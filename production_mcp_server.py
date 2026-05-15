@@ -602,6 +602,8 @@ def _resolve_string_list(value: Any, name: str) -> list[str]:
     for item in items:
         if item.startswith("-"):
             raise ValueError(f"Invalid {name} path: {item}")
+        if ".." in Path(item).parts:
+            raise ValueError(f"Invalid {name} path: {item}")
     return items
 
 
@@ -867,7 +869,7 @@ def _parse_trace_progress(trace_file: str) -> dict[str, Any]:
             state["phase"] = "done"
             state["detail"] = "Build terminé"
             state["percent"] = 100
-        elif name.startswith("export:") or "export" in name:
+        elif name.startswith("export:"):
             state["phase"] = "export"
             state["detail"] = name
     return state
