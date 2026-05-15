@@ -11,6 +11,7 @@ and runs long operations as background jobs.
 | Tool | Purpose |
 | --- | --- |
 | `production_status` | Check workspace, allowlist, active lock, and recent jobs. |
+| `production_list_templates` | List templates, expected deliverables, and unmatched deliverables. |
 | `production_start_job` | Start `copy`, `ingest`, `build`, `export`, `polish`, or a pipeline as a background job. |
 | `production_job_status` | Read one job status. |
 | `production_job_logs` | Read the tail of one job log. |

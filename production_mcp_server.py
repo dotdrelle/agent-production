@@ -260,6 +260,7 @@ def _render_landing_page(endpoint_url: str, scheme: str) -> str:
       <h2>Available tools</h2>
       <ul>
         <li><code>production_status</code><span>Check workspace and job readiness.</span></li>
+        <li><code>production_list_templates</code><span>List build templates and matching deliverables.</span></li>
         <li><code>production_start_job</code><span>Start an allowlisted production job and get a jobId.</span></li>
         <li><code>production_job_status</code><span>Read one job status.</span></li>
         <li><code>production_job_logs</code><span>Read a log tail.</span></li>
@@ -279,6 +280,20 @@ async def list_tools() -> list[Tool]:
             name="production_status",
             description="Check agent-wiki-production configuration, active lock, allowed steps, and recent jobs.",
             inputSchema={"type": "object", "properties": {}, "additionalProperties": False},
+        ),
+        Tool(
+            name="production_list_templates",
+            description="List available llm-wiki templates and their expected deliverable outputs for targeted build/export/polish jobs.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "includeDeliverables": {
+                        "type": "boolean",
+                        "description": "Include existing deliverables that are not directly matched to a template.",
+                    },
+                },
+                "additionalProperties": False,
+            },
         ),
         Tool(
             name="production_start_job",
@@ -368,6 +383,8 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
         match name:
             case "production_status":
                 result = _tool_status()
+            case "production_list_templates":
+                result = _tool_list_templates(arguments)
             case "production_start_job":
                 result = await _tool_start_job(arguments)
             case "production_job_status":
@@ -398,6 +415,54 @@ def _tool_status() -> list[TextContent]:
             "importsConfigured": len(_parse_imports()),
             "activeLock": _active_lock(),
             "recentJobs": [_job_summary(job) for job in _recent_jobs(5)],
+        }
+    )
+
+
+def _tool_list_templates(args: dict[str, Any]) -> list[TextContent]:
+    include_deliverables = bool(args.get("includeDeliverables", True))
+    templates_dir = _WORKSPACE_PATH / "templates"
+    deliverables_dir = _WORKSPACE_PATH / "deliverables"
+    templates: list[dict[str, Any]] = []
+    expected_outputs: set[str] = set()
+
+    if templates_dir.exists():
+        for path in sorted(templates_dir.rglob("*.md")):
+            rel_template = _relative_workspace_path(path)
+            rel_under_templates = path.relative_to(templates_dir).as_posix()
+            output = _template_output(path, rel_under_templates)
+            expected_outputs.add(output)
+            templates.append(
+                {
+                    "template": rel_under_templates,
+                    "templatePath": rel_template,
+                    "deliverable": output,
+                    "deliverablePath": f"deliverables/{output}",
+                    "deliverableExists": (deliverables_dir / output).exists(),
+                }
+            )
+
+    deliverables: list[dict[str, Any]] = []
+    if include_deliverables and deliverables_dir.exists():
+        for path in sorted(deliverables_dir.rglob("*.md")):
+            rel_deliverable = path.relative_to(deliverables_dir).as_posix()
+            if rel_deliverable in expected_outputs:
+                continue
+            deliverables.append(
+                {
+                    "deliverable": rel_deliverable,
+                    "deliverablePath": _relative_workspace_path(path),
+                }
+            )
+
+    return _json_text(
+        {
+            "ok": True,
+            "workspace": _WORKSPACE_NAME,
+            "templatesDir": "templates",
+            "deliverablesDir": "deliverables",
+            "templates": templates,
+            "unmatchedDeliverables": deliverables,
         }
     )
 
@@ -529,6 +594,27 @@ def _resolve_string_list(value: Any, name: str) -> list[str]:
         if item.startswith("-"):
             raise ValueError(f"Invalid {name} path: {item}")
     return items
+
+
+def _relative_workspace_path(path: Path) -> str:
+    return path.relative_to(_WORKSPACE_PATH).as_posix()
+
+
+def _template_output(path: Path, fallback: str) -> str:
+    text = path.read_text(encoding="utf-8", errors="replace")
+    if not text.startswith("---"):
+        return fallback
+    end = text.find("\n---", 3)
+    if end < 0:
+        return fallback
+    frontmatter = text[3:end].splitlines()
+    for line in frontmatter:
+        key, sep, value = line.partition(":")
+        if sep and key.strip() == "output":
+            output = value.strip().strip("'\"")
+            if output:
+                return output
+    return fallback
 
 
 async def _run_job(job_id: str) -> None:
