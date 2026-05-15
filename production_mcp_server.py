@@ -582,7 +582,8 @@ async def _run_cli_step(job_id: str, step: str) -> int:
         stderr=asyncio.subprocess.STDOUT,
     )
     _ACTIVE_PROCESSES[job_id] = proc
-    assert proc.stdout is not None
+    if proc.stdout is None:
+        raise RuntimeError("subprocess stdout is None; expected PIPE")
     while True:
         line = await proc.stdout.readline()
         if not line:

@@ -5,7 +5,7 @@ services:
       - ${WIKI_WORKSPACE_PATH:?Set WIKI_WORKSPACE_PATH}:/workspace
       - ${CME_DATA_PATH:-../agent-cme/data}:/agent-cme-data:ro
     environment:
-      - MCP_AUTH_TOKEN
+      - MCP_AUTH_TOKEN=${PRODUCTION_MCP_AUTH_TOKEN}
       - WORKSPACE_NAME=${WORKSPACE_NAME:-workspace}
       - WIKI_WORKSPACE_PATH=/workspace
       - WIKI_IMPORTS=${WIKI_IMPORTS}
