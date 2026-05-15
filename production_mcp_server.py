@@ -5,6 +5,7 @@ import asyncio
 import contextlib
 import json
 import os
+import re
 import shutil
 import signal
 import time
@@ -529,7 +530,15 @@ async def _tool_start_job(args: dict[str, Any]) -> list[TextContent]:
 def _tool_job_status(args: dict[str, Any]) -> list[TextContent]:
     job_id = str(args.get("jobId", "")).strip()
     job = _load_job(job_id)
-    return _json_text({"ok": True, "job": _with_duration(job), "logTail": _read_log_tail(job_id, 30)})
+    log_tail = _read_log_tail(job_id, 30)
+    return _json_text(
+        {
+            "ok": True,
+            "job": _with_duration(job),
+            "logTail": log_tail,
+            "progress": _job_progress(job, log_tail),
+        }
+    )
 
 
 def _tool_job_logs(args: dict[str, Any]) -> list[TextContent]:
@@ -726,6 +735,174 @@ def _read_log_tail(job_id: str, tail: int) -> list[str]:
         return []
     lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
     return lines[-max(1, min(tail, 500)) :]
+
+
+def _job_progress(job: dict[str, Any], log_tail: list[str]) -> dict[str, Any]:
+    current_step = _current_step(job)
+    trace_file = _trace_file_from_logs(log_tail)
+    trace = _parse_trace_progress(trace_file) if trace_file else {}
+    status = str(job.get("status") or "")
+    progress = {
+        "status": status,
+        "phase": trace.get("phase") or current_step.get("name") or status,
+        "label": trace.get("label") or _progress_label(job, current_step),
+        "detail": trace.get("detail") or _progress_detail(job, current_step),
+        "percent": trace.get("percent") if trace.get("percent") is not None else _step_percent(job),
+        "currentStep": current_step.get("name"),
+        "traceFile": trace_file,
+        "template": trace.get("template"),
+        "deliverable": trace.get("deliverable"),
+        "batchIndex": trace.get("batchIndex"),
+        "batchCount": trace.get("batchCount"),
+        "instructionCount": trace.get("instructionCount"),
+        "lastEvent": trace.get("lastEvent"),
+        "lastEventAt": trace.get("lastEventAt"),
+        "currentBatchStartedAt": trace.get("currentBatchStartedAt"),
+    }
+    if status == "done":
+        progress["percent"] = 100
+        progress["detail"] = progress["detail"] or "Job terminé"
+    if status in {"failed", "cancelled"}:
+        progress["detail"] = str(job.get("error") or progress["detail"] or status)
+    return progress
+
+
+def _current_step(job: dict[str, Any]) -> dict[str, Any]:
+    steps = job.get("steps") if isinstance(job.get("steps"), list) else []
+    for step in steps:
+        if isinstance(step, dict) and step.get("status") in {"running", "queued", "pending"}:
+            return step
+    for step in reversed(steps):
+        if isinstance(step, dict):
+            return step
+    return {}
+
+
+def _progress_label(job: dict[str, Any], step: dict[str, Any]) -> str:
+    targets = [*(job.get("templates") or []), *(job.get("deliverables") or [])]
+    target = ", ".join(str(item) for item in targets if item)
+    step_name = str(step.get("name") or job.get("type") or "production")
+    return f"{step_name} {target}".strip()
+
+
+def _progress_detail(job: dict[str, Any], step: dict[str, Any]) -> str:
+    status = step.get("status") or job.get("status")
+    return f"Étape {step.get('name')}: {status}" if step.get("name") else str(status or "")
+
+
+def _step_percent(job: dict[str, Any]) -> int | None:
+    steps = job.get("steps") if isinstance(job.get("steps"), list) else []
+    if not steps:
+        return None
+    done = sum(1 for step in steps if isinstance(step, dict) and step.get("status") == "done")
+    status = str(job.get("status") or "")
+    if status == "done":
+        return 100
+    if status in {"failed", "cancelled"}:
+        return max(0, min(99, round((done / len(steps)) * 100)))
+    running_bonus = 0.35 if any(isinstance(step, dict) and step.get("status") == "running" for step in steps) else 0
+    return max(0, min(99, round(((done + running_bonus) / len(steps)) * 100)))
+
+
+def _trace_file_from_logs(lines: list[str]) -> str | None:
+    for line in reversed(lines):
+        match = re.search(r"Trace file:\s*(.+)$", str(line))
+        if match:
+            return match.group(1).strip()
+    return None
+
+
+def _parse_trace_progress(trace_file: str) -> dict[str, Any]:
+    path = (_WORKSPACE_PATH / trace_file).resolve()
+    try:
+        path.relative_to(_WORKSPACE_PATH)
+    except ValueError:
+        return {}
+    if not path.exists():
+        return {}
+    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    state: dict[str, Any] = {"traceFile": trace_file}
+    for line in lines:
+        event = _trace_event(line)
+        if not event:
+            continue
+        name = event["name"]
+        fields = event["fields"]
+        state["lastEvent"] = name
+        state["lastEventAt"] = event["at"]
+        if name == "build:run-start":
+            state["phase"] = "build"
+            state["templateCount"] = _int_field(fields.get("templateCount"))
+        elif name == "build:template-start":
+            state["phase"] = "build"
+            state["template"] = fields.get("template")
+            state["deliverable"] = fields.get("output")
+            state["instructionCount"] = _int_field(fields.get("instructions"))
+            state["label"] = f"Build {state.get('template') or ''}".strip()
+        elif name == "llm:start":
+            state["phase"] = "llm"
+            state["template"] = fields.get("template") or state.get("template")
+            state["batchIndex"] = _int_field(fields.get("batchIndex"))
+            state["batchCount"] = _int_field(fields.get("batchCount"))
+            state["instructionCount"] = _int_field(fields.get("instructionCount")) or state.get("instructionCount")
+            state["currentBatchStartedAt"] = event["at"]
+            state["label"] = f"Build {state.get('template') or ''}".strip()
+            if state.get("batchIndex") is not None and state.get("batchCount"):
+                state["detail"] = f"Batch {state['batchIndex'] + 1}/{state['batchCount']} · LLM en cours"
+                state["percent"] = _batch_percent(state["batchIndex"], state["batchCount"], False)
+        elif name == "llm:end":
+            state["phase"] = "llm"
+            state["batchIndex"] = _int_field(fields.get("batchIndex"))
+            state["batchCount"] = _int_field(fields.get("batchCount"))
+            if state.get("batchIndex") is not None and state.get("batchCount"):
+                state["detail"] = f"Batch {state['batchIndex'] + 1}/{state['batchCount']} terminé"
+                state["percent"] = _batch_percent(state["batchIndex"], state["batchCount"], True)
+        elif name == "build:template-done":
+            state["phase"] = "build"
+            state["template"] = fields.get("template") or state.get("template")
+            state["deliverable"] = fields.get("output") or state.get("deliverable")
+            state["detail"] = "Template terminé"
+            state["percent"] = 98
+        elif name == "build:run-done":
+            state["phase"] = "done"
+            state["detail"] = "Build terminé"
+            state["percent"] = 100
+        elif name.startswith("export:") or "export" in name:
+            state["phase"] = "export"
+            state["detail"] = name
+    return state
+
+
+def _trace_event(line: str) -> dict[str, Any] | None:
+    match = re.match(r"^(?P<at>\S+)\s+\+\d+ms\s+\S+\s+(?P<name>\S+)\s*(?P<rest>.*)$", line)
+    if not match:
+        return None
+    return {
+        "at": match.group("at"),
+        "name": match.group("name"),
+        "fields": _trace_fields(match.group("rest")),
+    }
+
+
+def _trace_fields(rest: str) -> dict[str, str]:
+    fields: dict[str, str] = {}
+    for key, value in re.findall(r"(\w+)=((?:\"[^\"]*\")|(?:\[[^\]]*\])|(?:\S+))", rest):
+        fields[key] = value.strip('"')
+    return fields
+
+
+def _int_field(value: Any) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _batch_percent(batch_index: int, batch_count: int, completed: bool) -> int | None:
+    if batch_count <= 0:
+        return None
+    current = batch_index + (1 if completed else 0.25)
+    return max(1, min(99, round((current / batch_count) * 100)))
 
 
 def _with_duration(job: dict[str, Any]) -> dict[str, Any]:

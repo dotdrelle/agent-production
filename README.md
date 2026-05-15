@@ -62,6 +62,9 @@ Streamable HTTP requests to the same URL.
 - Jobs are asynchronous and return a `jobId` immediately.
 - One mutating job can run at a time per workspace.
 - Job metadata and logs are written under `.wiki/production-jobs`.
+- `production_job_status` includes a structured `progress` object derived from
+  the llm-wiki trace file when available: phase, label, detail, percent,
+  template/deliverable, batch index/count, and last trace event.
 - The server enforces the step allowlist. It never accepts arbitrary shell commands.
 - Real jobs require `confirm=true` when confirmation is enabled.
 - `build` jobs accept an optional `templates` array, for example
