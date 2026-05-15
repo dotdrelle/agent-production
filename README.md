@@ -63,3 +63,6 @@ Streamable HTTP requests to the same URL.
 - Job metadata and logs are written under `.wiki/production-jobs`.
 - The server enforces the step allowlist. It never accepts arbitrary shell commands.
 - Real jobs require `confirm=true` when confirmation is enabled.
+- `build` jobs accept an optional `templates` array, for example
+  `["EAE-REAS-architecture.md"]`, so a targeted build does not rebuild every
+  template.
