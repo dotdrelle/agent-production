@@ -303,6 +303,11 @@ async def list_tools() -> list[Tool]:
                         "items": {"type": "string"},
                         "description": "Optional template files for build steps, relative to the workspace root or templates/.",
                     },
+                    "deliverables": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Required for export or polish steps. Paths are relative to the workspace root or deliverables/.",
+                    },
                     "confirm": {"type": "boolean", "description": "Set true after explicit user approval."},
                     "dryRun": {"type": "boolean", "description": "Validate and return the planned job without running it."},
                 },
@@ -402,7 +407,8 @@ async def _tool_start_job(args: dict[str, Any]) -> list[TextContent]:
     dry_run = bool(args.get("dryRun", False))
     confirm = bool(args.get("confirm", False))
     steps = _resolve_steps(job_type, args.get("steps"))
-    templates = _resolve_string_list(args.get("templates"))
+    templates = _resolve_string_list(args.get("templates"), "templates")
+    deliverables = _resolve_string_list(args.get("deliverables"), "deliverables")
 
     if job_type not in _ALLOWED_STEPS:
         raise ValueError(f"Job type is not allowed: {job_type}")
@@ -411,10 +417,18 @@ async def _tool_start_job(args: dict[str, Any]) -> list[TextContent]:
             raise ValueError(f"Step is not allowed: {step}")
     if not _WORKSPACE_PATH.exists():
         raise ValueError(f"Workspace path does not exist: {_WORKSPACE_PATH}")
+    if any(step in {"export", "polish"} for step in steps) and not deliverables:
+        raise ValueError("export and polish jobs require at least one deliverable.")
 
-    plan = {"type": job_type, "steps": steps, "workspace": _WORKSPACE_NAME, "templates": templates}
+    plan = {
+        "type": job_type,
+        "steps": steps,
+        "workspace": _WORKSPACE_NAME,
+        "templates": templates,
+        "deliverables": deliverables,
+    }
     if dry_run:
-        return _json_text({"ok": True, "dryRun": True, "plan": plan, "commands": [_step_label(step, templates) for step in steps]})
+        return _json_text({"ok": True, "dryRun": True, "plan": plan, "commands": _command_labels(steps, templates, deliverables)})
     if _REQUIRE_CONFIRMATION and not confirm and any(step in _MUTATING_STEPS for step in steps):
         raise ValueError("Production jobs require confirm=true after explicit user approval.")
 
@@ -429,6 +443,7 @@ async def _tool_start_job(args: dict[str, Any]) -> list[TextContent]:
         "workspace": _WORKSPACE_NAME,
         "type": job_type,
         "templates": templates,
+        "deliverables": deliverables,
         "steps": [{"name": step, "status": "pending"} for step in steps],
         "status": "queued",
         "createdAt": _now(),
@@ -504,15 +519,15 @@ def _resolve_steps(job_type: str, raw_steps: Any) -> list[str]:
     return steps
 
 
-def _resolve_string_list(value: Any) -> list[str]:
+def _resolve_string_list(value: Any, name: str) -> list[str]:
     if value is None:
         return []
     if not isinstance(value, list):
-        raise ValueError("templates must be an array of strings.")
+        raise ValueError(f"{name} must be an array of strings.")
     items = [str(item).strip() for item in value if str(item).strip()]
     for item in items:
         if item.startswith("-"):
-            raise ValueError(f"Invalid template path: {item}")
+            raise ValueError(f"Invalid {name} path: {item}")
     return items
 
 
@@ -533,7 +548,12 @@ async def _run_job(job_id: str) -> None:
                 step["result"] = {"copiedFiles": count}
                 step["exitCode"] = 0
             else:
-                exit_code = await _run_cli_step(job_id, step["name"], job.get("templates", []))
+                exit_code = await _run_cli_step(
+                    job_id,
+                    step["name"],
+                    job.get("templates", []),
+                    job.get("deliverables", []),
+                )
                 step["exitCode"] = exit_code
                 if exit_code != 0:
                     raise RuntimeError(f"Step failed: {step['name']} exitCode={exit_code}")
@@ -591,26 +611,27 @@ def _run_copy_step(job_id: str) -> int:
     return copied
 
 
-async def _run_cli_step(job_id: str, step: str, templates: list[str]) -> int:
-    command = [*_STEP_COMMANDS[step]]
-    if step == "build":
-        command.extend(templates)
-    _append_log(job_id, f"[cmd] cwd={_WORKSPACE_PATH} {' '.join(command)}")
-    proc = await asyncio.create_subprocess_exec(
-        *command,
-        cwd=str(_WORKSPACE_PATH),
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.STDOUT,
-    )
-    _ACTIVE_PROCESSES[job_id] = proc
-    if proc.stdout is None:
-        raise RuntimeError("subprocess stdout is None; expected PIPE")
-    while True:
-        line = await proc.stdout.readline()
-        if not line:
-            break
-        _append_log(job_id, line.decode("utf-8", errors="replace").rstrip("\n"))
-    return await proc.wait()
+async def _run_cli_step(job_id: str, step: str, templates: list[str], deliverables: list[str]) -> int:
+    for command in _step_commands(step, templates, deliverables):
+        _append_log(job_id, f"[cmd] cwd={_WORKSPACE_PATH} {' '.join(command)}")
+        proc = await asyncio.create_subprocess_exec(
+            *command,
+            cwd=str(_WORKSPACE_PATH),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        _ACTIVE_PROCESSES[job_id] = proc
+        if proc.stdout is None:
+            raise RuntimeError("subprocess stdout is None; expected PIPE")
+        while True:
+            line = await proc.stdout.readline()
+            if not line:
+                break
+            _append_log(job_id, line.decode("utf-8", errors="replace").rstrip("\n"))
+        exit_code = await proc.wait()
+        if exit_code != 0:
+            return exit_code
+    return 0
 
 
 def _read_log_tail(job_id: str, tail: int) -> list[str]:
@@ -647,13 +668,26 @@ def _job_summary(job: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _step_label(step: str, templates: list[str] | None = None) -> str:
+def _step_commands(step: str, templates: list[str], deliverables: list[str]) -> list[list[str]]:
     if step == "copy":
-        return f"copy {len(_parse_imports())} import(s) to raw/untracked"
+        return []
     command = [*_STEP_COMMANDS[step]]
-    if step == "build" and templates:
+    if step == "build":
         command.extend(templates)
-    return " ".join(command)
+        return [command]
+    if step in {"export", "polish"}:
+        return [[*command, deliverable] for deliverable in deliverables]
+    return [command]
+
+
+def _command_labels(steps: list[str], templates: list[str], deliverables: list[str]) -> list[str]:
+    labels: list[str] = []
+    for step in steps:
+        if step == "copy":
+            labels.append(f"copy {len(_parse_imports())} import(s) to raw/untracked")
+            continue
+        labels.extend(" ".join(command) for command in _step_commands(step, templates, deliverables))
+    return labels
 
 
 def create_starlette_app() -> Starlette:

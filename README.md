@@ -66,3 +66,6 @@ Streamable HTTP requests to the same URL.
 - `build` jobs accept an optional `templates` array, for example
   `["EAE-REAS-architecture.md"]`, so a targeted build does not rebuild every
   template.
+- `export` and `polish` jobs require a `deliverables` array, for example
+  `["EAE-REAS-architecture.md"]`, so export/polish runs only on the requested
+  deliverable.
