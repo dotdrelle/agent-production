@@ -12,7 +12,7 @@ and runs long operations as background jobs.
 | --- | --- |
 | `production_status` | Check workspace, allowlist, active lock, and recent jobs. |
 | `production_list_templates` | List templates, expected deliverables, and unmatched deliverables. |
-| `production_start_job` | Start `copy`, `ingest`, `build`, `export`, `polish`, or a pipeline as a background job. |
+| `production_start_job` | Start `ingest`, `build`, `export`, `polish`, or a pipeline as a background job. |
 | `production_job_status` | Read one job status. |
 | `production_job_logs` | Read the tail of one job log. |
 | `production_cancel_job` | Cancel a running job. |
@@ -29,15 +29,12 @@ Required:
 ```bash
 export WORKSPACE_NAME=example
 export WIKI_WORKSPACE_PATH=/absolute/path/to/llm-wiki-workspace
-export CME_DATA_PATH=../agent-cme/data
 ```
 
 Optional:
 
 ```bash
-export WIKI_IMPORTS=/path/to/export-a\|/path/to/export-b
-export PRODUCTION_IMPORT_PATH_MAPPINGS=../agent-cme/data=/agent-cme-data
-export PRODUCTION_ALLOWED_STEPS=copy,ingest,build,export,polish,pipeline
+export PRODUCTION_ALLOWED_STEPS=ingest,build,export,polish,pipeline
 export PRODUCTION_REQUIRE_CONFIRMATION=true
 export MCP_AUTH_TOKEN=local-token
 ```
@@ -64,7 +61,11 @@ Streamable HTTP requests to the same URL.
 - Job metadata and logs are written under `.wiki/production-jobs`.
 - `production_job_status` includes a structured `progress` object derived from
   the llm-wiki trace file when available: phase, label, detail, percent,
-  template/deliverable, batch index/count, and last trace event.
+  current ingest source, template/deliverable, batch index/count, and last trace
+  event.
+- Cancelling a running job terminates the active process, marks unfinished steps
+  as `cancelled`, clears the workspace lock, and appends a cancellation log
+  entry.
 - The server enforces the step allowlist. It never accepts arbitrary shell commands.
 - Real jobs require `confirm=true` when confirmation is enabled.
 - `build` jobs accept an optional `templates` array, for example

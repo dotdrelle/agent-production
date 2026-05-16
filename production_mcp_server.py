@@ -531,12 +531,13 @@ def _tool_job_status(args: dict[str, Any]) -> list[TextContent]:
     job_id = str(args.get("jobId", "")).strip()
     job = _load_job(job_id)
     log_tail = _read_log_tail(job_id, 30)
+    progress_log_tail = _read_log_tail(job_id, 500)
     return _json_text(
         {
             "ok": True,
             "job": _with_duration(job),
             "logTail": log_tail,
-            "progress": _job_progress(job, log_tail),
+            "progress": _job_progress(job, progress_log_tail),
         }
     )
 
@@ -566,6 +567,11 @@ async def _tool_cancel_job(args: dict[str, Any]) -> list[TextContent]:
     job["status"] = "cancelled"
     job["finishedAt"] = _now()
     job["exitCode"] = -15
+    for step in job.get("steps", []):
+        if isinstance(step, dict) and step.get("status") in {"pending", "queued", "running"}:
+            step["status"] = "cancelled"
+            step["finishedAt"] = job["finishedAt"]
+            step["exitCode"] = -15
     _append_log(job_id, "[cancelled] Job cancelled by request.")
     _save_job(job)
     _clear_lock(job_id)
@@ -824,6 +830,8 @@ def _parse_trace_progress(trace_file: str) -> dict[str, Any]:
         return {}
     lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
     state: dict[str, Any] = {"traceFile": trace_file}
+    ingest_input_count: int | None = None
+    ingest_done_count = 0
     for line in lines:
         event = _trace_event(line)
         if not event:
@@ -835,6 +843,65 @@ def _parse_trace_progress(trace_file: str) -> dict[str, Any]:
         if name == "build:run-start":
             state["phase"] = "build"
             state["templateCount"] = _int_field(fields.get("templateCount"))
+        elif name == "ingest:run-start":
+            state["phase"] = "ingest"
+            ingest_input_count = _int_field(fields.get("inputCount"))
+            state["sourceCount"] = ingest_input_count
+            state["detail"] = "Sélection des sources"
+            state["percent"] = 1
+        elif name == "ingest:source-selection":
+            state["phase"] = "ingest"
+            resolved_count = _int_field(fields.get("resolvedCount"))
+            if resolved_count is not None:
+                ingest_input_count = resolved_count
+                state["sourceCount"] = resolved_count
+                state["sourceDoneCount"] = ingest_done_count
+                state["detail"] = f"{resolved_count} source(s) à ingérer"
+                state["percent"] = 1 if resolved_count > 0 else 100
+        elif name == "ingest:source-start":
+            state["phase"] = "ingest"
+            state["source"] = fields.get("sourcePath") or state.get("source")
+            source_name = Path(str(state.get("source") or "")).name
+            state["label"] = f"Ingest {source_name}".strip()
+            if ingest_input_count is not None and ingest_input_count > 0:
+                state["sourceIndex"] = ingest_done_count
+                state["sourceCount"] = ingest_input_count
+                state["sourceDoneCount"] = ingest_done_count
+                state["detail"] = f"Source {ingest_done_count + 1}/{ingest_input_count}"
+                state["percent"] = max(1, min(99, round(((ingest_done_count + 0.15) / ingest_input_count) * 100)))
+        elif name == "ingest:source":
+            state["phase"] = "ingest"
+            state["source"] = fields.get("source") or state.get("source")
+            source_name = Path(str(state.get("source") or "")).name
+            state["label"] = f"Ingest {source_name}".strip()
+        elif name == "ingest:prompt":
+            state["phase"] = "ingest"
+            state["source"] = fields.get("source") or state.get("source")
+            source_name = Path(str(state.get("source") or "")).name
+            state["label"] = f"Ingest {source_name}".strip()
+            state["detail"] = "Préparation LLM"
+        elif name == "ingest:plan":
+            state["phase"] = "ingest"
+            state["source"] = fields.get("source") or state.get("source")
+            source_name = Path(str(state.get("source") or "")).name
+            state["label"] = f"Ingest {source_name}".strip()
+            state["detail"] = "Plan d'ingestion reçu"
+        elif name == "ingest:source-done":
+            state["phase"] = "ingest"
+            ingest_done_count += 1
+            state["source"] = fields.get("source") or state.get("source")
+            source_name = Path(str(state.get("source") or "")).name
+            state["label"] = f"Ingest {source_name}".strip()
+            if ingest_input_count is not None and ingest_input_count > 0:
+                state["sourceIndex"] = max(0, ingest_done_count - 1)
+                state["sourceCount"] = ingest_input_count
+                state["sourceDoneCount"] = ingest_done_count
+                state["detail"] = f"Source {ingest_done_count}/{ingest_input_count}"
+                state["percent"] = max(1, min(99, round((ingest_done_count / ingest_input_count) * 100)))
+        elif name == "ingest:run-done":
+            state["phase"] = "done"
+            state["detail"] = "Ingest terminé"
+            state["percent"] = 100
         elif name == "build:template-start":
             state["phase"] = "build"
             state["template"] = fields.get("template")
@@ -843,19 +910,30 @@ def _parse_trace_progress(trace_file: str) -> dict[str, Any]:
             state["label"] = f"Build {state.get('template') or ''}".strip()
         elif name == "llm:start":
             state["phase"] = "llm"
+            state["source"] = fields.get("source") or state.get("source")
             state["template"] = fields.get("template") or state.get("template")
             state["batchIndex"] = _int_field(fields.get("batchIndex"))
             state["batchCount"] = _int_field(fields.get("batchCount"))
             state["instructionCount"] = _int_field(fields.get("instructionCount")) or state.get("instructionCount")
             state["currentBatchStartedAt"] = event["at"]
-            state["label"] = f"Build {state.get('template') or ''}".strip()
+            if state.get("source") and not state.get("template"):
+                source_name = Path(str(state.get("source") or "")).name
+                state["label"] = f"Ingest {source_name}".strip()
+                state["detail"] = "LLM en cours"
+            else:
+                state["label"] = f"Build {state.get('template') or ''}".strip()
             if state.get("batchIndex") is not None and state.get("batchCount"):
                 state["detail"] = f"Batch {state['batchIndex'] + 1}/{state['batchCount']} · LLM en cours"
                 state["percent"] = _batch_percent(state["batchIndex"], state["batchCount"], False)
         elif name == "llm:end":
             state["phase"] = "llm"
+            state["source"] = fields.get("source") or state.get("source")
             state["batchIndex"] = _int_field(fields.get("batchIndex"))
             state["batchCount"] = _int_field(fields.get("batchCount"))
+            if state.get("source") and not state.get("template"):
+                source_name = Path(str(state.get("source") or "")).name
+                state["label"] = f"Ingest {source_name}".strip()
+                state["detail"] = "LLM terminé"
             if state.get("batchIndex") is not None and state.get("batchCount"):
                 state["detail"] = f"Batch {state['batchIndex'] + 1}/{state['batchCount']} terminé"
                 state["percent"] = _batch_percent(state["batchIndex"], state["batchCount"], True)
