@@ -11,7 +11,7 @@ import signal
 import time
 import uuid
 from collections.abc import AsyncIterator
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -822,6 +822,39 @@ def _trace_file_from_logs(lines: list[str]) -> str | None:
     return None
 
 
+_WAIT_EVENTS = frozenset({
+    "provider:throttle",
+    "llm:rate-limit-wait",
+    "rerank:rate-limit-wait",
+    "embedding:rate-limit-wait",
+})
+
+
+def _service_name(event_name: str, fields: dict[str, str]) -> str:
+    label = fields.get("label", "")
+    if event_name.startswith("embedding:") or label == "embedding":
+        return "Vectorisation"
+    if event_name.startswith("rerank:") or label == "rerank":
+        return "Rerank"
+    return "LLM"
+
+
+def _quota_wait_detail(event_name: str, fields: dict[str, str], retry_at_iso: str | None = None) -> str:
+    service = _service_name(event_name, fields)
+    retry_iso = retry_at_iso or fields.get("retryAt")
+    wait_ms = _int_field(fields.get("waitMs"))
+    remaining_s: int | None = None
+    if retry_iso:
+        with contextlib.suppress(Exception):
+            retry_dt = datetime.fromisoformat(retry_iso.replace("Z", "+00:00"))
+            remaining_s = max(0, round((retry_dt - datetime.now(timezone.utc)).total_seconds()))
+    if remaining_s is None and wait_ms is not None:
+        remaining_s = max(0, round(wait_ms / 1000))
+    if remaining_s is not None and remaining_s > 0:
+        return f"{service} en attente quota, reprise dans {remaining_s}s"
+    return f"{service} en attente quota, reprise imminente"
+
+
 def _parse_trace_progress(trace_file: str) -> dict[str, Any]:
     path = (_WORKSPACE_PATH / trace_file).resolve()
     try:
@@ -842,7 +875,7 @@ def _parse_trace_progress(trace_file: str) -> dict[str, Any]:
         fields = event["fields"]
         state["lastEvent"] = name
         state["lastEventAt"] = event["at"]
-        if name != "provider:throttle":
+        if name not in _WAIT_EVENTS:
             state.pop("waitMs", None)
             state.pop("retryAt", None)
         if name == "build:run-start":
@@ -956,10 +989,19 @@ def _parse_trace_progress(trace_file: str) -> dict[str, Any]:
             state.pop("retryAt", None)
         elif name == "provider:throttle":
             wait_ms = _int_field(fields.get("waitMs"))
+            retry_at_iso: str | None = None
+            with contextlib.suppress(Exception):
+                event_dt = datetime.fromisoformat(event["at"].replace("Z", "+00:00"))
+                retry_at_iso = (event_dt + timedelta(milliseconds=wait_ms or 0)).isoformat()
+            state["waitMs"] = wait_ms
+            state["retryAt"] = retry_at_iso
+            state["detail"] = _quota_wait_detail(name, fields, retry_at_iso)
+        elif name in {"llm:rate-limit-wait", "rerank:rate-limit-wait", "embedding:rate-limit-wait"}:
+            wait_ms = _int_field(fields.get("waitMs"))
             retry_at = fields.get("retryAt")
             state["waitMs"] = wait_ms
             state["retryAt"] = retry_at
-            state["detail"] = "Quota fournisseur atteint, reprise en attente"
+            state["detail"] = _quota_wait_detail(name, fields)
         elif name.startswith("export:"):
             state["phase"] = "export"
             state["detail"] = name
