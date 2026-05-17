@@ -765,6 +765,8 @@ def _job_progress(job: dict[str, Any], log_tail: list[str]) -> dict[str, Any]:
         "instructionCount": trace.get("instructionCount"),
         "lastEvent": trace.get("lastEvent"),
         "lastEventAt": trace.get("lastEventAt"),
+        "waitMs": trace.get("waitMs"),
+        "retryAt": trace.get("retryAt"),
         "currentBatchStartedAt": trace.get("currentBatchStartedAt"),
     }
     if status == "done":
@@ -840,6 +842,9 @@ def _parse_trace_progress(trace_file: str) -> dict[str, Any]:
         fields = event["fields"]
         state["lastEvent"] = name
         state["lastEventAt"] = event["at"]
+        if name != "provider:throttle":
+            state.pop("waitMs", None)
+            state.pop("retryAt", None)
         if name == "build:run-start":
             state["phase"] = "build"
             state["templateCount"] = _int_field(fields.get("templateCount"))
@@ -947,6 +952,14 @@ def _parse_trace_progress(trace_file: str) -> dict[str, Any]:
             state["phase"] = "done"
             state["detail"] = "Build terminé"
             state["percent"] = 100
+            state.pop("waitMs", None)
+            state.pop("retryAt", None)
+        elif name == "provider:throttle":
+            wait_ms = _int_field(fields.get("waitMs"))
+            retry_at = fields.get("retryAt")
+            state["waitMs"] = wait_ms
+            state["retryAt"] = retry_at
+            state["detail"] = "Quota fournisseur atteint, reprise en attente"
         elif name.startswith("export:"):
             state["phase"] = "export"
             state["detail"] = name
