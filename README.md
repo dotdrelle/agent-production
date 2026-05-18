@@ -8,15 +8,15 @@ and runs long operations as background jobs.
 
 ## Tools
 
-| Tool | Purpose |
-| --- | --- |
-| `production_status` | Check workspace, allowlist, active lock, and recent jobs. |
-| `production_list_templates` | List templates, expected deliverables, and unmatched deliverables. |
-| `production_start_job` | Start `ingest`, `build`, `export`, `polish`, or a pipeline as a background job. |
-| `production_job_status` | Read one job status. |
-| `production_job_logs` | Read the tail of one job log. |
-| `production_cancel_job` | Cancel a running job. |
-| `production_list_jobs` | List recent jobs. |
+| Tool                        | Purpose                                                                                 |
+| --------------------------- | --------------------------------------------------------------------------------------- |
+| `production_status`         | Check workspace, allowlist, active lock, and recent jobs.                               |
+| `production_list_templates` | List templates, expected deliverables, and unmatched deliverables.                      |
+| `production_start_job`      | Start `copy`, `ingest`, `build`, `export`, `polish`, or a pipeline as a background job. |
+| `production_job_status`     | Read one job status.                                                                    |
+| `production_job_logs`       | Read the tail of one job log.                                                           |
+| `production_cancel_job`     | Cancel a running job.                                                                   |
+| `production_list_jobs`      | List recent jobs.                                                                       |
 
 ## Configuration
 
@@ -34,7 +34,7 @@ export WIKI_WORKSPACE_PATH=/absolute/path/to/llm-wiki-workspace
 Optional:
 
 ```bash
-export PRODUCTION_ALLOWED_STEPS=ingest,build,export,polish,pipeline
+export PRODUCTION_ALLOWED_STEPS=copy,ingest,build,export,polish,pipeline
 export PRODUCTION_REQUIRE_CONFIRMATION=true
 export MCP_AUTH_TOKEN=local-token
 ```
