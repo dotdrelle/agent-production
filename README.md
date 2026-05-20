@@ -12,7 +12,7 @@ and runs long operations as background jobs.
 | --------------------------- | --------------------------------------------------------------------------------------- |
 | `production_status`         | Check workspace, allowlist, active lock, and recent jobs.                               |
 | `production_list_templates` | List templates, expected deliverables, and unmatched deliverables.                      |
-| `production_start_job`      | Start `copy`, `ingest`, `build`, `export`, `polish`, or a pipeline as a background job. |
+| `production_start_job`      | Start `doctor`, `copy`, `ingest`, `build`, `export`, `polish`, or a pipeline as a background job. |
 | `production_job_status`     | Read one job status.                                                                    |
 | `production_job_logs`       | Read the tail of one job log.                                                           |
 | `production_cancel_job`     | Cancel a running job.                                                                   |
@@ -34,10 +34,14 @@ export WIKI_WORKSPACE_PATH=/absolute/path/to/llm-wiki-workspace
 Optional:
 
 ```bash
-export PRODUCTION_ALLOWED_STEPS=copy,ingest,build,export,polish,pipeline
-export PRODUCTION_REQUIRE_CONFIRMATION=true
+export PRODUCTION_ALLOWED_STEPS=doctor,copy,ingest,build,export,polish,pipeline
+export PRODUCTION_REQUIRE_CONFIRMATION=false
 export MCP_AUTH_TOKEN=local-token
 ```
+
+`agent-wiki-production` runs the `llm-wiki` CLI inside the mounted workspace.
+Configure LLM and vector provider keys in that workspace's `.wikirc.yaml`
+(`llm.apiKey` and, when needed, `retrieval.vector.apiKey`).
 
 ## Run Locally
 
@@ -67,7 +71,12 @@ Streamable HTTP requests to the same URL.
   as `cancelled`, clears the workspace lock, and appends a cancellation log
   entry.
 - The server enforces the step allowlist. It never accepts arbitrary shell commands.
-- Real jobs require `confirm=true` when confirmation is enabled.
+- The default `pipeline` runs `ingest`, `build`, `export`, then `polish`.
+  The legacy `copy` step is available only when requested explicitly, for
+  deployments that configure `WIKI_IMPORTS` and import path mappings.
+- Bearer authentication controls who can call the agent. `PRODUCTION_REQUIRE_CONFIRMATION`
+  is an optional extra application-level guard: set it to `true` if mutating jobs
+  must also include `confirm=true` after explicit user approval.
 - `build` jobs accept an optional `templates` array, for example
   `["EAE-REAS-architecture.md"]`, so a targeted build does not rebuild every
   template.

@@ -38,10 +38,10 @@ _IMPORTS = os.environ.get("WIKI_IMPORTS", "")
 _IMPORT_PATH_MAPPINGS = os.environ.get("PRODUCTION_IMPORT_PATH_MAPPINGS", "../agent-cme/data=/agent-cme-data")
 _ALLOWED_STEPS = {
     item.strip()
-    for item in os.environ.get("PRODUCTION_ALLOWED_STEPS", "copy,ingest,build,export,polish,pipeline").split(",")
+    for item in os.environ.get("PRODUCTION_ALLOWED_STEPS", "doctor,copy,ingest,build,export,polish,pipeline").split(",")
     if item.strip()
 }
-_REQUIRE_CONFIRMATION = os.environ.get("PRODUCTION_REQUIRE_CONFIRMATION", "true").lower() not in {"0", "false", "no"}
+_REQUIRE_CONFIRMATION = os.environ.get("PRODUCTION_REQUIRE_CONFIRMATION", "false").lower() not in {"0", "false", "no"}
 _JOBS_DIR = Path(os.environ.get("PRODUCTION_JOBS_DIR", str(_WORKSPACE_PATH / ".wiki" / "production-jobs"))).resolve()
 _LOCKS_DIR = Path(os.environ.get("PRODUCTION_LOCKS_DIR", str(_JOBS_DIR / "locks"))).resolve()
 _WIKI_BIN = os.environ.get("WIKI_BIN", "/app/bin/wiki.js")
@@ -49,6 +49,7 @@ _ACTIVE_TASKS: dict[str, asyncio.Task[None]] = {}
 _ACTIVE_PROCESSES: dict[str, asyncio.subprocess.Process] = {}
 
 _STEP_COMMANDS: dict[str, list[str]] = {
+    "doctor": ["node", _WIKI_BIN, "doctor"],
     "ingest": ["node", _WIKI_BIN, "ingest"],
     "build": ["node", _WIKI_BIN, "build"],
     "export": ["node", _WIKI_BIN, "export"],
@@ -300,18 +301,19 @@ async def list_tools() -> list[Tool]:
             name="production_start_job",
             description=(
                 "Start an llm-wiki production job asynchronously. Use only after explicit user request. "
-                "Mutating jobs require confirm=true when confirmation is enabled."
+                "Bearer authentication and the step allowlist are the primary controls. "
+                "If PRODUCTION_REQUIRE_CONFIRMATION=true, mutating jobs also require confirm=true."
             ),
             inputSchema={
                 "type": "object",
                 "properties": {
                     "type": {
                         "type": "string",
-                        "enum": ["copy", "ingest", "build", "export", "polish", "pipeline"],
+                        "enum": ["doctor", "copy", "ingest", "build", "export", "polish", "pipeline"],
                     },
                     "steps": {
                         "type": "array",
-                        "items": {"type": "string", "enum": ["copy", "ingest", "build", "export", "polish"]},
+                        "items": {"type": "string", "enum": ["doctor", "copy", "ingest", "build", "export", "polish"]},
                         "description": "Required for type=pipeline. Ordered steps to run.",
                     },
                     "templates": {
@@ -587,13 +589,13 @@ def _tool_list_jobs(args: dict[str, Any]) -> list[TextContent]:
 def _resolve_steps(job_type: str, raw_steps: Any) -> list[str]:
     if job_type == "pipeline":
         if not isinstance(raw_steps, list) or not raw_steps:
-            return ["copy", "ingest", "build", "export", "polish"]
+            return ["ingest", "build", "export", "polish"]
         steps = [str(item).strip() for item in raw_steps if str(item).strip()]
-    elif job_type in {"copy", "ingest", "build", "export", "polish"}:
+    elif job_type in {"doctor", "copy", "ingest", "build", "export", "polish"}:
         steps = [job_type]
     else:
         raise ValueError(f"Unknown production job type: {job_type}")
-    invalid = [step for step in steps if step not in {"copy", "ingest", "build", "export", "polish"}]
+    invalid = [step for step in steps if step not in {"doctor", "copy", "ingest", "build", "export", "polish"}]
     if invalid:
         raise ValueError(f"Unknown production step: {invalid[0]}")
     return steps
