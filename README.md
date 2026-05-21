@@ -37,7 +37,10 @@ Optional:
 export PRODUCTION_ALLOWED_STEPS=doctor,copy,ingest,build,export,polish,pipeline
 export PRODUCTION_REQUIRE_CONFIRMATION=false
 export MCP_AUTH_TOKEN=local-token
+export WIKI_IMPORTS=
 ```
+
+`MCP_AUTH_TOKEN` and `WIKI_IMPORTS` default to empty strings in the standalone Docker Compose file. Leave `WIKI_IMPORTS` empty unless you explicitly use the legacy `copy` step.
 
 `agent-wiki-production` runs the `llm-wiki` CLI inside the mounted workspace.
 Configure LLM and vector provider keys in that workspace's `.wikirc.yaml`
