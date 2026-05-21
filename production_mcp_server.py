@@ -301,6 +301,7 @@ async def list_tools() -> list[Tool]:
             name="production_start_job",
             description=(
                 "Start an llm-wiki production job asynchronously. Use only after explicit user request. "
+                "For type=\"ingest\", this reads Markdown files already present in the workspace, including files exported by agent-cme; it does not fetch from Confluence directly. "
                 "Bearer authentication and the step allowlist are the primary controls. "
                 "If PRODUCTION_REQUIRE_CONFIRMATION=true, mutating jobs also require confirm=true."
             ),
