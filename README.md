@@ -1,5 +1,7 @@
 # agent-wiki-production
 
+[![License: PolyForm Noncommercial 1.0.0](https://img.shields.io/badge/license-PolyForm%20Noncommercial%201.0.0-blue)](LICENSE)
+
 Workspace-scoped MCP server for running `llm-wiki` production jobs.
 
 This agent is intentionally separate from `llm-wiki` chat/search. It mounts one
@@ -27,8 +29,8 @@ cp .env.example .env
 Required:
 
 ```bash
-export WORKSPACE_NAME=example
-export WIKI_WORKSPACE_PATH=/absolute/path/to/llm-wiki-workspace
+export WORKSPACE_NAME=<workspace-name>
+export WIKI_WORKSPACE_PATH=<absolute-path-to-llm-wiki-workspace>
 ```
 
 Optional:
@@ -36,7 +38,7 @@ Optional:
 ```bash
 export PRODUCTION_ALLOWED_STEPS=doctor,copy,ingest,build,export,polish,pipeline
 export PRODUCTION_REQUIRE_CONFIRMATION=false
-export MCP_AUTH_TOKEN=local-token
+export MCP_AUTH_TOKEN=<generated-local-token>
 export WIKI_IMPORTS=
 ```
 
@@ -86,3 +88,7 @@ Streamable HTTP requests to the same URL.
 - `export` and `polish` jobs require a `deliverables` array, for example
   `["EAE-REAS-architecture.md"]`, so export/polish runs only on the requested
   deliverable.
+
+## License
+
+Released under the **PolyForm Noncommercial License 1.0.0**. See [LICENSE](LICENSE).
