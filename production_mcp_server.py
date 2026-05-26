@@ -541,6 +541,7 @@ def _tool_job_status(args: dict[str, Any]) -> list[TextContent]:
             "job": _with_duration(job),
             "logTail": log_tail,
             "progress": _job_progress(job, progress_log_tail),
+            "producedFiles": job.get("producedFiles") or _produced_files_from_job(job),
         }
     )
 
@@ -661,6 +662,7 @@ async def _run_job(job_id: str) -> None:
                     job.get("deliverables", []),
                 )
                 step["exitCode"] = exit_code
+                step["result"] = _step_result_from_logs(job_id, step["name"])
                 if exit_code != 0:
                     raise RuntimeError(f"Step failed: {step['name']} exitCode={exit_code}")
             step["status"] = "done"
@@ -682,6 +684,7 @@ async def _run_job(job_id: str) -> None:
         _append_log(job_id, f"[error] {exc}")
     finally:
         job["finishedAt"] = _now()
+        job["producedFiles"] = _produced_files_from_job(job)
         for step in job["steps"]:
             if step.get("status") == "running":
                 step["status"] = job["status"]
@@ -746,6 +749,42 @@ def _read_log_tail(job_id: str, tail: int) -> list[str]:
         return []
     lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
     return lines[-max(1, min(tail, 500)) :]
+
+
+def _exported_files_from_logs(lines: list[str]) -> list[str]:
+    files: list[str] = []
+    seen: set[str] = set()
+    for line in lines:
+        match = re.search(r"Exported\s+→\s+(.+)$", str(line))
+        if not match:
+            continue
+        value = match.group(1).strip()
+        if value and value not in seen:
+            seen.add(value)
+            files.append(value)
+    return files
+
+
+def _step_result_from_logs(job_id: str, step: str) -> dict[str, Any]:
+    if step not in {"export", "polish"}:
+        return {}
+    produced_files = _exported_files_from_logs(_read_log_tail(job_id, 500))
+    return {"producedFiles": produced_files} if produced_files else {}
+
+
+def _produced_files_from_job(job: dict[str, Any]) -> list[str]:
+    files: list[str] = []
+    seen: set[str] = set()
+    for step in job.get("steps", []):
+        result = step.get("result") if isinstance(step, dict) else None
+        if not isinstance(result, dict):
+            continue
+        for value in result.get("producedFiles") or []:
+            text = str(value)
+            if text and text not in seen:
+                seen.add(text)
+                files.append(text)
+    return files
 
 
 def _job_progress(job: dict[str, Any], log_tail: list[str]) -> dict[str, Any]:
@@ -1066,6 +1105,7 @@ def _job_summary(job: dict[str, Any]) -> dict[str, Any]:
         "updatedAt": job.get("updatedAt"),
         "durationSeconds": job.get("durationSeconds"),
         "error": job.get("error"),
+        "producedFiles": job.get("producedFiles") or _produced_files_from_job(job),
     }
 
 
