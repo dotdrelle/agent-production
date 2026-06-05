@@ -72,6 +72,10 @@ Streamable HTTP requests to the same URL.
   the llm-wiki trace file when available: phase, label, detail, percent,
   current ingest source, template/deliverable, batch index/count, and last trace
   event.
+- `production_start_job` and `production_job_status` include additive
+  `_activity` metadata with `poll.server=production` and
+  `poll.tool=production_job_status`, so manager shells can monitor jobs without
+  hard-coding production-specific status parsing.
 - Cancelling a running job terminates the active process, marks unfinished steps
   as `cancelled`, clears the workspace lock, and appends a cancellation log
   entry.

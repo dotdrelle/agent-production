@@ -27,6 +27,9 @@ over MCP. It runs allowlisted long-running jobs such as `doctor`, `ingest`,
   when changing job execution.
 - Jobs are asynchronous. Tool calls should return a `jobId` quickly, then expose
   status and logs through follow-up tools.
+- `production_start_job` and `production_job_status` must preserve their native
+  payloads and include additive `_activity` metadata for manager/orchestrator
+  polling. `_activity.poll` should point to `production.production_job_status`.
 - Keep the default pipeline as `ingest`, `build`, `export`, then `polish`.
   The legacy `copy` step is available only when explicitly requested and
   configured.

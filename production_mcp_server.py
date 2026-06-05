@@ -90,6 +90,42 @@ def _json_text(payload: dict[str, Any]) -> list[TextContent]:
     return [TextContent(type="text", text=json.dumps(payload, ensure_ascii=False, indent=2))]
 
 
+def _terminal_status(status: Any) -> bool:
+    return str(status or "").lower() in {"done", "failed", "cancelled", "canceled", "complete", "completed", "success", "error"}
+
+
+def _activity_for_job(job: dict[str, Any], progress: dict[str, Any] | None = None) -> dict[str, Any]:
+    job_id = str(job.get("jobId") or "")
+    status = str(job.get("status") or (progress or {}).get("status") or "running")
+    step = (progress or {}).get("currentStep") or job.get("type") or "production"
+    percent = (progress or {}).get("percent")
+    label_parts = [
+        "Production",
+        str(job.get("type") or "job"),
+        status,
+        str(step) if step else None,
+        f"{round(float(percent))}%" if isinstance(percent, (int, float)) else None,
+    ]
+    return {
+        "id": job_id,
+        "source": "production",
+        "kind": str(job.get("type") or "job"),
+        "label": " · ".join(part for part in label_parts if part),
+        "status": status,
+        "progress": progress or {"step": step},
+        "poll": {
+            "server": "production",
+            "tool": "production_job_status",
+            "args": {"jobId": job_id},
+            "intervalMs": 2500,
+        } if job_id and not _terminal_status(status) else None,
+        "startedAt": job.get("startedAt") or job.get("createdAt"),
+        "updatedAt": job.get("updatedAt") or _now(),
+        "error": job.get("error"),
+        "terminal": _terminal_status(status),
+    }
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -527,7 +563,7 @@ async def _tool_start_job(args: dict[str, Any]) -> list[TextContent]:
     _create_lock(job_id)
     task = asyncio.create_task(_run_job(job_id))
     _ACTIVE_TASKS[job_id] = task
-    return _json_text({"ok": True, "jobId": job_id, "status": "queued", "plan": plan})
+    return _json_text({"ok": True, "jobId": job_id, "status": "queued", "plan": plan, "_activity": _activity_for_job(job)})
 
 
 def _tool_job_status(args: dict[str, Any]) -> list[TextContent]:
@@ -535,13 +571,15 @@ def _tool_job_status(args: dict[str, Any]) -> list[TextContent]:
     job = _load_job(job_id)
     log_tail = _read_log_tail(job_id, 30)
     progress_log_tail = _read_log_tail(job_id, 500)
+    progress = _job_progress(job, progress_log_tail)
     return _json_text(
         {
             "ok": True,
             "job": _with_duration(job),
             "logTail": log_tail,
-            "progress": _job_progress(job, progress_log_tail),
+            "progress": progress,
             "producedFiles": job.get("producedFiles") or _produced_files_from_job(job),
+            "_activity": _activity_for_job(job, progress),
         }
     )
 
