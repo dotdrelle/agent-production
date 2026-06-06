@@ -31,6 +31,7 @@ import uvicorn
 
 app = Server("agent-wiki-production")
 
+_AGENT_VERSION = "0.5.1"
 _MCP_TOKEN = os.environ.get("MCP_AUTH_TOKEN", "")
 _WORKSPACE_NAME = os.environ.get("WORKSPACE_NAME", "workspace")
 _WORKSPACE_PATH = Path(os.environ.get("WIKI_WORKSPACE_PATH", "/workspace")).resolve()
@@ -286,6 +287,7 @@ def _render_landing_page(endpoint_url: str, scheme: str) -> str:
     <section class="panel">
       <dl>
         <dt>Status</dt><dd>Ready</dd>
+        <dt>Version</dt><dd><code>{_escape_html(_AGENT_VERSION)}</code></dd>
         <dt>Endpoint</dt><dd><code>{_escape_html(endpoint_url)}</code></dd>
         <dt>Transport</dt><dd>MCP Streamable HTTP over {_escape_html(scheme.upper())}</dd>
         <dt>Authentication</dt><dd>{_escape_html(auth_status)}</dd>
@@ -449,6 +451,7 @@ def _tool_status() -> list[TextContent]:
         {
             "ok": True,
             "service": "agent-wiki-production",
+            "version": _AGENT_VERSION,
             "workspace": {"name": _WORKSPACE_NAME, "path": str(_WORKSPACE_PATH), "exists": _WORKSPACE_PATH.exists()},
             "allowedSteps": sorted(_ALLOWED_STEPS),
             "requireConfirmation": _REQUIRE_CONFIRMATION,
