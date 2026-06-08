@@ -33,6 +33,11 @@ over MCP. It runs allowlisted long-running jobs such as `doctor`, `ingest`,
 - Keep the default pipeline as `ingest`, `build`, `export`, then `polish`.
   The legacy `copy` step is available only when explicitly requested and
   configured.
+- The `stabilize` flag on `production_start_job` applies only to `build` steps.
+  It passes `--stabilize` to `wiki build`, which preserves unchanged sections
+  verbatim and merges only changed sections via LLM. It is a no-op when no
+  existing deliverable is present. Do not add `--stabilize` to `ingest`,
+  `export`, or `polish` commands.
 - Use `PRODUCTION_REQUIRE_CONFIRMATION=true` when a deployment needs an extra
   application-level guard for mutating jobs.
 - LLM/model/provider secrets belong in the mounted workspace `.wikirc.yaml`, not

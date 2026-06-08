@@ -31,7 +31,7 @@ import uvicorn
 
 app = Server("agent-wiki-production")
 
-_AGENT_VERSION = "0.5.7"
+_AGENT_VERSION = "0.5.12"
 _MCP_TOKEN = os.environ.get("MCP_AUTH_TOKEN", "")
 _WORKSPACE_NAME = os.environ.get("WORKSPACE_NAME", "workspace")
 _WORKSPACE_PATH = Path(os.environ.get("WIKI_WORKSPACE_PATH", "/workspace")).resolve()
@@ -98,7 +98,7 @@ def _terminal_status(status: Any) -> bool:
 def _activity_for_job(job: dict[str, Any], progress: dict[str, Any] | None = None) -> dict[str, Any]:
     job_id = str(job.get("jobId") or "")
     status = str(job.get("status") or (progress or {}).get("status") or "running")
-    step = (progress or {}).get("currentStep") or job.get("type") or "production"
+    step = (progress or {}).get("phase") or (progress or {}).get("currentStep") or job.get("type") or "production"
     percent = (progress or {}).get("percent")
     label_parts = [
         "Production",
@@ -365,6 +365,14 @@ async def list_tools() -> list[Tool]:
                         "items": {"type": "string"},
                         "description": "Required for export or polish steps. Paths are relative to the workspace root or deliverables/.",
                     },
+                    "stabilize": {
+                        "type": "boolean",
+                        "description": (
+                            "Apply section-by-section stabilization on build steps. "
+                            "Unchanged sections are preserved verbatim; only changed sections are rewritten by LLM. "
+                            "Ignored for first builds and has no effect on ingest, export, or polish steps."
+                        ),
+                    },
                     "confirm": {"type": "boolean", "description": "Set true after explicit user approval."},
                     "dryRun": {"type": "boolean", "description": "Validate and return the planned job without running it."},
                 },
@@ -488,6 +496,8 @@ def _tool_list_templates(args: dict[str, Any]) -> list[TextContent]:
     deliverables: list[dict[str, Any]] = []
     if include_deliverables and deliverables_dir.exists():
         for path in sorted(deliverables_dir.rglob("*.md")):
+            if any(part.startswith(".tmp.") or part.startswith(".changes.") for part in path.parts):
+                continue
             rel_deliverable = path.relative_to(deliverables_dir).as_posix()
             if rel_deliverable in expected_outputs:
                 continue
@@ -517,6 +527,7 @@ async def _tool_start_job(args: dict[str, Any]) -> list[TextContent]:
     steps = _resolve_steps(job_type, args.get("steps"))
     templates = _resolve_string_list(args.get("templates"), "templates")
     deliverables = _resolve_string_list(args.get("deliverables"), "deliverables")
+    stabilize = bool(args.get("stabilize", False))
 
     if job_type not in _ALLOWED_STEPS:
         raise ValueError(f"Job type is not allowed: {job_type}")
@@ -534,9 +545,10 @@ async def _tool_start_job(args: dict[str, Any]) -> list[TextContent]:
         "workspace": _WORKSPACE_NAME,
         "templates": templates,
         "deliverables": deliverables,
+        "stabilize": stabilize,
     }
     if dry_run:
-        return _json_text({"ok": True, "dryRun": True, "plan": plan, "commands": _command_labels(steps, templates, deliverables)})
+        return _json_text({"ok": True, "dryRun": True, "plan": plan, "commands": _command_labels(steps, templates, deliverables, stabilize)})
     if _REQUIRE_CONFIRMATION and not confirm and any(step in _MUTATING_STEPS for step in steps):
         raise ValueError("Production jobs require confirm=true after explicit user approval.")
 
@@ -552,6 +564,7 @@ async def _tool_start_job(args: dict[str, Any]) -> list[TextContent]:
         "type": job_type,
         "templates": templates,
         "deliverables": deliverables,
+        "stabilize": stabilize,
         "steps": [{"name": step, "status": "pending"} for step in steps],
         "status": "queued",
         "createdAt": _now(),
@@ -701,6 +714,7 @@ async def _run_job(job_id: str) -> None:
                     step["name"],
                     job.get("templates", []),
                     job.get("deliverables", []),
+                    stabilize=bool(job.get("stabilize", False)),
                 )
                 step["exitCode"] = exit_code
                 step["result"] = _step_result_from_logs(job_id, step["name"])
@@ -761,8 +775,14 @@ def _run_copy_step(job_id: str) -> int:
     return copied
 
 
-async def _run_cli_step(job_id: str, step: str, templates: list[str], deliverables: list[str]) -> int:
-    for command in _step_commands(step, templates, deliverables):
+async def _run_cli_step(
+    job_id: str,
+    step: str,
+    templates: list[str],
+    deliverables: list[str],
+    stabilize: bool = False,
+) -> int:
+    for command in _step_commands(step, templates, deliverables, stabilize=stabilize):
         _append_log(job_id, f"[cmd] cwd={_WORKSPACE_PATH} {' '.join(command)}")
         proc = await asyncio.create_subprocess_exec(
             *command,
@@ -846,6 +866,11 @@ def _job_progress(job: dict[str, Any], log_tail: list[str]) -> dict[str, Any]:
         "batchIndex": trace.get("batchIndex"),
         "batchCount": trace.get("batchCount"),
         "instructionCount": trace.get("instructionCount"),
+        "stabilizeKept": trace.get("stabilizeKept"),
+        "stabilizeMerged": trace.get("stabilizeMerged"),
+        "stabilizeInserted": trace.get("stabilizeInserted"),
+        "stabilizeRemoved": trace.get("stabilizeRemoved"),
+        "stabilizeSection": trace.get("stabilizeSection"),
         "lastEvent": trace.get("lastEvent"),
         "lastEventAt": trace.get("lastEventAt"),
         "waitMs": trace.get("waitMs"),
@@ -950,6 +975,10 @@ def _parse_trace_progress(trace_file: str) -> dict[str, Any]:
     state: dict[str, Any] = {"traceFile": trace_file}
     ingest_input_count: int | None = None
     ingest_done_count = 0
+    stabilize_kept = 0
+    stabilize_merged = 0
+    stabilize_inserted = 0
+    stabilize_removed = 0
     for line in lines:
         event = _trace_event(line)
         if not event:
@@ -1029,33 +1058,103 @@ def _parse_trace_progress(trace_file: str) -> dict[str, Any]:
             state["deliverable"] = fields.get("output")
             state["instructionCount"] = _int_field(fields.get("instructions"))
             state["label"] = f"Build {state.get('template') or ''}".strip()
+        elif name == "build:stabilize-start":
+            state["phase"] = "stabilize"
+            state["template"] = fields.get("template") or state.get("template")
+            state["deliverable"] = fields.get("output") or state.get("deliverable")
+            state["label"] = f"Stabilize {state.get('template') or ''}".strip()
+            state["detail"] = "Préparation stabilisation"
+            state["percent"] = 95
+        elif name == "build:stabilize-section-skip":
+            stabilize_kept += 1
+            section = _heading_path_label(fields.get("headingPath"))
+            state["phase"] = "stabilize"
+            state["label"] = f"Stabilize {state.get('template') or ''}".strip()
+            state["detail"] = f"Section conservée: {section}" if section else "Section conservée"
+            state["percent"] = 96
+            state["stabilizeKept"] = stabilize_kept
+            state["stabilizeSection"] = section
+        elif name == "build:stabilize-section-llm":
+            stabilize_merged += 1
+            section = _heading_path_label(fields.get("headingPath"))
+            state["phase"] = "stabilize"
+            state["label"] = f"Stabilize {state.get('template') or ''}".strip()
+            state["detail"] = f"Stabilisation LLM: {section}" if section else "Stabilisation LLM"
+            state["percent"] = 97
+            state["stabilizeMerged"] = stabilize_merged
+            state["stabilizeSection"] = section
+        elif name == "build:stabilize-done":
+            kept = _int_field(fields.get("kept"))
+            merged = _int_field(fields.get("merged"))
+            inserted = _int_field(fields.get("inserted"))
+            removed = _int_field(fields.get("removed"))
+            if kept is not None:
+                stabilize_kept = kept
+            if merged is not None:
+                stabilize_merged = merged
+            if inserted is not None:
+                stabilize_inserted = inserted
+            if removed is not None:
+                stabilize_removed = removed
+            state["phase"] = "stabilize"
+            state["label"] = f"Stabilize {state.get('template') or ''}".strip()
+            state["detail"] = (
+                f"Stabilisation terminée: {stabilize_kept} conservées · "
+                f"{stabilize_merged} modifiées · {stabilize_inserted} nouvelles · "
+                f"{stabilize_removed} supprimées"
+            )
+            state["percent"] = 98
+            state["stabilizeKept"] = stabilize_kept
+            state["stabilizeMerged"] = stabilize_merged
+            state["stabilizeInserted"] = stabilize_inserted
+            state["stabilizeRemoved"] = stabilize_removed
+        elif name == "build:stabilize-failed":
+            state["phase"] = "stabilize"
+            state["template"] = fields.get("template") or state.get("template")
+            state["deliverable"] = fields.get("output") or state.get("deliverable")
+            state["label"] = f"Stabilize {state.get('template') or ''}".strip()
+            message = fields.get("message")
+            state["detail"] = f"Stabilisation échouée: {message}" if message else "Stabilisation échouée"
+            state["percent"] = 98
         elif name == "llm:start":
-            state["phase"] = "llm"
+            is_stabilize_llm = fields.get("label") == "build:stabilize"
+            state["phase"] = "stabilize" if is_stabilize_llm else "llm"
             state["source"] = fields.get("source") or state.get("source")
             state["template"] = fields.get("template") or state.get("template")
             state["batchIndex"] = _int_field(fields.get("batchIndex"))
             state["batchCount"] = _int_field(fields.get("batchCount"))
             state["instructionCount"] = _int_field(fields.get("instructionCount")) or state.get("instructionCount")
             state["currentBatchStartedAt"] = event["at"]
-            if state.get("source") and not state.get("template"):
+            if is_stabilize_llm:
+                section = str(state.get("stabilizeSection") or "")
+                state["label"] = f"Stabilize {state.get('template') or ''}".strip()
+                state["detail"] = f"Stabilisation LLM: {section}" if section else "Stabilisation LLM"
+                state["percent"] = 97
+            elif state.get("source") and not state.get("template"):
                 source_name = Path(str(state.get("source") or "")).name
                 state["label"] = f"Ingest {source_name}".strip()
                 state["detail"] = "LLM en cours"
             else:
                 state["label"] = f"Build {state.get('template') or ''}".strip()
-            if state.get("batchIndex") is not None and state.get("batchCount"):
+            if not is_stabilize_llm and state.get("batchIndex") is not None and state.get("batchCount"):
                 state["detail"] = f"Batch {state['batchIndex'] + 1}/{state['batchCount']} · LLM en cours"
                 state["percent"] = _batch_percent(state["batchIndex"], state["batchCount"], False)
         elif name == "llm:end":
-            state["phase"] = "llm"
+            is_stabilize_llm = fields.get("label") == "build:stabilize"
+            state["phase"] = "stabilize" if is_stabilize_llm else "llm"
             state["source"] = fields.get("source") or state.get("source")
             state["batchIndex"] = _int_field(fields.get("batchIndex"))
             state["batchCount"] = _int_field(fields.get("batchCount"))
-            if state.get("source") and not state.get("template"):
+            if is_stabilize_llm:
+                section = str(state.get("stabilizeSection") or "")
+                state["label"] = f"Stabilize {state.get('template') or ''}".strip()
+                state["detail"] = f"Stabilisation LLM terminée: {section}" if section else "Stabilisation LLM terminée"
+                state["percent"] = 97
+            elif state.get("source") and not state.get("template"):
                 source_name = Path(str(state.get("source") or "")).name
                 state["label"] = f"Ingest {source_name}".strip()
                 state["detail"] = "LLM terminé"
-            if state.get("batchIndex") is not None and state.get("batchCount"):
+            if not is_stabilize_llm and state.get("batchIndex") is not None and state.get("batchCount"):
                 state["detail"] = f"Batch {state['batchIndex'] + 1}/{state['batchCount']} terminé"
                 state["percent"] = _batch_percent(state["batchIndex"], state["batchCount"], True)
         elif name == "build:template-done":
@@ -1109,6 +1208,18 @@ def _trace_fields(rest: str) -> dict[str, str]:
     return fields
 
 
+def _heading_path_label(value: str | None) -> str:
+    if not value:
+        return ""
+    try:
+        parsed = json.loads(value)
+        if isinstance(parsed, list):
+            return " > ".join(str(item) for item in parsed if str(item))
+    except Exception:
+        pass
+    return value.strip()
+
+
 def _int_field(value: Any) -> int | None:
     try:
         return int(value)
@@ -1150,11 +1261,13 @@ def _job_summary(job: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _step_commands(step: str, templates: list[str], deliverables: list[str]) -> list[list[str]]:
+def _step_commands(step: str, templates: list[str], deliverables: list[str], stabilize: bool = False) -> list[list[str]]:
     if step == "copy":
         return []
     command = [*_STEP_COMMANDS[step]]
     if step == "build":
+        if stabilize:
+            command.append("--stabilize")
         command.extend(templates)
         return [command]
     if step in {"export", "polish"}:
@@ -1162,13 +1275,13 @@ def _step_commands(step: str, templates: list[str], deliverables: list[str]) -> 
     return [command]
 
 
-def _command_labels(steps: list[str], templates: list[str], deliverables: list[str]) -> list[str]:
+def _command_labels(steps: list[str], templates: list[str], deliverables: list[str], stabilize: bool = False) -> list[str]:
     labels: list[str] = []
     for step in steps:
         if step == "copy":
             labels.append(f"copy {len(_parse_imports())} import(s) to raw/untracked")
             continue
-        labels.extend(" ".join(command) for command in _step_commands(step, templates, deliverables))
+        labels.extend(" ".join(command) for command in _step_commands(step, templates, deliverables, stabilize=stabilize))
     return labels
 
 

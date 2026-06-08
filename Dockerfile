@@ -1,4 +1,6 @@
-FROM dotdrelle/llm-wiki:latest
+ARG LLM_WIKI_IMAGE=dotdrelle/llm-wiki
+ARG LLM_WIKI_TAG=latest
+FROM ${LLM_WIKI_IMAGE}:${LLM_WIKI_TAG}
 
 USER root
 WORKDIR /app-production

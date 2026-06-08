@@ -89,6 +89,9 @@ Streamable HTTP requests to the same URL.
 - `build` jobs accept an optional `templates` array, for example
   `["EAE-REAS-architecture.md"]`, so a targeted build does not rebuild every
   template.
+- `build` and `pipeline` jobs accept `stabilize: true` to pass
+  `wiki build --stabilize`; existing deliverables keep unchanged sections
+  verbatim while changed sections are merged from the fresh candidate.
 - `export` and `polish` jobs require a `deliverables` array, for example
   `["EAE-REAS-architecture.md"]`, so export/polish runs only on the requested
   deliverable.
