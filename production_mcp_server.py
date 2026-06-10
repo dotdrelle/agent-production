@@ -31,10 +31,11 @@ import uvicorn
 
 app = Server("agent-wiki-production")
 
-_AGENT_VERSION = "0.5.13"
+_AGENT_VERSION = "0.5.15"
 _MCP_TOKEN = os.environ.get("MCP_AUTH_TOKEN", "")
 _WORKSPACE_NAME = os.environ.get("WORKSPACE_NAME", "workspace")
 _WORKSPACE_PATH = Path(os.environ.get("WIKI_WORKSPACE_PATH", "/workspace")).resolve()
+_LOG_PREFIX = f"[production-mcp/{_WORKSPACE_NAME}]"
 _IMPORTS = os.environ.get("WIKI_IMPORTS", "")
 _IMPORT_PATH_MAPPINGS = os.environ.get("PRODUCTION_IMPORT_PATH_MAPPINGS", "../agent-cme/data=/agent-cme-data")
 _ALLOWED_STEPS = {
@@ -59,7 +60,7 @@ _STEP_COMMANDS: dict[str, list[str]] = {
 _MUTATING_STEPS = {"copy", "ingest", "build", "export", "polish", "pipeline"}
 
 if not _MCP_TOKEN:
-    print("[production-mcp] Warning: MCP_AUTH_TOKEN is not configured; the endpoint accepts unauthenticated clients.")
+    print(f"{_LOG_PREFIX} Warning: MCP_AUTH_TOKEN is not configured; the endpoint accepts unauthenticated clients.")
 
 
 class _BearerAuthMiddleware(BaseHTTPMiddleware):
@@ -377,6 +378,10 @@ async def list_tools() -> list[Tool]:
                         "type": "string",
                         "description": "Optional .wikirc file path relative to the workspace root, for example .wikirc.yaml.openai.",
                     },
+                    "callerLabel": {
+                        "type": "string",
+                        "description": "Optional identifier of the caller (e.g. 'juno/wiki-manager'). Logged in the job for traceability.",
+                    },
                     "confirm": {"type": "boolean", "description": "Set true after explicit user approval."},
                     "dryRun": {"type": "boolean", "description": "Validate and return the planned job without running it."},
                 },
@@ -432,7 +437,7 @@ async def list_tools() -> list[Tool]:
 @app.call_tool()
 async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
     start = time.time()
-    print(f"[production-mcp] tools/call {name}")
+    print(f"{_LOG_PREFIX} tools/call {name}")
     try:
         match name:
             case "production_status":
@@ -451,10 +456,10 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
                 result = _tool_list_jobs(arguments)
             case _:
                 raise ValueError(f"Unknown tool: {name}")
-        print(f"[production-mcp] tools/result {name} ok {int((time.time() - start) * 1000)}ms")
+        print(f"{_LOG_PREFIX} tools/result {name} ok {int((time.time() - start) * 1000)}ms")
         return result
     except Exception as exc:
-        print(f"[production-mcp] tools/result {name} error {int((time.time() - start) * 1000)}ms {exc}")
+        print(f"{_LOG_PREFIX} tools/result {name} error {int((time.time() - start) * 1000)}ms {exc}")
         return _json_text({"ok": False, "error": str(exc)})
 
 
@@ -533,6 +538,7 @@ async def _tool_start_job(args: dict[str, Any]) -> list[TextContent]:
     deliverables = _resolve_string_list(args.get("deliverables"), "deliverables")
     stabilize = bool(args.get("stabilize", False))
     config_path = _resolve_config_path(args.get("configPath"))
+    caller_label = str(args["callerLabel"]).strip()[:120] if args.get("callerLabel") else None
 
     if job_type not in _ALLOWED_STEPS:
         raise ValueError(f"Job type is not allowed: {job_type}")
@@ -572,6 +578,7 @@ async def _tool_start_job(args: dict[str, Any]) -> list[TextContent]:
         "deliverables": deliverables,
         "stabilize": stabilize,
         "configPath": config_path,
+        **({"callerLabel": caller_label} if caller_label else {}),
         "steps": [{"name": step, "status": "pending"} for step in steps],
         "status": "queued",
         "createdAt": _now(),
@@ -726,7 +733,8 @@ async def _run_job(job_id: str) -> None:
     job["status"] = "running"
     job["startedAt"] = _now()
     _save_job(job)
-    _append_log(job_id, f"[start] workspace={_WORKSPACE_NAME} type={job['type']}")
+    caller_info = f" caller={job['callerLabel']}" if job.get("callerLabel") else ""
+    _append_log(job_id, f"[start] workspace={_WORKSPACE_NAME} type={job['type']}{caller_info}")
     try:
         for index, step in enumerate(job["steps"]):
             step["status"] = "running"
@@ -813,11 +821,12 @@ async def _run_cli_step(
     stabilize: bool = False,
     config_path: str | None = None,
 ) -> int:
+    env = dict(os.environ)
+    env["WIKI_RUN_CALLER"] = job_id
+    if config_path:
+        env["WIKI_CONFIG_PATH"] = config_path
+        _append_log(job_id, f"[config] WIKI_CONFIG_PATH={config_path}")
     for command in _step_commands(step, templates, deliverables, stabilize=stabilize):
-        env = dict(os.environ)
-        if config_path:
-            env["WIKI_CONFIG_PATH"] = config_path
-            _append_log(job_id, f"[config] WIKI_CONFIG_PATH={config_path}")
         _append_log(job_id, f"[cmd] cwd={_WORKSPACE_PATH} {' '.join(command)}")
         proc = await asyncio.create_subprocess_exec(
             *command,
@@ -1366,8 +1375,8 @@ def create_starlette_app() -> Starlette:
 def main() -> None:
     host = os.environ.get("MCP_HOST", "0.0.0.0")
     port = int(os.environ.get("MCP_PORT", "8080"))
-    print(f"[production-mcp] Streamable HTTP on http://{host}:{port}/mcp")
-    print(f"[production-mcp] workspace={_WORKSPACE_NAME} path={_WORKSPACE_PATH}")
+    print(f"{_LOG_PREFIX} Streamable HTTP on http://{host}:{port}/mcp")
+    print(f"{_LOG_PREFIX} path={_WORKSPACE_PATH}")
     uvicorn.run(create_starlette_app(), host=host, port=port)
 
 

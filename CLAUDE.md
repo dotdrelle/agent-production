@@ -40,6 +40,14 @@ over MCP. It runs allowlisted long-running jobs such as `doctor`, `ingest`,
   `export`, or `polish` commands.
 - Use `PRODUCTION_REQUIRE_CONFIRMATION=true` when a deployment needs an extra
   application-level guard for mutating jobs.
+- `production_start_job` accepts optional `configPath` (a `.wikirc.*` filename
+  relative to the workspace root) to select a config profile for a single job.
+  When supplied, the subprocess receives `WIKI_CONFIG_PATH=<configPath>`.
+- `production_start_job` accepts optional `callerLabel` (max 120 chars) to
+  identify the originating agent in job logs. The server logs
+  `[start] ... caller=<callerLabel>` when set.
+- The subprocess always receives `WIKI_RUN_CALLER=<job_id>` so `llm-wiki` CLI
+  trace files can link back to the production job that launched them.
 - LLM/model/provider secrets belong in the mounted workspace `.wikirc.yaml`, not
   in this service's README examples or code.
 - Document path and token examples with placeholders such as

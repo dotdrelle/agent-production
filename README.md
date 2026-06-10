@@ -49,7 +49,8 @@ export WIKI_IMPORTS=
 Configure LLM and vector provider keys in that workspace's `.wikirc.yaml`
 (`llm.apiKey` and, when needed, `retrieval.vector.apiKey`). `production_start_job`
 also accepts `configPath` to select a workspace-local profile such as
-`.wikirc.yaml.openai` for a single job.
+`.wikirc.yaml.openai` for a single job, and optional `callerLabel` (max 120
+chars) to identify the originating agent in job logs.
 
 ## Run Locally
 
