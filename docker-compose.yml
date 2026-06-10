@@ -8,6 +8,7 @@ services:
       - MCP_AUTH_TOKEN=${MCP_AUTH_TOKEN:-}
       - WORKSPACE_NAME=${WORKSPACE_NAME:-workspace}
       - WIKI_WORKSPACE_PATH=/workspace
+      - WIKI_CONFIG_PATH=${WIKI_CONFIG_PATH:-}
       - WIKI_IMPORTS=${WIKI_IMPORTS:-}
       - PRODUCTION_IMPORT_PATH_MAPPINGS=${PRODUCTION_IMPORT_PATH_MAPPINGS:-../agent-cme/data=/agent-cme-data}
       - PRODUCTION_ALLOWED_STEPS=${PRODUCTION_ALLOWED_STEPS:-doctor,copy,ingest,build,export,polish,pipeline}

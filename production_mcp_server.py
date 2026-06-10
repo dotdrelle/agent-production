@@ -373,6 +373,10 @@ async def list_tools() -> list[Tool]:
                             "Ignored for first builds and has no effect on ingest, export, or polish steps."
                         ),
                     },
+                    "configPath": {
+                        "type": "string",
+                        "description": "Optional .wikirc file path relative to the workspace root, for example .wikirc.yaml.openai.",
+                    },
                     "confirm": {"type": "boolean", "description": "Set true after explicit user approval."},
                     "dryRun": {"type": "boolean", "description": "Validate and return the planned job without running it."},
                 },
@@ -528,6 +532,7 @@ async def _tool_start_job(args: dict[str, Any]) -> list[TextContent]:
     templates = _resolve_string_list(args.get("templates"), "templates")
     deliverables = _resolve_string_list(args.get("deliverables"), "deliverables")
     stabilize = bool(args.get("stabilize", False))
+    config_path = _resolve_config_path(args.get("configPath"))
 
     if job_type not in _ALLOWED_STEPS:
         raise ValueError(f"Job type is not allowed: {job_type}")
@@ -546,6 +551,7 @@ async def _tool_start_job(args: dict[str, Any]) -> list[TextContent]:
         "templates": templates,
         "deliverables": deliverables,
         "stabilize": stabilize,
+        "configPath": config_path,
     }
     if dry_run:
         return _json_text({"ok": True, "dryRun": True, "plan": plan, "commands": _command_labels(steps, templates, deliverables, stabilize)})
@@ -565,6 +571,7 @@ async def _tool_start_job(args: dict[str, Any]) -> list[TextContent]:
         "templates": templates,
         "deliverables": deliverables,
         "stabilize": stabilize,
+        "configPath": config_path,
         "steps": [{"name": step, "status": "pending"} for step in steps],
         "status": "queued",
         "createdAt": _now(),
@@ -671,6 +678,28 @@ def _resolve_string_list(value: Any, name: str) -> list[str]:
     return items
 
 
+def _resolve_config_path(value: Any) -> str | None:
+    if value is None or str(value).strip() == "":
+        return None
+    item = str(value).strip()
+    path = Path(item)
+    file_name = path.name
+    if item.startswith("-") or path.is_absolute() or ".." in path.parts:
+        raise ValueError(f"Invalid configPath: {item}")
+    if file_name != ".wikirc.yaml" and file_name != ".wikirc.yml" and not (
+        file_name.startswith(".wikirc.yaml.") or file_name.startswith(".wikirc.yml.")
+    ):
+        raise ValueError(f"Invalid configPath: {item}")
+    resolved = (_WORKSPACE_PATH / path).resolve()
+    try:
+        resolved.relative_to(_WORKSPACE_PATH)
+    except ValueError:
+        raise ValueError(f"Invalid configPath: {item}") from None
+    if not resolved.is_file():
+        raise ValueError(f"configPath does not exist: {item}")
+    return path.as_posix()
+
+
 def _relative_workspace_path(path: Path) -> str:
     return path.relative_to(_WORKSPACE_PATH).as_posix()
 
@@ -715,6 +744,7 @@ async def _run_job(job_id: str) -> None:
                     job.get("templates", []),
                     job.get("deliverables", []),
                     stabilize=bool(job.get("stabilize", False)),
+                    config_path=job.get("configPath"),
                 )
                 step["exitCode"] = exit_code
                 step["result"] = _step_result_from_logs(job_id, step["name"])
@@ -781,12 +811,18 @@ async def _run_cli_step(
     templates: list[str],
     deliverables: list[str],
     stabilize: bool = False,
+    config_path: str | None = None,
 ) -> int:
     for command in _step_commands(step, templates, deliverables, stabilize=stabilize):
+        env = dict(os.environ)
+        if config_path:
+            env["WIKI_CONFIG_PATH"] = config_path
+            _append_log(job_id, f"[config] WIKI_CONFIG_PATH={config_path}")
         _append_log(job_id, f"[cmd] cwd={_WORKSPACE_PATH} {' '.join(command)}")
         proc = await asyncio.create_subprocess_exec(
             *command,
             cwd=str(_WORKSPACE_PATH),
+            env=env,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
         )

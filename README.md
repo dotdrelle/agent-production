@@ -39,14 +39,17 @@ Optional:
 export PRODUCTION_ALLOWED_STEPS=doctor,copy,ingest,build,export,polish,pipeline
 export PRODUCTION_REQUIRE_CONFIRMATION=false
 export MCP_AUTH_TOKEN=<generated-local-token>
+export WIKI_CONFIG_PATH=.wikirc.yaml.openai
 export WIKI_IMPORTS=
 ```
 
-`MCP_AUTH_TOKEN` and `WIKI_IMPORTS` default to empty strings in the standalone Docker Compose file. Leave `WIKI_IMPORTS` empty unless you explicitly use the legacy `copy` step.
+`MCP_AUTH_TOKEN`, `WIKI_CONFIG_PATH`, and `WIKI_IMPORTS` default to empty strings in the standalone Docker Compose file. Leave `WIKI_IMPORTS` empty unless you explicitly use the legacy `copy` step.
 
 `agent-wiki-production` runs the `llm-wiki` CLI inside the mounted workspace.
 Configure LLM and vector provider keys in that workspace's `.wikirc.yaml`
-(`llm.apiKey` and, when needed, `retrieval.vector.apiKey`).
+(`llm.apiKey` and, when needed, `retrieval.vector.apiKey`). `production_start_job`
+also accepts `configPath` to select a workspace-local profile such as
+`.wikirc.yaml.openai` for a single job.
 
 ## Run Locally
 
