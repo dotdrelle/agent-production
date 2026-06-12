@@ -31,7 +31,7 @@ import uvicorn
 
 app = Server("agent-wiki-production")
 
-_AGENT_VERSION = "0.5.15"
+_AGENT_VERSION = "0.5.17"
 _MCP_TOKEN = os.environ.get("MCP_AUTH_TOKEN", "")
 _WORKSPACE_NAME = os.environ.get("WORKSPACE_NAME", "workspace")
 _WORKSPACE_PATH = Path(os.environ.get("WIKI_WORKSPACE_PATH", "/workspace")).resolve()
