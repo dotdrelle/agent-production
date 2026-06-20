@@ -31,13 +31,13 @@ import uvicorn
 
 app = Server("agent-wiki-production")
 
-_AGENT_VERSION = "0.5.21"
+_AGENT_VERSION = "0.6.8"
 _MCP_TOKEN = os.environ.get("MCP_AUTH_TOKEN", "")
 _WORKSPACE_NAME = os.environ.get("WORKSPACE_NAME", "workspace")
 _WORKSPACE_PATH = Path(os.environ.get("WIKI_WORKSPACE_PATH", "/workspace")).resolve()
 _LOG_PREFIX = f"[production-mcp/{_WORKSPACE_NAME}]"
 _IMPORTS = os.environ.get("WIKI_IMPORTS", "")
-_IMPORT_PATH_MAPPINGS = os.environ.get("PRODUCTION_IMPORT_PATH_MAPPINGS", "../agent-cme/data=/agent-cme-data")
+_IMPORT_PATH_MAPPINGS = os.environ.get("PRODUCTION_IMPORT_PATH_MAPPINGS", "")
 _ALLOWED_STEPS = {
     item.strip()
     for item in os.environ.get("PRODUCTION_ALLOWED_STEPS", "doctor,copy,ingest,build,export,polish,pipeline").split(",")
