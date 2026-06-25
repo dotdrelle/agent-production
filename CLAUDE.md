@@ -48,6 +48,8 @@ over MCP. It runs allowlisted long-running jobs such as `doctor`, `ingest`,
   `[start] ... caller=<callerLabel>` when set.
 - The subprocess always receives `WIKI_RUN_CALLER=<job_id>` so `llm-wiki` CLI
   trace files can link back to the production job that launched them.
+- Keep `_AGENT_VERSION` aligned with the coordinated `llm-wiki-manager`
+  release version so status responses identify the deployed agent bundle.
 - LLM/model/provider secrets belong in the mounted workspace `.wikirc.yaml`, not
   in this service's README examples or code.
 - Document path and token examples with placeholders such as
