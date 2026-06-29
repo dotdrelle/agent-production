@@ -31,7 +31,7 @@ import uvicorn
 
 app = Server("agent-wiki-production")
 
-_AGENT_VERSION = "0.6.34"
+_AGENT_VERSION = "0.6.45"
 _MCP_TOKEN = os.environ.get("MCP_AUTH_TOKEN", "")
 _WORKSPACE_NAME = os.environ.get("WORKSPACE_NAME", "workspace")
 _WORKSPACE_PATH = Path(os.environ.get("WIKI_WORKSPACE_PATH", "/workspace")).resolve()
@@ -924,7 +924,7 @@ def _job_progress(job: dict[str, Any], log_tail: list[str]) -> dict[str, Any]:
     }
     if status == "done":
         progress["percent"] = 100
-        progress["detail"] = progress["detail"] or "Job terminé"
+        progress["detail"] = progress["detail"] or "Job complete"
     if status in {"failed", "cancelled"}:
         progress["detail"] = str(job.get("error") or progress["detail"] or status)
     return progress
@@ -950,7 +950,7 @@ def _progress_label(job: dict[str, Any], step: dict[str, Any]) -> str:
 
 def _progress_detail(job: dict[str, Any], step: dict[str, Any]) -> str:
     status = step.get("status") or job.get("status")
-    return f"Étape {step.get('name')}: {status}" if step.get("name") else str(status or "")
+    return f"Step {step.get('name')}: {status}" if step.get("name") else str(status or "")
 
 
 def _step_percent(job: dict[str, Any]) -> int | None:
@@ -986,7 +986,7 @@ _WAIT_EVENTS = frozenset({
 def _service_name(event_name: str, fields: dict[str, str]) -> str:
     label = fields.get("label", "")
     if event_name.startswith("embedding:") or label == "embedding":
-        return "Vectorisation"
+        return "Embedding"
     if event_name.startswith("rerank:") or label == "rerank":
         return "Rerank"
     return "LLM"
@@ -1004,8 +1004,8 @@ def _quota_wait_detail(event_name: str, fields: dict[str, str], retry_at_iso: st
     if remaining_s is None and wait_ms is not None:
         remaining_s = max(0, round(wait_ms / 1000))
     if remaining_s is not None and remaining_s > 0:
-        return f"{service} en attente quota, reprise dans {remaining_s}s"
-    return f"{service} en attente quota, reprise imminente"
+        return f"{service} quota wait, resuming in {remaining_s}s"
+    return f"{service} quota wait, resuming shortly"
 
 
 def _parse_trace_progress(trace_file: str) -> dict[str, Any]:
@@ -1042,7 +1042,7 @@ def _parse_trace_progress(trace_file: str) -> dict[str, Any]:
             state["phase"] = "ingest"
             ingest_input_count = _int_field(fields.get("inputCount"))
             state["sourceCount"] = ingest_input_count
-            state["detail"] = "Sélection des sources"
+            state["detail"] = "Selecting sources"
             state["percent"] = 1
         elif name == "ingest:source-selection":
             state["phase"] = "ingest"
@@ -1051,7 +1051,7 @@ def _parse_trace_progress(trace_file: str) -> dict[str, Any]:
                 ingest_input_count = resolved_count
                 state["sourceCount"] = resolved_count
                 state["sourceDoneCount"] = ingest_done_count
-                state["detail"] = f"{resolved_count} source(s) à ingérer"
+                state["detail"] = f"{resolved_count} source(s) to ingest"
                 state["percent"] = 1 if resolved_count > 0 else 100
         elif name == "ingest:source-start":
             state["phase"] = "ingest"
@@ -1074,13 +1074,13 @@ def _parse_trace_progress(trace_file: str) -> dict[str, Any]:
             state["source"] = fields.get("source") or state.get("source")
             source_name = Path(str(state.get("source") or "")).name
             state["label"] = f"Ingest {source_name}".strip()
-            state["detail"] = "Préparation LLM"
+            state["detail"] = "Preparing LLM"
         elif name == "ingest:plan":
             state["phase"] = "ingest"
             state["source"] = fields.get("source") or state.get("source")
             source_name = Path(str(state.get("source") or "")).name
             state["label"] = f"Ingest {source_name}".strip()
-            state["detail"] = "Plan d'ingestion reçu"
+            state["detail"] = "Ingestion plan received"
         elif name == "ingest:source-done":
             state["phase"] = "ingest"
             ingest_done_count += 1
@@ -1095,7 +1095,7 @@ def _parse_trace_progress(trace_file: str) -> dict[str, Any]:
                 state["percent"] = max(1, min(99, round((ingest_done_count / ingest_input_count) * 100)))
         elif name == "ingest:run-done":
             state["phase"] = "done"
-            state["detail"] = "Ingest terminé"
+            state["detail"] = "Ingest complete"
             state["percent"] = 100
         elif name == "build:template-start":
             state["phase"] = "build"
@@ -1108,14 +1108,14 @@ def _parse_trace_progress(trace_file: str) -> dict[str, Any]:
             state["template"] = fields.get("template") or state.get("template")
             state["deliverable"] = fields.get("output") or state.get("deliverable")
             state["label"] = f"Stabilize {state.get('template') or ''}".strip()
-            state["detail"] = "Préparation stabilisation"
+            state["detail"] = "Preparing stabilization"
             state["percent"] = 95
         elif name == "build:stabilize-section-skip":
             stabilize_kept += 1
             section = _heading_path_label(fields.get("headingPath"))
             state["phase"] = "stabilize"
             state["label"] = f"Stabilize {state.get('template') or ''}".strip()
-            state["detail"] = f"Section conservée: {section}" if section else "Section conservée"
+            state["detail"] = f"Section kept: {section}" if section else "Section kept"
             state["percent"] = 96
             state["stabilizeKept"] = stabilize_kept
             state["stabilizeSection"] = section
@@ -1144,9 +1144,9 @@ def _parse_trace_progress(trace_file: str) -> dict[str, Any]:
             state["phase"] = "stabilize"
             state["label"] = f"Stabilize {state.get('template') or ''}".strip()
             state["detail"] = (
-                f"Stabilisation terminée: {stabilize_kept} conservées · "
-                f"{stabilize_merged} modifiées · {stabilize_inserted} nouvelles · "
-                f"{stabilize_removed} supprimées"
+                f"Stabilization complete: {stabilize_kept} kept · "
+                f"{stabilize_merged} modified · {stabilize_inserted} new · "
+                f"{stabilize_removed} removed"
             )
             state["percent"] = 98
             state["stabilizeKept"] = stabilize_kept
@@ -1159,7 +1159,7 @@ def _parse_trace_progress(trace_file: str) -> dict[str, Any]:
             state["deliverable"] = fields.get("output") or state.get("deliverable")
             state["label"] = f"Stabilize {state.get('template') or ''}".strip()
             message = fields.get("message")
-            state["detail"] = f"Stabilisation échouée: {message}" if message else "Stabilisation échouée"
+            state["detail"] = f"Stabilization failed: {message}" if message else "Stabilization failed"
             state["percent"] = 98
         elif name == "llm:start":
             is_stabilize_llm = fields.get("label") == "build:stabilize"
@@ -1178,11 +1178,11 @@ def _parse_trace_progress(trace_file: str) -> dict[str, Any]:
             elif state.get("source") and not state.get("template"):
                 source_name = Path(str(state.get("source") or "")).name
                 state["label"] = f"Ingest {source_name}".strip()
-                state["detail"] = "LLM en cours"
+                state["detail"] = "LLM running"
             else:
                 state["label"] = f"Build {state.get('template') or ''}".strip()
             if not is_stabilize_llm and state.get("batchIndex") is not None and state.get("batchCount"):
-                state["detail"] = f"Batch {state['batchIndex'] + 1}/{state['batchCount']} · LLM en cours"
+                state["detail"] = f"Batch {state['batchIndex'] + 1}/{state['batchCount']} · LLM running"
                 state["percent"] = _batch_percent(state["batchIndex"], state["batchCount"], False)
         elif name == "llm:end":
             is_stabilize_llm = fields.get("label") == "build:stabilize"
@@ -1193,24 +1193,24 @@ def _parse_trace_progress(trace_file: str) -> dict[str, Any]:
             if is_stabilize_llm:
                 section = str(state.get("stabilizeSection") or "")
                 state["label"] = f"Stabilize {state.get('template') or ''}".strip()
-                state["detail"] = f"Stabilisation LLM terminée: {section}" if section else "Stabilisation LLM terminée"
+                state["detail"] = f"LLM stabilization complete: {section}" if section else "LLM stabilization complete"
                 state["percent"] = 97
             elif state.get("source") and not state.get("template"):
                 source_name = Path(str(state.get("source") or "")).name
                 state["label"] = f"Ingest {source_name}".strip()
-                state["detail"] = "LLM terminé"
+                state["detail"] = "LLM complete"
             if not is_stabilize_llm and state.get("batchIndex") is not None and state.get("batchCount"):
-                state["detail"] = f"Batch {state['batchIndex'] + 1}/{state['batchCount']} terminé"
+                state["detail"] = f"Batch {state['batchIndex'] + 1}/{state['batchCount']} complete"
                 state["percent"] = _batch_percent(state["batchIndex"], state["batchCount"], True)
         elif name == "build:template-done":
             state["phase"] = "build"
             state["template"] = fields.get("template") or state.get("template")
             state["deliverable"] = fields.get("output") or state.get("deliverable")
-            state["detail"] = "Template terminé"
+            state["detail"] = "Template complete"
             state["percent"] = 98
         elif name == "build:run-done":
             state["phase"] = "done"
-            state["detail"] = "Build terminé"
+            state["detail"] = "Build complete"
             state["percent"] = 100
             state.pop("waitMs", None)
             state.pop("retryAt", None)
