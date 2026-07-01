@@ -31,7 +31,7 @@ import uvicorn
 
 app = Server("agent-wiki-production")
 
-_AGENT_VERSION = "0.7.1"
+_AGENT_VERSION = "0.7.3"
 _MCP_TOKEN = os.environ.get("MCP_AUTH_TOKEN", "")
 _WORKSPACE_NAME = os.environ.get("WORKSPACE_NAME", "workspace")
 _WORKSPACE_PATH = Path(os.environ.get("WIKI_WORKSPACE_PATH", "/workspace")).resolve()
@@ -380,7 +380,7 @@ async def list_tools() -> list[Tool]:
                     },
                     "callerLabel": {
                         "type": "string",
-                        "description": "Optional identifier of the caller (e.g. 'juno/wiki-manager'). Logged in the job for traceability.",
+                        "description": "Optional identifier of the caller (e.g. 'my-project/wiki-manager'). Logged in the job for traceability.",
                     },
                     "confirm": {"type": "boolean", "description": "Set true after explicit user approval."},
                     "dryRun": {"type": "boolean", "description": "Validate and return the planned job without running it."},
