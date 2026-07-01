@@ -50,7 +50,7 @@ over MCP. It runs allowlisted long-running jobs such as `doctor`, `ingest`,
   trace files can link back to the production job that launched them.
 - Keep `_AGENT_VERSION` aligned with the coordinated `llm-wiki-manager`
   release version so status responses identify the deployed agent bundle.
-  Current release line: `0.6.47`.
+  Current release line: `0.7.0`.
 - MCP tool descriptions, `_activity` metadata, progress details, status page
   text, and logs intended for operators must stay in English. The workspace
   `.wikirc` language affects only LLM-generated wiki/deliverable content.
