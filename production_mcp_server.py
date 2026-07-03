@@ -92,6 +92,13 @@ def _json_text(payload: dict[str, Any]) -> list[TextContent]:
     return [TextContent(type="text", text=json.dumps(payload, ensure_ascii=False, indent=2))]
 
 
+def _mask_secret_text(value: Any) -> str:
+    text = str(value)
+    text = re.sub(r"(?i)(authorization:\s*bearer\s+)[^\s,;]+", r"\1***", text)
+    text = re.sub(r"(?i)(api[_-]?key|token|secret|password)(['\"]?\s*[:=]\s*['\"]?)[^'\"\s,;]+", r"\1\2***", text)
+    return text
+
+
 def _terminal_status(status: Any) -> bool:
     return str(status or "").lower() in {"done", "failed", "cancelled", "canceled", "complete", "completed", "success", "error"}
 
@@ -459,7 +466,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
         print(f"{_LOG_PREFIX} tools/result {name} ok {int((time.time() - start) * 1000)}ms")
         return result
     except Exception as exc:
-        print(f"{_LOG_PREFIX} tools/result {name} error {int((time.time() - start) * 1000)}ms {exc}")
+        print(f"{_LOG_PREFIX} tools/result {name} error {int((time.time() - start) * 1000)}ms {_mask_secret_text(exc)}")
         return _json_text({"ok": False, "error": str(exc)})
 
 
