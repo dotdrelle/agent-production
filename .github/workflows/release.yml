@@ -10,8 +10,35 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          path: agent-wiki-production
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/llm-wiki-manager
+          path: llm-wiki-manager
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/llm-wiki
+          path: llm-wiki
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/agent-cme
+          path: agent-external/agent-cme
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/agent-mailer-api
+          path: agent-external/agent-mailer-api
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/agent-wiki-documents
+          path: agent-external/agent-wiki-documents
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: node llm-wiki-manager/scripts/check-versions.js
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
       - run: python -m pip install --upgrade pip pytest
       - run: pytest -q
+        working-directory: agent-wiki-production
