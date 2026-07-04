@@ -69,7 +69,11 @@ _MUTATING_STEPS = {"copy", "ingest", "build", "export", "polish", "pipeline"}
 
 _WRITE_TOOLS = {"production_start_job", "production_cancel_job"}
 
-if not (_MCP_TOKEN or _MCP_READ_TOKEN or _MCP_WRITE_TOKEN):
+def _any_token_configured() -> bool:
+    return bool(_MCP_TOKEN or _MCP_READ_TOKEN or _MCP_WRITE_TOKEN)
+
+
+if not _any_token_configured():
     print(f"{_LOG_PREFIX} Warning: MCP_AUTH_TOKEN is not configured; the endpoint accepts unauthenticated clients.")
 
 
@@ -79,7 +83,7 @@ def _bearer_token(request: Request) -> str:
 
 
 def _token_scopes(token: str) -> set[str] | None:
-    if not (_MCP_TOKEN or _MCP_READ_TOKEN or _MCP_WRITE_TOKEN):
+    if not _any_token_configured():
         return {"read", "write"}
     if _MCP_TOKEN and hmac.compare_digest(token, _MCP_TOKEN):
         return {"read", "write"}

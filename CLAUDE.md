@@ -61,7 +61,11 @@ over MCP. It runs allowlisted long-running jobs such as `doctor`, `ingest`,
   the current request's scope is threaded through a `contextvars.ContextVar`
   set by `_BearerAuthMiddleware`, not passed explicitly. Requests are
   rate-limited (`MCP_RATE_LIMIT_REQUESTS`/`MCP_RATE_LIMIT_WINDOW_SECONDS`,
-  default 120/60s) keyed by token or remote IP.
+  default 120/60s) keyed by token or remote IP. `_any_token_configured()` is
+  the single "is any token set" check. This whole block is copy-pasted
+  near-verbatim across all four agent repos plus `llm-wiki`'s `mcpHttp.ts`
+  (TypeScript) — see `agent-cme/CLAUDE.md`'s fuller note on why that hasn't
+  been consolidated into a shared package.
 - MCP tool descriptions, `_activity` metadata, progress details, status page
   text, and logs intended for operators must stay in English. The workspace
   `.wikirc` language affects only LLM-generated wiki/deliverable content.
