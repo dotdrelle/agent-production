@@ -90,6 +90,11 @@ Streamable HTTP requests to the same URL.
 - Bearer authentication controls who can call the agent. `PRODUCTION_REQUIRE_CONFIRMATION`
   is an optional extra application-level guard: set it to `true` if mutating jobs
   must also include `confirm=true` after explicit user approval.
+- For scoped HTTP access, set `MCP_READ_TOKEN` for status/list/log clients and
+  `MCP_WRITE_TOKEN` for clients allowed to start or cancel jobs. `MCP_AUTH_TOKEN`
+  remains a legacy full-access read+write token. Rate limiting defaults to 120
+  requests per 60 seconds and can be tuned with `MCP_RATE_LIMIT_REQUESTS` and
+  `MCP_RATE_LIMIT_WINDOW_SECONDS`.
 - `build` jobs accept an optional `templates` array, for example
   `["EAE-REAS-architecture.md"]`, so a targeted build does not rebuild every
   template.

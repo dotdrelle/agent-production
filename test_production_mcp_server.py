@@ -113,6 +113,18 @@ class ProductionMcpServerTest(unittest.TestCase):
         self.assertNotIn("runtime", masked)
         self.assertNotIn("secret", masked)
 
+    def test_read_scope_cannot_start_or_cancel_job(self):
+        token = self.server._CURRENT_SCOPES.set({"read"})
+        try:
+            denied = self.server._require_tool_scope("production_start_job")
+            allowed = self.server._require_tool_scope("production_status")
+        finally:
+            self.server._CURRENT_SCOPES.reset(token)
+
+        self.assertFalse(self.payload(denied)["ok"])
+        self.assertIn("write scope", self.payload(denied)["error"])
+        self.assertIsNone(allowed)
+
 
 if __name__ == "__main__":
     unittest.main()
