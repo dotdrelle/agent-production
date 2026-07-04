@@ -12,6 +12,7 @@ import shutil
 import signal
 import time
 import uuid
+import hashlib
 from collections.abc import AsyncIterator
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -176,6 +177,7 @@ def _activity_for_job(job: dict[str, Any], progress: dict[str, Any] | None = Non
         str(step) if step else None,
         f"{round(float(percent))}%" if isinstance(percent, (int, float)) else None,
     ]
+    targets = [*(job.get("inputs") or []), *(job.get("templates") or []), *(job.get("deliverables") or [])]
     return {
         "id": job_id,
         "source": "production",
@@ -183,6 +185,8 @@ def _activity_for_job(job: dict[str, Any], progress: dict[str, Any] | None = Non
         "label": " · ".join(part for part in label_parts if part),
         "status": status,
         "progress": progress or {"step": step},
+        "targets": targets,
+        "outputRefs": _output_refs_for_job(job),
         "poll": {
             "server": "production",
             "tool": "production_job_status",
@@ -214,8 +218,10 @@ def _log_path(job_id: str) -> Path:
     return _JOBS_DIR / "logs" / f"{job_id}.log"
 
 
-def _lock_path() -> Path:
-    return _LOCKS_DIR / f"{_WORKSPACE_NAME}.lock"
+def _lock_path(scope: str = "workspace-write") -> Path:
+    digest = hashlib.sha256(scope.encode("utf-8")).hexdigest()[:16]
+    safe_workspace = re.sub(r"[^A-Za-z0-9_.-]+", "_", _WORKSPACE_NAME)
+    return _LOCKS_DIR / safe_workspace / f"{digest}.lock"
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -256,17 +262,18 @@ def _recent_jobs(limit: int = 10) -> list[dict[str, Any]]:
     return jobs[: max(1, min(limit, 100))]
 
 
-def _read_lock() -> dict[str, Any] | None:
-    path = _lock_path()
+def _read_lock(path: Path) -> dict[str, Any] | None:
     if not path.exists():
         return None
     with contextlib.suppress(Exception):
-        return _read_json(path)
-    return {"workspace": _WORKSPACE_NAME, "invalid": True}
+        lock = _read_json(path)
+        lock["_path"] = str(path)
+        return lock
+    return {"workspace": _WORKSPACE_NAME, "invalid": True, "_path": str(path)}
 
 
-def _active_lock() -> dict[str, Any] | None:
-    lock = _read_lock()
+def _active_lock_for_path(path: Path) -> dict[str, Any] | None:
+    lock = _read_lock(path)
     if not lock:
         return None
     job_id = str(lock.get("jobId", ""))
@@ -280,20 +287,71 @@ def _active_lock() -> dict[str, Any] | None:
             job["error"] = "Agent restarted while job was active."
             _save_job(job)
     with contextlib.suppress(FileNotFoundError):
-        _lock_path().unlink()
+        path.unlink()
     return None
 
 
-def _create_lock(job_id: str) -> None:
+def _active_locks() -> list[dict[str, Any]]:
     _ensure_dirs()
-    _write_json(_lock_path(), {"workspace": _WORKSPACE_NAME, "jobId": job_id, "createdAt": _now()})
+    locks: list[dict[str, Any]] = []
+    workspace_lock_dir = _LOCKS_DIR / re.sub(r"[^A-Za-z0-9_.-]+", "_", _WORKSPACE_NAME)
+    for path in sorted(workspace_lock_dir.glob("*.lock")) if workspace_lock_dir.exists() else []:
+        lock = _active_lock_for_path(path)
+        if lock:
+            locks.append(lock)
+    legacy_lock = _LOCKS_DIR / f"{_WORKSPACE_NAME}.lock"
+    if legacy_lock.exists():
+        lock = _active_lock_for_path(legacy_lock)
+        if lock:
+            locks.append(lock)
+    return locks
 
 
-def _clear_lock(job_id: str) -> None:
-    lock = _read_lock()
+def _active_lock() -> dict[str, Any] | None:
+    locks = _active_locks()
+    return locks[0] if locks else None
+
+
+def _conflicting_lock(scopes: list[str]) -> dict[str, Any] | None:
+    requested = set(scopes)
+    requested_workspace = "workspace-write" in requested
+    for lock in _active_locks():
+        active_scopes = set(lock.get("scopes") or [lock.get("scope") or "workspace-write"])
+        if requested_workspace or "workspace-write" in active_scopes or requested.intersection(active_scopes):
+            return lock
+    return None
+
+
+def _create_locks(job_id: str, scopes: list[str]) -> None:
+    _ensure_dirs()
+    created: list[Path] = []
+    payload = {"workspace": _WORKSPACE_NAME, "jobId": job_id, "scopes": scopes, "createdAt": _now()}
+    try:
+        for scope in scopes:
+            path = _lock_path(scope)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("x", encoding="utf-8") as handle:
+                handle.write(json.dumps({**payload, "scope": scope}, ensure_ascii=False, indent=2) + "\n")
+            created.append(path)
+    except FileExistsError:
+        for path in created:
+            with contextlib.suppress(FileNotFoundError):
+                path.unlink()
+        raise
+
+
+def _clear_locks(job_id: str) -> None:
+    workspace_lock_dir = _LOCKS_DIR / re.sub(r"[^A-Za-z0-9_.-]+", "_", _WORKSPACE_NAME)
+    for path in sorted(workspace_lock_dir.glob("*.lock")) if workspace_lock_dir.exists() else []:
+        lock = _read_lock(path)
+        if lock and str(lock.get("jobId")) == job_id:
+            with contextlib.suppress(FileNotFoundError):
+                path.unlink()
+    legacy_lock = _LOCKS_DIR / f"{_WORKSPACE_NAME}.lock"
+    lock = _read_lock(legacy_lock)
     if lock and str(lock.get("jobId")) == job_id:
         with contextlib.suppress(FileNotFoundError):
-            _lock_path().unlink()
+            legacy_lock.unlink()
 
 
 def _parse_imports() -> list[Path]:
@@ -429,6 +487,11 @@ async def list_tools() -> list[Tool]:
                         "items": {"type": "string"},
                         "description": "Optional template files for build steps, relative to the workspace root or templates/.",
                     },
+                    "inputs": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional source files for ingest steps, relative to the workspace root or raw/untracked/.",
+                    },
                     "deliverables": {
                         "type": "array",
                         "items": {"type": "string"},
@@ -545,6 +608,7 @@ def _tool_status() -> list[TextContent]:
             "requireConfirmation": _REQUIRE_CONFIRMATION,
             "importsConfigured": len(_parse_imports()),
             "activeLock": _active_lock(),
+            "activeLocks": _active_locks(),
             "recentJobs": [_job_summary(job) for job in _recent_jobs(5)],
         }
     )
@@ -605,6 +669,7 @@ async def _tool_start_job(args: dict[str, Any]) -> list[TextContent]:
     dry_run = bool(args.get("dryRun", False))
     confirm = bool(args.get("confirm", False))
     steps = _resolve_steps(job_type, args.get("steps"))
+    inputs = _resolve_string_list(args.get("inputs"), "inputs")
     templates = _resolve_string_list(args.get("templates"), "templates")
     deliverables = _resolve_string_list(args.get("deliverables"), "deliverables")
     stabilize = bool(args.get("stabilize", False))
@@ -620,24 +685,29 @@ async def _tool_start_job(args: dict[str, Any]) -> list[TextContent]:
         raise ValueError(f"Workspace path does not exist: {_WORKSPACE_PATH}")
     if any(step in {"export", "polish"} for step in steps) and not deliverables:
         raise ValueError("export and polish jobs require at least one deliverable.")
+    if inputs and not any(step == "ingest" for step in steps):
+        raise ValueError("inputs can only be used with ingest or pipeline jobs.")
+    lock_scopes = _job_lock_scopes(steps, inputs, templates, deliverables)
 
     plan = {
         "type": job_type,
         "steps": steps,
         "workspace": _WORKSPACE_NAME,
+        "inputs": inputs,
         "templates": templates,
         "deliverables": deliverables,
         "stabilize": stabilize,
         "configPath": config_path,
+        "lockScopes": lock_scopes,
     }
     if dry_run:
-        return _json_text({"ok": True, "dryRun": True, "plan": plan, "commands": _command_labels(steps, templates, deliverables, stabilize)})
+        return _json_text({"ok": True, "dryRun": True, "plan": plan, "commands": _command_labels(steps, inputs, templates, deliverables, stabilize)})
     if _REQUIRE_CONFIRMATION and not confirm and any(step in _MUTATING_STEPS for step in steps):
         raise ValueError("Production jobs require confirm=true after explicit user approval.")
 
-    active = _active_lock()
+    active = _conflicting_lock(lock_scopes)
     if active:
-        return _json_text({"ok": False, "error": "workspace_busy", "activeJobId": active.get("jobId"), "lock": active})
+        return _json_text({"ok": False, "error": "target_busy", "activeJobId": active.get("jobId"), "lock": active, "requestedLockScopes": lock_scopes})
 
     _ensure_dirs()
     job_id = f"prod_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
@@ -645,8 +715,10 @@ async def _tool_start_job(args: dict[str, Any]) -> list[TextContent]:
         "jobId": job_id,
         "workspace": _WORKSPACE_NAME,
         "type": job_type,
+        "inputs": inputs,
         "templates": templates,
         "deliverables": deliverables,
+        "lockScopes": lock_scopes,
         "stabilize": stabilize,
         "configPath": config_path,
         **({"callerLabel": caller_label} if caller_label else {}),
@@ -660,8 +732,18 @@ async def _tool_start_job(args: dict[str, Any]) -> list[TextContent]:
         "error": None,
         "logPath": str(_log_path(job_id)),
     }
+    try:
+        _create_locks(job_id, lock_scopes)
+    except FileExistsError:
+        active = _conflicting_lock(lock_scopes)
+        if active:
+            return _json_text({"ok": False, "error": "target_busy", "activeJobId": active.get("jobId"), "lock": active, "requestedLockScopes": lock_scopes})
+        try:
+            _create_locks(job_id, lock_scopes)
+        except FileExistsError:
+            active = _conflicting_lock(lock_scopes)
+            return _json_text({"ok": False, "error": "target_busy", "activeJobId": active.get("jobId") if active else None, "lock": active, "requestedLockScopes": lock_scopes})
     _save_job(job)
-    _create_lock(job_id)
     task = asyncio.create_task(_run_job(job_id))
     _ACTIVE_TASKS[job_id] = task
     return _json_text({"ok": True, "jobId": job_id, "status": "queued", "plan": plan, "_activity": _activity_for_job(job)})
@@ -717,7 +799,7 @@ async def _tool_cancel_job(args: dict[str, Any]) -> list[TextContent]:
             step["exitCode"] = -15
     _append_log(job_id, "[cancelled] Job cancelled by request.")
     _save_job(job)
-    _clear_lock(job_id)
+    _clear_locks(job_id)
     return _json_text({"ok": True, "job": _with_duration(job)})
 
 
@@ -754,6 +836,45 @@ def _resolve_string_list(value: Any, name: str) -> list[str]:
         if ".." in Path(item).parts:
             raise ValueError(f"Invalid {name} path: {item}")
     return items
+
+
+def _normalize_target_path(value: str, root: str) -> str:
+    path = Path(value)
+    if path.is_absolute() or ".." in path.parts:
+        raise ValueError(f"Invalid {root} path: {value}")
+    parts = path.parts
+    if parts and parts[0] == root:
+        return path.as_posix()
+    return Path(root, path).as_posix()
+
+
+def _template_deliverable_scope(template: str) -> str:
+    relative_template = _normalize_target_path(template, "templates")
+    template_path = (_WORKSPACE_PATH / relative_template).resolve()
+    fallback = Path(relative_template).relative_to("templates").as_posix()
+    output = _template_output(template_path, fallback) if template_path.is_file() else fallback
+    return f"deliverable:{_normalize_target_path(output, 'deliverables')}"
+
+
+def _job_lock_scopes(
+    steps: list[str],
+    inputs: list[str],
+    templates: list[str],
+    deliverables: list[str],
+) -> list[str]:
+    scopes: set[str] = set()
+    if any(step in {"copy", "ingest"} for step in steps):
+        scopes.add("workspace-write")
+    if "build" in steps:
+        if templates:
+            scopes.update(_template_deliverable_scope(template) for template in templates)
+        else:
+            scopes.add("workspace-write")
+    if any(step in {"export", "polish"} for step in steps):
+        scopes.update(f"deliverable:{_normalize_target_path(deliverable, 'deliverables')}" for deliverable in deliverables)
+    if not scopes:
+        scopes.add("read")
+    return sorted(scopes)
 
 
 def _resolve_config_path(value: Any) -> str | None:
@@ -820,6 +941,7 @@ async def _run_job(job_id: str) -> None:
                 exit_code = await _run_cli_step(
                     job_id,
                     step["name"],
+                    job.get("inputs", []),
                     job.get("templates", []),
                     job.get("deliverables", []),
                     stabilize=bool(job.get("stabilize", False)),
@@ -854,7 +976,7 @@ async def _run_job(job_id: str) -> None:
                 step["status"] = job["status"]
                 step["finishedAt"] = _now()
         _save_job(job)
-        _clear_lock(job_id)
+        _clear_locks(job_id)
         _ACTIVE_PROCESSES.pop(job_id, None)
         _ACTIVE_TASKS.pop(job_id, None)
         _append_log(job_id, f"[finish] status={job['status']} exitCode={job['exitCode']}")
@@ -887,6 +1009,7 @@ def _run_copy_step(job_id: str) -> int:
 async def _run_cli_step(
     job_id: str,
     step: str,
+    inputs: list[str],
     templates: list[str],
     deliverables: list[str],
     stabilize: bool = False,
@@ -897,7 +1020,7 @@ async def _run_cli_step(
     if config_path:
         env["WIKI_CONFIG_PATH"] = config_path
         _append_log(job_id, f"[config] WIKI_CONFIG_PATH={config_path}")
-    for command in _step_commands(step, templates, deliverables, stabilize=stabilize):
+    for command in _step_commands(step, inputs, templates, deliverables, stabilize=stabilize):
         _append_log(job_id, f"[cmd] cwd={_WORKSPACE_PATH} {' '.join(command)}")
         proc = await asyncio.create_subprocess_exec(
             *command,
@@ -962,6 +1085,25 @@ def _produced_files_from_job(job: dict[str, Any]) -> list[str]:
                 seen.add(text)
                 files.append(text)
     return files
+
+
+def _output_refs_for_job(job: dict[str, Any]) -> list[dict[str, Any]]:
+    refs: list[dict[str, Any]] = []
+    for path_value in job.get("producedFiles") or _produced_files_from_job(job):
+        refs.append({"type": "file", "path": str(path_value)})
+    for template in job.get("templates") or []:
+        if job.get("type") == "build" or any(step.get("name") == "build" for step in job.get("steps", []) if isinstance(step, dict)):
+            refs.append({"type": "file", "path": _template_deliverable_scope(str(template)).replace("deliverable:", "")})
+    for deliverable in job.get("deliverables") or []:
+        refs.append({"type": "file", "path": _normalize_target_path(str(deliverable), "deliverables")})
+    seen: set[str] = set()
+    unique: list[dict[str, Any]] = []
+    for ref in refs:
+        key = json.dumps(ref, sort_keys=True)
+        if key not in seen:
+            seen.add(key)
+            unique.append(ref)
+    return unique
 
 
 def _job_progress(job: dict[str, Any], log_tail: list[str]) -> dict[str, Any]:
@@ -1369,6 +1511,10 @@ def _job_summary(job: dict[str, Any]) -> dict[str, Any]:
         "workspace": job.get("workspace"),
         "type": job.get("type"),
         "status": job.get("status"),
+        "inputs": job.get("inputs") or [],
+        "templates": job.get("templates") or [],
+        "deliverables": job.get("deliverables") or [],
+        "lockScopes": job.get("lockScopes") or [],
         "createdAt": job.get("createdAt"),
         "updatedAt": job.get("updatedAt"),
         "durationSeconds": job.get("durationSeconds"),
@@ -1377,10 +1523,13 @@ def _job_summary(job: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _step_commands(step: str, templates: list[str], deliverables: list[str], stabilize: bool = False) -> list[list[str]]:
+def _step_commands(step: str, inputs: list[str], templates: list[str], deliverables: list[str], stabilize: bool = False) -> list[list[str]]:
     if step == "copy":
         return []
     command = [*_STEP_COMMANDS[step]]
+    if step == "ingest":
+        command.extend(inputs)
+        return [command]
     if step == "build":
         if stabilize:
             command.append("--stabilize")
@@ -1391,13 +1540,13 @@ def _step_commands(step: str, templates: list[str], deliverables: list[str], sta
     return [command]
 
 
-def _command_labels(steps: list[str], templates: list[str], deliverables: list[str], stabilize: bool = False) -> list[str]:
+def _command_labels(steps: list[str], inputs: list[str], templates: list[str], deliverables: list[str], stabilize: bool = False) -> list[str]:
     labels: list[str] = []
     for step in steps:
         if step == "copy":
             labels.append(f"copy {len(_parse_imports())} import(s) to raw/untracked")
             continue
-        labels.extend(" ".join(command) for command in _step_commands(step, templates, deliverables, stabilize=stabilize))
+        labels.extend(" ".join(command) for command in _step_commands(step, inputs, templates, deliverables, stabilize=stabilize))
     return labels
 
 

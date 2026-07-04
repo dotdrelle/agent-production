@@ -70,7 +70,10 @@ Streamable HTTP requests to the same URL.
 ## Behavior
 
 - Jobs are asynchronous and return a `jobId` immediately.
-- One mutating job can run at a time per workspace.
+- Mutating jobs use scoped locks: ingest/copy/pipeline take the workspace-write
+  lock, targeted build jobs lock their expected deliverables, and export/polish
+  jobs lock the requested deliverables. Non-conflicting targeted jobs can run in
+  parallel.
 - Job metadata and logs are written under `.wiki/production-jobs`.
 - `production_job_status` includes a structured `progress` object derived from
   the llm-wiki trace file when available: phase, label, detail, percent,
@@ -98,6 +101,9 @@ Streamable HTTP requests to the same URL.
 - `build` jobs accept an optional `templates` array, for example
   `["EAE-REAS-architecture.md"]`, so a targeted build does not rebuild every
   template.
+- `ingest` jobs accept an optional `inputs` array, for example
+  `["raw/untracked/doc-a.md", "doc-b.md"]`, so one runtime task can ingest a
+  restricted source subset.
 - `build` and `pipeline` jobs accept `stabilize: true` to pass
   `wiki build --stabilize`; existing deliverables keep unchanged sections
   verbatim while changed sections are merged from the fresh candidate.

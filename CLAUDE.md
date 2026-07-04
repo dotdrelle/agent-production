@@ -23,8 +23,8 @@ over MCP. It runs allowlisted long-running jobs such as `doctor`, `ingest`,
 
 - Never accept arbitrary shell commands. Only execute allowlisted production
   steps and the fixed command mappings in the server.
-- One mutating job should run at a time per workspace. Preserve lock behavior
-  when changing job execution.
+- Preserve scoped production locks when changing job execution: workspace-write
+  for ingest/copy/pipeline, deliverable locks for targeted build/export/polish.
 - Jobs are asynchronous. Tool calls should return a `jobId` quickly, then expose
   status and logs through follow-up tools.
 - `production_start_job` and `production_job_status` must preserve their native
@@ -33,6 +33,10 @@ over MCP. It runs allowlisted long-running jobs such as `doctor`, `ingest`,
 - Keep the default pipeline as `ingest`, `build`, `export`, then `polish`.
   The legacy `copy` step is available only when explicitly requested and
   configured.
+- `production_start_job` supports targeted `inputs` for ingest, `templates` for
+  build, and `deliverables` for export/polish. Ingest/copy/pipeline hold a
+  workspace-write lock; targeted build/export/polish jobs hold deliverable
+  locks so non-conflicting runtime tasks can execute in parallel.
 - The `stabilize` flag on `production_start_job` applies only to `build` steps.
   It passes `--stabilize` to `wiki build`, which preserves unchanged sections
   verbatim and merges only changed sections via LLM. It is a no-op when no

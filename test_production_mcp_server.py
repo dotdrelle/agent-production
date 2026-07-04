@@ -103,9 +103,49 @@ class ProductionMcpServerTest(unittest.TestCase):
         self.assertTrue(payload["dryRun"])
         self.assertEqual(payload["plan"]["steps"], ["doctor"])
 
+    def test_ingest_dry_run_accepts_target_inputs(self):
+        result = asyncio.run(
+            self.server._tool_start_job(
+                {
+                    "type": "ingest",
+                    "inputs": ["raw/untracked/doc-a.md", "doc-b.md"],
+                    "dryRun": True,
+                }
+            )
+        )
+        payload = self.payload(result)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["plan"]["inputs"], ["raw/untracked/doc-a.md", "doc-b.md"])
+        self.assertIn("node /app/bin/wiki.js ingest raw/untracked/doc-a.md doc-b.md", payload["commands"])
+
     def test_mutating_job_requires_confirmation(self):
         with self.assertRaisesRegex(ValueError, "confirm=true"):
             asyncio.run(self.server._tool_start_job({"type": "build"}))
+
+    def test_targeted_build_jobs_can_run_in_parallel_but_conflicting_export_waits(self):
+        async def scenario():
+            async def hold_job(_job_id):
+                await asyncio.Future()
+
+            self.server._run_job = hold_job
+            (self.workspace / "templates" / "a.md").write_text("---\noutput: a.md\n---\n# A\n", encoding="utf-8")
+            (self.workspace / "templates" / "b.md").write_text("---\noutput: b.md\n---\n# B\n", encoding="utf-8")
+
+            first = self.payload(await self.server._tool_start_job({"type": "build", "templates": ["a.md"], "confirm": True}))
+            second = self.payload(await self.server._tool_start_job({"type": "build", "templates": ["b.md"], "confirm": True}))
+            conflict = self.payload(await self.server._tool_start_job({"type": "export", "deliverables": ["a.md"], "confirm": True}))
+
+            self.assertTrue(first["ok"])
+            self.assertTrue(second["ok"])
+            self.assertFalse(conflict["ok"])
+            self.assertEqual(conflict["error"], "target_busy")
+            self.assertEqual(first["plan"]["lockScopes"], ["deliverable:deliverables/a.md"])
+            self.assertEqual(second["plan"]["lockScopes"], ["deliverable:deliverables/b.md"])
+
+            await self.server._tool_cancel_job({"jobId": first["jobId"]})
+            await self.server._tool_cancel_job({"jobId": second["jobId"]})
+
+        asyncio.run(scenario())
 
     def test_log_redaction_masks_secret_values(self):
         masked = self.server._mask_secret_text("Authorization: Bearer abc123 token=runtime password:secret")
