@@ -4,6 +4,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 import types
 import unittest
 from dataclasses import dataclass
@@ -118,6 +119,38 @@ class ProductionMcpServerTest(unittest.TestCase):
         self.assertEqual(payload["plan"]["inputs"], ["raw/untracked/doc-a.md", "doc-b.md"])
         self.assertIn("node /app/bin/wiki.js ingest raw/untracked/doc-a.md doc-b.md", payload["commands"])
 
+    def test_ingest_plan_dry_run_accepts_target_inputs_without_workspace_write_lock(self):
+        result = asyncio.run(
+            self.server._tool_start_job(
+                {
+                    "type": "ingest_plan",
+                    "inputs": ["raw/untracked/doc-a.md", "doc-b.md"],
+                    "dryRun": True,
+                }
+            )
+        )
+        payload = self.payload(result)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["plan"]["steps"], ["ingest_plan"])
+        self.assertEqual(payload["plan"]["lockScopes"], ["read"])
+        self.assertIn("node /app/bin/wiki.js ingest --plan-only raw/untracked/doc-a.md doc-b.md", payload["commands"])
+
+    def test_ingest_apply_dry_run_accepts_plan_files_with_workspace_write_lock(self):
+        result = asyncio.run(
+            self.server._tool_start_job(
+                {
+                    "type": "ingest_apply",
+                    "inputs": [".wiki/ingest-plans/plan-a.json"],
+                    "dryRun": True,
+                }
+            )
+        )
+        payload = self.payload(result)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["plan"]["steps"], ["ingest_apply"])
+        self.assertEqual(payload["plan"]["lockScopes"], ["workspace-write"])
+        self.assertIn("node /app/bin/wiki.js ingest --apply .wiki/ingest-plans/plan-a.json", payload["commands"])
+
     def test_mutating_job_requires_confirmation(self):
         with self.assertRaisesRegex(ValueError, "confirm=true"):
             asyncio.run(self.server._tool_start_job({"type": "build"}))
@@ -144,6 +177,48 @@ class ProductionMcpServerTest(unittest.TestCase):
 
             await self.server._tool_cancel_job({"jobId": first["jobId"]})
             await self.server._tool_cancel_job({"jobId": second["jobId"]})
+
+        asyncio.run(scenario())
+
+    def test_targeted_build_jobs_are_faster_in_parallel(self):
+        async def scenario():
+            async def slow_cli_step(
+                _job_id,
+                _step,
+                _inputs,
+                _templates,
+                _deliverables,
+                stabilize=False,
+                config_path=None,
+            ):
+                await asyncio.sleep(0.5)
+                return 0
+
+            async def run_build(template):
+                payload = self.payload(
+                    await self.server._tool_start_job(
+                        {"type": "build", "templates": [template], "confirm": True}
+                    )
+                )
+                self.assertTrue(payload["ok"])
+                task = self.server._ACTIVE_TASKS[payload["jobId"]]
+                await task
+                return payload["jobId"]
+
+            self.server._run_cli_step = slow_cli_step
+            (self.workspace / "templates" / "a.md").write_text("---\noutput: a.md\n---\n# A\n", encoding="utf-8")
+            (self.workspace / "templates" / "b.md").write_text("---\noutput: b.md\n---\n# B\n", encoding="utf-8")
+
+            sequential_start = time.perf_counter()
+            await run_build("a.md")
+            await run_build("b.md")
+            sequential_seconds = time.perf_counter() - sequential_start
+
+            parallel_start = time.perf_counter()
+            await asyncio.gather(run_build("a.md"), run_build("b.md"))
+            parallel_seconds = time.perf_counter() - parallel_start
+
+            self.assertLess(parallel_seconds, sequential_seconds * 0.65)
 
         asyncio.run(scenario())
 

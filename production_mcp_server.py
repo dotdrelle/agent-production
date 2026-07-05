@@ -34,7 +34,7 @@ import uvicorn
 
 app = Server("agent-wiki-production")
 
-_AGENT_VERSION = "0.11.3"
+_AGENT_VERSION = "0.11.4"
 _MCP_TOKEN = os.environ.get("MCP_AUTH_TOKEN", "")
 _MCP_READ_TOKEN = os.environ.get("MCP_READ_TOKEN", "")
 _MCP_WRITE_TOKEN = os.environ.get("MCP_WRITE_TOKEN", "")
@@ -49,7 +49,7 @@ _IMPORTS = os.environ.get("WIKI_IMPORTS", "")
 _IMPORT_PATH_MAPPINGS = os.environ.get("PRODUCTION_IMPORT_PATH_MAPPINGS", "")
 _ALLOWED_STEPS = {
     item.strip()
-    for item in os.environ.get("PRODUCTION_ALLOWED_STEPS", "doctor,copy,ingest,build,export,polish,pipeline").split(",")
+    for item in os.environ.get("PRODUCTION_ALLOWED_STEPS", "doctor,copy,ingest,ingest_plan,ingest_apply,build,export,polish,pipeline").split(",")
     if item.strip()
 }
 _REQUIRE_CONFIRMATION = os.environ.get("PRODUCTION_REQUIRE_CONFIRMATION", "false").lower() not in {"0", "false", "no"}
@@ -62,11 +62,13 @@ _ACTIVE_PROCESSES: dict[str, asyncio.subprocess.Process] = {}
 _STEP_COMMANDS: dict[str, list[str]] = {
     "doctor": ["node", _WIKI_BIN, "doctor"],
     "ingest": ["node", _WIKI_BIN, "ingest"],
+    "ingest_plan": ["node", _WIKI_BIN, "ingest", "--plan-only"],
+    "ingest_apply": ["node", _WIKI_BIN, "ingest", "--apply"],
     "build": ["node", _WIKI_BIN, "build"],
     "export": ["node", _WIKI_BIN, "export"],
     "polish": ["node", _WIKI_BIN, "export", "--polish"],
 }
-_MUTATING_STEPS = {"copy", "ingest", "build", "export", "polish", "pipeline"}
+_MUTATING_STEPS = {"copy", "ingest", "ingest_plan", "ingest_apply", "build", "export", "polish", "pipeline"}
 
 _WRITE_TOOLS = {"production_start_job", "production_cancel_job"}
 
@@ -466,7 +468,8 @@ async def list_tools() -> list[Tool]:
             name="production_start_job",
             description=(
                 "Start an llm-wiki production job asynchronously. Use only after explicit user request. "
-                "For type=\"ingest\", this reads Markdown files already present in the workspace, including files exported by agent-cme; it does not fetch from Confluence directly. "
+                "For type=\"ingest\" or type=\"ingest_plan\", this reads Markdown files already present in the workspace, including files exported by agent-cme; it does not fetch from Confluence directly. "
+                "Use type=\"ingest_apply\" only to apply ingest plan files produced by type=\"ingest_plan\". "
                 "Bearer authentication and the step allowlist are the primary controls. "
                 "If PRODUCTION_REQUIRE_CONFIRMATION=true, mutating jobs also require confirm=true."
             ),
@@ -475,11 +478,11 @@ async def list_tools() -> list[Tool]:
                 "properties": {
                     "type": {
                         "type": "string",
-                        "enum": ["doctor", "copy", "ingest", "build", "export", "polish", "pipeline"],
+                        "enum": ["doctor", "copy", "ingest", "ingest_plan", "ingest_apply", "build", "export", "polish", "pipeline"],
                     },
                     "steps": {
                         "type": "array",
-                        "items": {"type": "string", "enum": ["doctor", "copy", "ingest", "build", "export", "polish"]},
+                        "items": {"type": "string", "enum": ["doctor", "copy", "ingest", "ingest_plan", "ingest_apply", "build", "export", "polish"]},
                         "description": "Required for type=pipeline. Ordered steps to run.",
                     },
                     "templates": {
@@ -490,7 +493,7 @@ async def list_tools() -> list[Tool]:
                     "inputs": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "Optional source files for ingest steps, relative to the workspace root or raw/untracked/.",
+                        "description": "Optional source files for ingest/ingest_plan steps, or ingest plan files for ingest_apply, relative to the workspace root.",
                     },
                     "deliverables": {
                         "type": "array",
@@ -685,8 +688,8 @@ async def _tool_start_job(args: dict[str, Any]) -> list[TextContent]:
         raise ValueError(f"Workspace path does not exist: {_WORKSPACE_PATH}")
     if any(step in {"export", "polish"} for step in steps) and not deliverables:
         raise ValueError("export and polish jobs require at least one deliverable.")
-    if inputs and not any(step == "ingest" for step in steps):
-        raise ValueError("inputs can only be used with ingest or pipeline jobs.")
+    if inputs and not any(step in {"ingest", "ingest_plan", "ingest_apply"} for step in steps):
+        raise ValueError("inputs can only be used with ingest, ingest_plan, ingest_apply, or pipeline jobs.")
     lock_scopes = _job_lock_scopes(steps, inputs, templates, deliverables)
 
     plan = {
@@ -814,11 +817,11 @@ def _resolve_steps(job_type: str, raw_steps: Any) -> list[str]:
         if not isinstance(raw_steps, list) or not raw_steps:
             return ["ingest", "build", "export", "polish"]
         steps = [str(item).strip() for item in raw_steps if str(item).strip()]
-    elif job_type in {"doctor", "copy", "ingest", "build", "export", "polish"}:
+    elif job_type in {"doctor", "copy", "ingest", "ingest_plan", "ingest_apply", "build", "export", "polish"}:
         steps = [job_type]
     else:
         raise ValueError(f"Unknown production job type: {job_type}")
-    invalid = [step for step in steps if step not in {"doctor", "copy", "ingest", "build", "export", "polish"}]
+    invalid = [step for step in steps if step not in {"doctor", "copy", "ingest", "ingest_plan", "ingest_apply", "build", "export", "polish"}]
     if invalid:
         raise ValueError(f"Unknown production step: {invalid[0]}")
     return steps
@@ -863,7 +866,7 @@ def _job_lock_scopes(
     deliverables: list[str],
 ) -> list[str]:
     scopes: set[str] = set()
-    if any(step in {"copy", "ingest"} for step in steps):
+    if any(step in {"copy", "ingest", "ingest_apply"} for step in steps):
         scopes.add("workspace-write")
     if "build" in steps:
         if templates:
@@ -1065,7 +1068,24 @@ def _exported_files_from_logs(lines: list[str]) -> list[str]:
     return files
 
 
+def _ingest_plan_files_from_logs(lines: list[str]) -> list[str]:
+    files: list[str] = []
+    seen: set[str] = set()
+    for line in lines:
+        match = re.search(r"Ingest plan written:\s*(.+)$", str(line))
+        if not match:
+            continue
+        value = match.group(1).strip()
+        if value and value not in seen:
+            seen.add(value)
+            files.append(value)
+    return files
+
+
 def _step_result_from_logs(job_id: str, step: str) -> dict[str, Any]:
+    if step == "ingest_plan":
+        plan_files = _ingest_plan_files_from_logs(_read_log_tail(job_id, 500))
+        return {"producedFiles": plan_files} if plan_files else {}
     if step not in {"export", "polish"}:
         return {}
     produced_files = _exported_files_from_logs(_read_log_tail(job_id, 500))
@@ -1527,7 +1547,7 @@ def _step_commands(step: str, inputs: list[str], templates: list[str], deliverab
     if step == "copy":
         return []
     command = [*_STEP_COMMANDS[step]]
-    if step == "ingest":
+    if step in {"ingest", "ingest_plan", "ingest_apply"}:
         command.extend(inputs)
         return [command]
     if step == "build":

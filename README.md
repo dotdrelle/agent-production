@@ -14,7 +14,7 @@ and runs long operations as background jobs.
 | --------------------------- | --------------------------------------------------------------------------------------- |
 | `production_status`         | Check workspace, allowlist, active lock, and recent jobs.                               |
 | `production_list_templates` | List templates, expected deliverables, and unmatched deliverables.                      |
-| `production_start_job`      | Start `doctor`, `copy`, `ingest`, `build`, `export`, `polish`, or a pipeline as a background job. |
+| `production_start_job`      | Start `doctor`, `copy`, `ingest`, `ingest_plan`, `ingest_apply`, `build`, `export`, `polish`, or a pipeline as a background job. |
 | `production_job_status`     | Read one job status.                                                                    |
 | `production_job_logs`       | Read the tail of one job log.                                                           |
 | `production_cancel_job`     | Cancel a running job.                                                                   |
@@ -36,7 +36,7 @@ export WIKI_WORKSPACE_PATH=<absolute-path-to-llm-wiki-workspace>
 Optional:
 
 ```bash
-export PRODUCTION_ALLOWED_STEPS=doctor,copy,ingest,build,export,polish,pipeline
+export PRODUCTION_ALLOWED_STEPS=doctor,copy,ingest,ingest_plan,ingest_apply,build,export,polish,pipeline
 export PRODUCTION_REQUIRE_CONFIRMATION=false
 export MCP_AUTH_TOKEN=<generated-local-token>
 export WIKI_CONFIG_PATH=.wikirc.yaml.openai
@@ -70,10 +70,10 @@ Streamable HTTP requests to the same URL.
 ## Behavior
 
 - Jobs are asynchronous and return a `jobId` immediately.
-- Mutating jobs use scoped locks: ingest/copy/pipeline take the workspace-write
-  lock, targeted build jobs lock their expected deliverables, and export/polish
-  jobs lock the requested deliverables. Non-conflicting targeted jobs can run in
-  parallel.
+- Mutating jobs use scoped locks: ingest/copy/ingest_apply/pipeline take the
+  workspace-write lock, ingest_plan uses a read lock, targeted build jobs lock
+  their expected deliverables, and export/polish jobs lock the requested
+  deliverables. Non-conflicting targeted jobs can run in parallel.
 - Job metadata and logs are written under `.wiki/production-jobs`.
 - `production_job_status` includes a structured `progress` object derived from
   the llm-wiki trace file when available: phase, label, detail, percent,
@@ -104,6 +104,12 @@ Streamable HTTP requests to the same URL.
 - `ingest` jobs accept an optional `inputs` array, for example
   `["raw/untracked/doc-a.md", "doc-b.md"]`, so one runtime task can ingest a
   restricted source subset.
+- `ingest_plan` accepts the same source `inputs` and writes a planned operation
+  file under `.wiki/ingest-plans/`. `ingest_apply` accepts those plan file paths
+  in `inputs` and applies them in the single workspace-write phase.
+  This is the 0.11.4 orchestration contract for parallel ingest: users still ask
+  for an ingest once, while the runtime can schedule planning tasks in parallel
+  and converge on a single apply/review task.
 - `build` and `pipeline` jobs accept `stabilize: true` to pass
   `wiki build --stabilize`; existing deliverables keep unchanged sections
   verbatim while changed sections are merged from the fresh candidate.

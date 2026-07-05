@@ -4,7 +4,8 @@
 
 `agent-wiki-production` exposes workspace-scoped `llm-wiki` production actions
 over MCP. It runs allowlisted long-running jobs such as `doctor`, `ingest`,
-`build`, `export`, `polish`, and the default pipeline as background tasks.
+`ingest_plan`, `ingest_apply`, `build`, `export`, `polish`, and the default
+pipeline as background tasks.
 
 ## Architecture
 
@@ -24,7 +25,8 @@ over MCP. It runs allowlisted long-running jobs such as `doctor`, `ingest`,
 - Never accept arbitrary shell commands. Only execute allowlisted production
   steps and the fixed command mappings in the server.
 - Preserve scoped production locks when changing job execution: workspace-write
-  for ingest/copy/pipeline, deliverable locks for targeted build/export/polish.
+  for ingest/copy/ingest_apply/pipeline, read for ingest_plan, deliverable locks
+  for targeted build/export/polish.
 - Jobs are asynchronous. Tool calls should return a `jobId` quickly, then expose
   status and logs through follow-up tools.
 - `production_start_job` and `production_job_status` must preserve their native
@@ -33,10 +35,11 @@ over MCP. It runs allowlisted long-running jobs such as `doctor`, `ingest`,
 - Keep the default pipeline as `ingest`, `build`, `export`, then `polish`.
   The legacy `copy` step is available only when explicitly requested and
   configured.
-- `production_start_job` supports targeted `inputs` for ingest, `templates` for
-  build, and `deliverables` for export/polish. Ingest/copy/pipeline hold a
-  workspace-write lock; targeted build/export/polish jobs hold deliverable
-  locks so non-conflicting runtime tasks can execute in parallel.
+- `production_start_job` supports targeted `inputs` for ingest/ingest_plan,
+  plan-file `inputs` for ingest_apply, `templates` for build, and `deliverables`
+  for export/polish. Ingest/copy/ingest_apply/pipeline hold a workspace-write
+  lock; ingest_plan is read-only; targeted build/export/polish jobs hold
+  deliverable locks so non-conflicting runtime tasks can execute in parallel.
 - The `stabilize` flag on `production_start_job` applies only to `build` steps.
   It passes `--stabilize` to `wiki build`, which preserves unchanged sections
   verbatim and merges only changed sections via LLM. It is a no-op when no
@@ -54,7 +57,7 @@ over MCP. It runs allowlisted long-running jobs such as `doctor`, `ingest`,
   trace files can link back to the production job that launched them.
 - Keep `_AGENT_VERSION` aligned with the coordinated `llm-wiki-manager`
   release version so status responses identify the deployed agent bundle.
-  Current release line: `0.11.1`. Alignment is checked by
+  Current release line: `0.11.4`. Alignment is checked by
   `llm-wiki-manager/scripts/check-versions.js` and synced by the root
   `build-and-push.sh`.
 - **Auth, scopes, rate limiting** (0.10.3): `MCP_AUTH_TOKEN` remains a legacy
