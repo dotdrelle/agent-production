@@ -37,7 +37,7 @@ Optional:
 
 ```bash
 export PRODUCTION_ALLOWED_STEPS=doctor,copy,ingest,ingest_plan,ingest_apply,build,export,polish,pipeline
-export PRODUCTION_REQUIRE_CONFIRMATION=false
+export PRODUCTION_REQUIRE_CONFIRMATION=true
 export MCP_AUTH_TOKEN=<generated-local-token>
 export WIKI_CONFIG_PATH=.wikirc.yaml.openai
 export WIKI_IMPORTS=

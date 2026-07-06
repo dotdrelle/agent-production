@@ -52,7 +52,7 @@ _ALLOWED_STEPS = {
     for item in os.environ.get("PRODUCTION_ALLOWED_STEPS", "doctor,copy,ingest,ingest_plan,ingest_apply,build,export,polish,pipeline").split(",")
     if item.strip()
 }
-_REQUIRE_CONFIRMATION = os.environ.get("PRODUCTION_REQUIRE_CONFIRMATION", "false").lower() not in {"0", "false", "no"}
+_REQUIRE_CONFIRMATION = os.environ.get("PRODUCTION_REQUIRE_CONFIRMATION", "true").lower() not in {"0", "false", "no"}
 _JOBS_DIR = Path(os.environ.get("PRODUCTION_JOBS_DIR", str(_WORKSPACE_PATH / ".wiki" / "production-jobs"))).resolve()
 _LOCKS_DIR = Path(os.environ.get("PRODUCTION_LOCKS_DIR", str(_JOBS_DIR / "locks"))).resolve()
 _WIKI_BIN = os.environ.get("WIKI_BIN", "/app/bin/wiki.js")
