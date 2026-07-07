@@ -276,6 +276,51 @@ def _capability_input_schema(capability_id: str, supported: list[str]) -> dict[s
     }
 
 
+def _agent_plan_input_schema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            "capability": {"type": "string", "enum": sorted(_CAPABILITY_STEP_MAP)},
+            "operation": {
+                "type": "string",
+                "enum": ["ingest", "build", "export", "polish", "pipeline"],
+            },
+            "objective": {"type": "string"},
+            "workspace": {
+                "type": "object",
+                "properties": {
+                    "revision": {"type": "string"},
+                },
+                "additionalProperties": True,
+            },
+            "arguments": {
+                "type": "object",
+                "properties": {
+                    "inputs": {"type": "array", "items": {"type": "string"}},
+                    "templates": {"type": "array", "items": {"type": "string"}},
+                    "deliverables": {"type": "array", "items": {"type": "string"}},
+                    "steps": {"type": "array", "items": {"type": "string"}},
+                    "stabilize": {"type": "boolean"},
+                    "configPath": {"type": "string"},
+                    "callerLabel": {"type": "string"},
+                },
+                "additionalProperties": True,
+            },
+            "constraints": {
+                "type": "object",
+                "properties": {
+                    "maxTasks": {"type": "integer", "minimum": 1},
+                    "maxConcurrency": {"type": "integer", "minimum": 1},
+                    "maxDepth": {"type": "integer", "minimum": 1},
+                    "requireApprovalForMutations": {"type": "boolean"},
+                },
+                "additionalProperties": True,
+            },
+        },
+        "additionalProperties": True,
+    }
+
+
 def _activity_for_job(job: dict[str, Any], progress: dict[str, Any] | None = None) -> dict[str, Any]:
     job_id = str(job.get("jobId") or "")
     status = str(job.get("status") or (progress or {}).get("status") or "running")
@@ -560,6 +605,11 @@ async def list_tools() -> list[Tool]:
             inputSchema={"type": "object", "properties": {}, "additionalProperties": False},
         ),
         Tool(
+            name="agent_plan",
+            description="Plan production tasks for a requested capability and return a TaskGraphFragment without executing it.",
+            inputSchema=_agent_plan_input_schema(),
+        ),
+        Tool(
             name="production_status",
             description="Check agent-wiki-production configuration, active lock, allowed steps, and recent jobs.",
             inputSchema={"type": "object", "properties": {}, "additionalProperties": False},
@@ -693,6 +743,8 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
         match name:
             case "agent_describe":
                 result = _tool_agent_describe()
+            case "agent_plan":
+                result = _tool_agent_plan(arguments)
             case "production_status":
                 result = _tool_status()
             case "production_list_templates":
@@ -718,6 +770,10 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
 
 def _tool_agent_describe() -> list[TextContent]:
     return _json_text(_agent_description())
+
+
+def _tool_agent_plan(args: dict[str, Any]) -> list[TextContent]:
+    return _json_text(_agent_plan(args))
 
 
 def _tool_status() -> list[TextContent]:
@@ -930,6 +986,790 @@ def _tool_list_jobs(args: dict[str, Any]) -> list[TextContent]:
     limit = int(args.get("limit", 20))
     jobs = [_job_summary(_with_duration(job)) for job in _recent_jobs(limit)]
     return _json_text({"ok": True, "workspace": _WORKSPACE_NAME, "jobs": jobs})
+
+
+def _agent_plan(args: dict[str, Any]) -> dict[str, Any]:
+    request_args = args.get("arguments") if isinstance(args.get("arguments"), dict) else {}
+    constraints = _planning_constraints(args.get("constraints"))
+    capability, operation = _plan_capability_operation(args)
+    workspace_revision = _workspace_revision_from_request(args)
+
+    if capability == "knowledge.update":
+        return _plan_knowledge_update(operation, request_args, constraints, workspace_revision)
+    if capability == "document.build":
+        return _plan_document_build(request_args, constraints, workspace_revision, depends_on=[])
+    if capability == "document.publish":
+        return _plan_document_publish(operation, request_args, constraints, workspace_revision, depends_on=[])
+    if capability == "knowledge.pipeline":
+        return _plan_pipeline(request_args, constraints, workspace_revision)
+    if capability == "workspace.diagnose":
+        return _empty_plan("workspace.diagnose", "Diagnose workspace", ["Production planning does not create diagnose tasks."])
+    raise ValueError(f"Unsupported planning capability: {capability}")
+
+
+def _planning_constraints(raw_constraints: Any) -> dict[str, Any]:
+    constraints = raw_constraints if isinstance(raw_constraints, dict) else {}
+    max_tasks = _positive_int(constraints.get("maxTasks"))
+    max_concurrency = _positive_int(constraints.get("maxConcurrency")) or _RECOMMENDED_CONCURRENCY or 1
+    if _MAX_CONCURRENCY:
+        max_concurrency = min(max_concurrency, _MAX_CONCURRENCY)
+    max_depth = _positive_int(constraints.get("maxDepth"))
+    return {
+        "maxTasks": max_tasks,
+        "maxConcurrency": max(1, max_concurrency),
+        "maxDepth": max_depth,
+        "requireApprovalForMutations": bool(constraints.get("requireApprovalForMutations", False)),
+    }
+
+
+def _positive_int(value: Any) -> int | None:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number > 0 else None
+
+
+def _plan_capability_operation(args: dict[str, Any]) -> tuple[str, str]:
+    capability = str(args.get("capability") or "").strip()
+    operation = str(args.get("operation") or "").strip()
+    objective = str(args.get("objective") or "").lower()
+    request_args = args.get("arguments") if isinstance(args.get("arguments"), dict) else {}
+    legacy_type = str(request_args.get("type") or args.get("type") or "").strip()
+    if not operation and legacy_type:
+        operation = legacy_type
+
+    if not capability:
+        if operation in {"ingest", "ingest_plan", "ingest_apply"} or "ingest" in objective:
+            capability = "knowledge.update"
+        elif operation == "build" or "build" in objective or "document" in objective:
+            capability = "document.build"
+        elif operation in {"export", "polish"} or "publish" in objective or "publication" in objective:
+            capability = "document.publish"
+        elif operation == "pipeline" or "pipeline" in objective:
+            capability = "knowledge.pipeline"
+
+    if not operation:
+        defaults = {
+            "knowledge.update": "ingest",
+            "document.build": "build",
+            "document.publish": "export",
+            "knowledge.pipeline": "pipeline",
+        }
+        operation = defaults.get(capability, "")
+
+    if capability not in _CAPABILITY_STEP_MAP:
+        raise ValueError("agent_plan requires a supported capability.")
+    if operation and operation not in {"ingest", "ingest_plan", "ingest_apply", "build", "export", "polish", "pipeline"}:
+        raise ValueError(f"Unsupported planning operation: {operation}")
+    if operation == "ingest_plan":
+        operation = "ingest"
+    return capability, operation
+
+
+def _workspace_revision_from_request(args: dict[str, Any]) -> str:
+    workspace = args.get("workspace") if isinstance(args.get("workspace"), dict) else {}
+    revision = workspace.get("revision") or args.get("workspaceRevision")
+    return str(revision).strip() if revision else "unknown"
+
+
+def _empty_plan(capability: str, label: str, synthesis: list[str]) -> dict[str, Any]:
+    return {
+        "contractVersion": "1",
+        "agentInstanceId": _AGENT_INSTANCE_ID,
+        "capability": capability,
+        "summary": {
+            "label": label,
+            "initialSynthesis": synthesis,
+            "estimatedTasks": 0,
+        },
+        "groups": [],
+        "tasks": [],
+        "expectedOutputs": [],
+    }
+
+
+def _plan_knowledge_update(
+    operation: str,
+    request_args: dict[str, Any],
+    constraints: dict[str, Any],
+    workspace_revision: str,
+) -> dict[str, Any]:
+    if operation not in {"ingest", "ingest_apply"}:
+        raise ValueError(f"knowledge.update cannot plan operation: {operation}")
+    if "ingest" not in _ALLOWED_STEPS:
+        raise ValueError("ingest is not allowed by PRODUCTION_ALLOWED_STEPS.")
+    files = _resolve_plan_files(request_args.get("inputs"), "raw/untracked", default_scan=True)
+    if not files:
+        return _empty_plan(
+            "knowledge.update",
+            "Update knowledge",
+            ["No Markdown files were found in raw/untracked; no ingest operation was planned."],
+        )
+
+    max_depth = constraints["maxDepth"]
+    max_tasks = constraints["maxTasks"]
+    if (max_depth is not None and max_depth < 2) or (max_tasks is not None and max_tasks < 2):
+        task = _planned_task(
+            "ingest-all",
+            f"Ingest {len(files)} source file(s)",
+            "knowledge.update",
+            "ingest",
+            {"inputs": files},
+            [],
+            False,
+            _file_refs(files),
+            [{"type": "directory", "ref": "wiki"}],
+            _job_lock_scopes(["ingest"], files, [], []),
+            constraints,
+            workspace_revision,
+            progress_weight=len(files),
+        )
+        return _fragment("knowledge.update", "Update knowledge", [f"{len(files)} source file(s) will be ingested as one aggregated task."], [], [task], task["expectedOutputRefs"])
+
+    aggregate_ingest = max_tasks is not None and len(files) + 1 > max_tasks
+    ingest_group = {
+        "id": "ingest",
+        "label": "Plan source ingestion",
+        "recommendedConcurrency": constraints["maxConcurrency"],
+        "progressWeight": len(files),
+    }
+    plan_refs: list[dict[str, Any]] = []
+    tasks: list[dict[str, Any]] = []
+    if aggregate_ingest:
+        plan_ref = _ingest_plan_ref(files)
+        plan_refs.append(plan_ref)
+        tasks.append(
+            _planned_task(
+                "ingest-batch",
+                f"Plan ingest for {len(files)} source file(s)",
+                "knowledge.update",
+                "ingest",
+                {"mode": "plan", "inputs": files},
+                [],
+                True,
+                _file_refs(files),
+                [plan_ref],
+                ["read"],
+                constraints,
+                workspace_revision,
+                group_id="ingest",
+                recommended_concurrency=constraints["maxConcurrency"],
+                progress_weight=len(files),
+            )
+        )
+    else:
+        for index, file_ref in enumerate(files, 1):
+            plan_ref = _ingest_plan_ref([file_ref])
+            plan_refs.append(plan_ref)
+            tasks.append(
+                _planned_task(
+                    _task_id("ingest", file_ref),
+                    f"Ingest {Path(file_ref).name}",
+                    "knowledge.update",
+                    "ingest",
+                    {"mode": "plan", "inputs": [file_ref]},
+                    [],
+                    True,
+                    _file_refs([file_ref]),
+                    [plan_ref],
+                    ["read"],
+                    constraints,
+                    workspace_revision,
+                    group_id="ingest",
+                    recommended_concurrency=constraints["maxConcurrency"],
+                    progress_weight=1,
+                    priority=index,
+                )
+            )
+
+    apply_allowed = "ingest_apply" in _ALLOWED_STEPS
+    if apply_allowed:
+        apply_task = _planned_task(
+            "ingest-apply",
+            "Apply ingest plans",
+            "knowledge.update",
+            "ingest_apply",
+            {"inputs": [ref["ref"] for ref in plan_refs]},
+            [task["id"] for task in tasks],
+            False,
+            plan_refs,
+            [{"type": "directory", "ref": "wiki"}],
+            _job_lock_scopes(["ingest_apply"], [ref["ref"] for ref in plan_refs], [], []),
+            constraints,
+            workspace_revision,
+            depends_on_group="ingest",
+            barrier=True,
+            progress_weight=max(1, len(files)),
+        )
+        tasks.append(apply_task)
+
+    synthesis = [f"{len(files)} source file(s) resolved from raw/untracked."]
+    if aggregate_ingest:
+        synthesis.append("Ingest planning was aggregated to satisfy maxTasks.")
+    if not apply_allowed:
+        synthesis.append("ingest_apply is not allowlisted; the apply barrier was omitted.")
+    expected = [{"type": "directory", "ref": "wiki"}] if apply_allowed else plan_refs
+    return _fragment("knowledge.update", "Update knowledge", synthesis, [ingest_group], tasks, expected)
+
+
+def _plan_document_build(
+    request_args: dict[str, Any],
+    constraints: dict[str, Any],
+    workspace_revision: str,
+    depends_on: list[str],
+) -> dict[str, Any]:
+    if "build" not in _ALLOWED_STEPS:
+        raise ValueError("build is not allowed by PRODUCTION_ALLOWED_STEPS.")
+    templates = _resolve_plan_files(request_args.get("templates"), "templates", default_scan=True)
+    if not templates:
+        return _empty_plan(
+            "document.build",
+            "Build documents",
+            ["No Markdown templates were found in templates; no build operation was planned."],
+        )
+    tasks, expected = _build_tasks(templates, request_args, constraints, workspace_revision, depends_on)
+    return _fragment(
+        "document.build",
+        "Build documents",
+        [f"{len(templates)} template file(s) resolved for document generation."],
+        _groups_for_tasks(tasks, "build", "Build deliverables", constraints["maxConcurrency"], len(templates)),
+        tasks,
+        expected,
+    )
+
+
+def _plan_document_publish(
+    operation: str,
+    request_args: dict[str, Any],
+    constraints: dict[str, Any],
+    workspace_revision: str,
+    depends_on: list[str],
+) -> dict[str, Any]:
+    if operation not in {"export", "polish"}:
+        raise ValueError(f"document.publish cannot plan operation: {operation}")
+    if operation not in _ALLOWED_STEPS:
+        raise ValueError(f"{operation} is not allowed by PRODUCTION_ALLOWED_STEPS.")
+    deliverables = _resolve_plan_files(request_args.get("deliverables"), "deliverables", default_scan=True)
+    if not deliverables:
+        return _empty_plan(
+            "document.publish",
+            "Publish documents",
+            ["No Markdown deliverables were found in deliverables; no publication operation was planned."],
+        )
+    tasks = _publish_tasks(operation, deliverables, request_args, constraints, workspace_revision, depends_on)
+    return _fragment(
+        "document.publish",
+        "Publish documents",
+        [f"{len(deliverables)} deliverable file(s) resolved for {operation}."],
+        _groups_for_tasks(tasks, operation, f"{operation.title()} deliverables", constraints["maxConcurrency"], len(deliverables)),
+        tasks,
+        _file_refs(deliverables),
+    )
+
+
+def _plan_pipeline(request_args: dict[str, Any], constraints: dict[str, Any], workspace_revision: str) -> dict[str, Any]:
+    if "pipeline" not in _ALLOWED_STEPS:
+        raise ValueError("pipeline is not allowed by PRODUCTION_ALLOWED_STEPS.")
+    requested_steps = _pipeline_requested_steps(request_args)
+    max_depth = constraints["maxDepth"]
+    if max_depth is not None and max_depth < 3:
+        task = _planned_task(
+            "pipeline",
+            "Run full production pipeline",
+            "knowledge.pipeline",
+            "pipeline",
+            _pipeline_arguments(request_args),
+            [],
+            False,
+            [],
+            [{"type": "directory", "ref": "deliverables"}],
+            ["workspace-write"],
+            constraints,
+            workspace_revision,
+            progress_weight=1,
+        )
+        return _fragment(
+            "knowledge.pipeline",
+            "Run production pipeline",
+            ["Pipeline planning was aggregated to satisfy maxDepth."],
+            [],
+            [task],
+            task["expectedOutputRefs"],
+        )
+
+    tasks: list[dict[str, Any]] = []
+    groups: list[dict[str, Any]] = []
+    expected_outputs: list[dict[str, Any]] = []
+
+    input_files = _resolve_plan_files(request_args.get("inputs"), "raw/untracked", default_scan=True)
+    if "ingest" in requested_steps and input_files and "ingest" in _ALLOWED_STEPS:
+        ingest_fragment = _plan_knowledge_update("ingest", request_args, constraints, workspace_revision)
+        tasks.extend(ingest_fragment["tasks"])
+        groups.extend(ingest_fragment["groups"])
+        expected_outputs.extend(ingest_fragment.get("expectedOutputs") or [])
+    previous_ids = [task["id"] for task in tasks if task.get("barrier")] or [task["id"] for task in tasks]
+
+    templates = _resolve_plan_files(request_args.get("templates"), "templates", default_scan=True)
+    if "build" in requested_steps and templates and "build" in _ALLOWED_STEPS:
+        build_tasks, build_outputs = _build_tasks(templates, request_args, constraints, workspace_revision, previous_ids, capability="knowledge.pipeline")
+        tasks.extend(build_tasks)
+        groups.extend(_groups_for_tasks(build_tasks, "build", "Build deliverables", constraints["maxConcurrency"], len(templates)))
+        expected_outputs.extend(build_outputs)
+        previous_ids = [task["id"] for task in build_tasks]
+
+    deliverables = [ref["ref"] for ref in expected_outputs if isinstance(ref, dict) and str(ref.get("ref", "")).startswith("deliverables/")]
+    if not deliverables:
+        deliverables = _resolve_plan_files(request_args.get("deliverables"), "deliverables", default_scan=True)
+    publish_operation = "export" if "export" in requested_steps and "export" in _ALLOWED_STEPS else ""
+    if deliverables and publish_operation:
+        publish_tasks = _publish_tasks(publish_operation, deliverables, request_args, constraints, workspace_revision, previous_ids, capability="knowledge.pipeline")
+        tasks.extend(publish_tasks)
+        groups.extend(_groups_for_tasks(publish_tasks, publish_operation, f"{publish_operation.title()} deliverables", constraints["maxConcurrency"], len(deliverables)))
+        expected_outputs.extend(_file_refs(deliverables))
+        previous_ids = [task["id"] for task in publish_tasks]
+    if deliverables and "polish" in requested_steps and "polish" in _ALLOWED_STEPS:
+        polish_tasks = _publish_tasks("polish", deliverables, request_args, constraints, workspace_revision, previous_ids, capability="knowledge.pipeline")
+        tasks.extend(polish_tasks)
+        groups.extend(_groups_for_tasks(polish_tasks, "polish", "Polish deliverables", constraints["maxConcurrency"], len(deliverables)))
+        expected_outputs.extend(_file_refs(deliverables))
+
+    if not tasks:
+        return _empty_plan(
+            "knowledge.pipeline",
+            "Run production pipeline",
+            ["No raw/untracked inputs, templates, or deliverables were found; no pipeline operation was planned."],
+        )
+
+    planned_count = len(tasks)
+    tasks = _aggregate_if_needed(tasks, constraints, workspace_revision, "knowledge.pipeline")
+    if len(tasks) != planned_count:
+        groups = []
+    return _fragment(
+        "knowledge.pipeline",
+        "Run production pipeline",
+        ["Full production pipeline planned from concrete workspace files."],
+        _unique_groups(groups),
+        tasks,
+        _unique_refs(expected_outputs),
+    )
+
+
+def _fragment(
+    capability: str,
+    label: str,
+    synthesis: list[str],
+    groups: list[dict[str, Any]],
+    tasks: list[dict[str, Any]],
+    expected_outputs: list[dict[str, Any]],
+) -> dict[str, Any]:
+    return {
+        "contractVersion": "1",
+        "agentInstanceId": _AGENT_INSTANCE_ID,
+        "capability": capability,
+        "summary": {
+            "label": label,
+            "initialSynthesis": synthesis,
+            "estimatedTasks": len(tasks),
+        },
+        "groups": groups,
+        "tasks": tasks,
+        "expectedOutputs": _unique_refs(expected_outputs),
+    }
+
+
+def _build_tasks(
+    templates: list[str],
+    request_args: dict[str, Any],
+    constraints: dict[str, Any],
+    workspace_revision: str,
+    depends_on: list[str],
+    capability: str = "document.build",
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    stabilize = bool(request_args.get("stabilize", False))
+    config_path = _safe_optional_config_path(request_args)
+    if _must_aggregate(len(templates), constraints):
+        deliverables = [_deliverable_for_template(template) for template in templates]
+        task = _planned_task(
+            "build-batch",
+            f"Build {len(templates)} deliverable(s)",
+            capability,
+            "build",
+            {"templates": templates, "stabilize": stabilize, **({"configPath": config_path} if config_path else {})},
+            depends_on,
+            True,
+            _file_refs(templates),
+            _file_refs(deliverables),
+            _job_lock_scopes(["build"], templates, [], []),
+            constraints,
+            workspace_revision,
+            group_id="build",
+            recommended_concurrency=constraints["maxConcurrency"],
+            progress_weight=len(templates),
+        )
+        return [task], task["expectedOutputRefs"]
+
+    tasks: list[dict[str, Any]] = []
+    outputs: list[dict[str, Any]] = []
+    for index, template in enumerate(templates, 1):
+        deliverable = _deliverable_for_template(template)
+        outputs.append({"type": "file", "ref": deliverable})
+        tasks.append(
+            _planned_task(
+                _task_id("build", template),
+                f"Build {Path(deliverable).name}",
+                capability,
+                "build",
+                {"templates": [template], "stabilize": stabilize, **({"configPath": config_path} if config_path else {})},
+                depends_on,
+                True,
+                _file_refs([template]),
+                [{"type": "file", "ref": deliverable}],
+                _job_lock_scopes(["build"], [template], [], []),
+                constraints,
+                workspace_revision,
+                group_id="build",
+                recommended_concurrency=constraints["maxConcurrency"],
+                progress_weight=1,
+                priority=index,
+            )
+        )
+    return tasks, outputs
+
+
+def _publish_tasks(
+    operation: str,
+    deliverables: list[str],
+    request_args: dict[str, Any],
+    constraints: dict[str, Any],
+    workspace_revision: str,
+    depends_on: list[str],
+    capability: str = "document.publish",
+) -> list[dict[str, Any]]:
+    config_path = _safe_optional_config_path(request_args)
+    if _must_aggregate(len(deliverables), constraints):
+        return [
+            _planned_task(
+                f"{operation}-batch",
+                f"{operation.title()} {len(deliverables)} deliverable(s)",
+                capability,
+                operation,
+                {"deliverables": deliverables, **({"configPath": config_path} if config_path else {})},
+                depends_on,
+                True,
+                _file_refs(deliverables),
+                _file_refs(deliverables),
+                _job_lock_scopes([operation], [], [], deliverables),
+                constraints,
+                workspace_revision,
+                group_id=operation,
+                recommended_concurrency=constraints["maxConcurrency"],
+                progress_weight=len(deliverables),
+            )
+        ]
+
+    tasks: list[dict[str, Any]] = []
+    for index, deliverable in enumerate(deliverables, 1):
+        tasks.append(
+            _planned_task(
+                _task_id(operation, deliverable),
+                f"{operation.title()} {Path(deliverable).name}",
+                capability,
+                operation,
+                {"deliverables": [deliverable], **({"configPath": config_path} if config_path else {})},
+                depends_on,
+                True,
+                _file_refs([deliverable]),
+                _file_refs([deliverable]),
+                _job_lock_scopes([operation], [], [], [deliverable]),
+                constraints,
+                workspace_revision,
+                group_id=operation,
+                recommended_concurrency=constraints["maxConcurrency"],
+                progress_weight=1,
+                priority=index,
+            )
+        )
+    return tasks
+
+
+def _planned_task(
+    task_id: str,
+    label: str,
+    capability: str,
+    operation: str,
+    arguments: dict[str, Any],
+    depends_on: list[str],
+    parallelizable: bool,
+    input_refs: list[dict[str, Any]],
+    expected_output_refs: list[dict[str, Any]],
+    locks: list[str],
+    constraints: dict[str, Any],
+    workspace_revision: str,
+    group_id: str | None = None,
+    depends_on_group: str | None = None,
+    barrier: bool = False,
+    recommended_concurrency: int | None = None,
+    progress_weight: int | float = 1,
+    priority: int | None = None,
+) -> dict[str, Any]:
+    requires_approval = bool(constraints["requireApprovalForMutations"] and operation in _MUTATING_STEPS)
+    task = {
+        "id": task_id,
+        "label": label,
+        "requiredCapability": capability,
+        "operation": operation,
+        "arguments": arguments,
+        "dependsOn": depends_on,
+        "parallelizable": parallelizable,
+        "inputRefs": input_refs,
+        "expectedOutputRefs": expected_output_refs,
+        "locks": locks,
+        "requiresApproval": requires_approval,
+        "idempotencyKey": _idempotency_key(workspace_revision, capability, operation, arguments, input_refs) if operation in _MUTATING_STEPS else None,
+        "progressWeight": progress_weight,
+    }
+    if group_id:
+        task["groupId"] = group_id
+    if depends_on_group:
+        task["dependsOnGroup"] = depends_on_group
+    if barrier:
+        task["barrier"] = True
+    if recommended_concurrency:
+        task["recommendedConcurrency"] = recommended_concurrency
+    if priority is not None:
+        task["priority"] = priority
+    if requires_approval:
+        task["approvalClass"] = "mutation"
+        task["approvalSummary"] = f"{operation} mutates the production workspace."
+    return task
+
+
+def _resolve_plan_files(raw_values: Any, root: str, default_scan: bool = False) -> list[str]:
+    values = _resolve_string_list(raw_values, root) if raw_values is not None else []
+    if not values and default_scan:
+        return _scan_markdown_files(root)
+    resolved: list[str] = []
+    for value in values:
+        if _has_glob_pattern(value):
+            resolved.extend(_expand_plan_glob(value, root))
+            continue
+        rel = _normalize_plan_path(value, root)
+        path = (_WORKSPACE_PATH / rel).resolve()
+        try:
+            path.relative_to(_WORKSPACE_PATH)
+        except ValueError:
+            raise ValueError(f"Invalid {root} path: {value}") from None
+        if not path.is_file():
+            raise ValueError(f"{root} file does not exist: {value}")
+        resolved.append(rel)
+    return _unique_strings(resolved)
+
+
+def _scan_markdown_files(root: str) -> list[str]:
+    base = (_WORKSPACE_PATH / root).resolve()
+    if not base.is_dir():
+        return []
+    files: list[str] = []
+    for path in sorted(base.rglob("*.md")):
+        if root == "deliverables" and any(part.startswith(".tmp.") or part.startswith(".changes.") for part in path.parts):
+            continue
+        files.append(_relative_workspace_path(path))
+    return files
+
+
+def _normalize_plan_path(value: str, root: str) -> str:
+    path = Path(value)
+    if path.is_absolute() or ".." in path.parts:
+        raise ValueError(f"Invalid {root} path: {value}")
+    root_parts = Path(root).parts
+    if path.parts[: len(root_parts)] == root_parts:
+        return path.as_posix()
+    return Path(root, path).as_posix()
+
+
+def _expand_plan_glob(value: str, root: str) -> list[str]:
+    pattern = Path(value)
+    if pattern.is_absolute() or ".." in pattern.parts:
+        raise ValueError(f"Invalid {root} glob: {value}")
+    normalized = _normalize_plan_path(value, root)
+    matches = sorted(path for path in _WORKSPACE_PATH.glob(normalized) if path.is_file())
+    if not matches:
+        raise ValueError(f"No files match {value}")
+    return [_relative_workspace_path(path) for path in matches]
+
+
+def _safe_optional_config_path(request_args: dict[str, Any]) -> str | None:
+    return _resolve_config_path(request_args.get("configPath")) if request_args.get("configPath") else None
+
+
+def _deliverable_for_template(template: str) -> str:
+    normalized = _normalize_target_path(template, "templates")
+    path = (_WORKSPACE_PATH / normalized).resolve()
+    fallback = Path(normalized).relative_to("templates").as_posix()
+    return _normalize_target_path(_template_output(path, fallback), "deliverables")
+
+
+def _file_refs(paths: list[str]) -> list[dict[str, Any]]:
+    return [{"type": "file", "ref": path, "label": Path(path).name} for path in paths]
+
+
+def _ingest_plan_ref(paths: list[str]) -> dict[str, Any]:
+    digest = hashlib.sha256("\n".join(paths).encode("utf-8")).hexdigest()[:16]
+    return {"type": "file", "ref": f".wiki/ingest-plans/{digest}.json", "label": "ingest plan"}
+
+
+def _idempotency_key(
+    workspace_revision: str,
+    capability: str,
+    operation: str,
+    arguments: dict[str, Any],
+    input_refs: list[dict[str, Any]],
+) -> str:
+    payload = {
+        "workspaceRevision": workspace_revision,
+        "capability": capability,
+        "operation": operation,
+        "arguments": arguments,
+        "checksums": _checksums_for_refs(input_refs),
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _checksums_for_refs(refs: list[dict[str, Any]]) -> dict[str, str]:
+    checksums: dict[str, str] = {}
+    for ref in refs:
+        path_value = str(ref.get("ref") or "")
+        path = (_WORKSPACE_PATH / path_value).resolve()
+        try:
+            path.relative_to(_WORKSPACE_PATH)
+        except ValueError:
+            continue
+        if path.is_file():
+            checksums[path_value] = hashlib.sha256(path.read_bytes()).hexdigest()
+    return checksums
+
+
+def _task_id(prefix: str, path_value: str) -> str:
+    slug = re.sub(r"[^a-zA-Z0-9]+", "-", Path(path_value).with_suffix("").as_posix()).strip("-").lower()
+    digest = hashlib.sha256(path_value.encode("utf-8")).hexdigest()[:8]
+    return f"{prefix}-{slug[:48]}-{digest}"
+
+
+def _must_aggregate(count: int, constraints: dict[str, Any]) -> bool:
+    max_tasks = constraints["maxTasks"]
+    return max_tasks is not None and count > max_tasks
+
+
+def _groups_for_tasks(
+    tasks: list[dict[str, Any]],
+    group_id: str,
+    label: str,
+    recommended_concurrency: int,
+    progress_weight: int,
+) -> list[dict[str, Any]]:
+    if not tasks:
+        return []
+    return [{
+        "id": group_id,
+        "label": label,
+        "recommendedConcurrency": recommended_concurrency,
+        "progressWeight": progress_weight,
+    }]
+
+
+def _aggregate_if_needed(
+    tasks: list[dict[str, Any]],
+    constraints: dict[str, Any],
+    workspace_revision: str,
+    capability: str,
+) -> list[dict[str, Any]]:
+    max_tasks = constraints["maxTasks"]
+    if max_tasks is None or len(tasks) <= max_tasks:
+        return tasks
+    arguments = {
+        "tasks": [
+            {
+                "operation": task["operation"],
+                "arguments": task.get("arguments") or {},
+            }
+            for task in tasks
+        ]
+    }
+    input_refs = _unique_refs([ref for task in tasks for ref in task.get("inputRefs", [])])
+    expected_refs = _unique_refs([ref for task in tasks for ref in task.get("expectedOutputRefs", [])])
+    locks = sorted({scope for task in tasks for scope in task.get("locks", [])} or {"workspace-write"})
+    return [
+        _planned_task(
+            "pipeline-aggregated",
+            f"Run aggregated pipeline with {len(tasks)} planned operation(s)",
+            capability,
+            "pipeline",
+            arguments,
+            [],
+            False,
+            input_refs,
+            expected_refs,
+            locks,
+            constraints,
+            workspace_revision,
+            progress_weight=sum(float(task.get("progressWeight", 1)) for task in tasks),
+        )
+    ]
+
+
+def _pipeline_arguments(request_args: dict[str, Any]) -> dict[str, Any]:
+    allowed = {"inputs", "templates", "deliverables", "steps", "stabilize", "configPath", "callerLabel"}
+    return {key: value for key, value in request_args.items() if key in allowed}
+
+
+def _pipeline_requested_steps(request_args: dict[str, Any]) -> list[str]:
+    raw_steps = request_args.get("steps")
+    if raw_steps is None:
+        return ["ingest", "build", "export", "polish"]
+    if not isinstance(raw_steps, list):
+        raise ValueError("pipeline steps must be an array of strings.")
+    steps = [str(step).strip() for step in raw_steps if str(step).strip()]
+    invalid = [step for step in steps if step not in {"ingest", "build", "export", "polish"}]
+    if invalid:
+        raise ValueError(f"Unsupported pipeline planning step: {invalid[0]}")
+    return steps
+
+
+def _unique_refs(refs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    unique: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for ref in refs:
+        key = json.dumps(ref, sort_keys=True)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(ref)
+    return unique
+
+
+def _unique_groups(groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    unique: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for group in groups:
+        group_id = str(group.get("id") or "")
+        if group_id in seen:
+            continue
+        seen.add(group_id)
+        unique.append(group)
+    return unique
+
+
+def _unique_strings(values: list[str]) -> list[str]:
+    unique: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        unique.append(value)
+    return unique
 
 
 def _resolve_steps(job_type: str, raw_steps: Any) -> list[str]:

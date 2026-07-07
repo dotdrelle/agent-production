@@ -109,6 +109,37 @@ class ProductionMcpServerTest(unittest.TestCase):
     def payload(self, result):
         return json.loads(result[0].text)
 
+    def assert_task_graph_fragment(self, fragment):
+        self.assertEqual(fragment["contractVersion"], "1")
+        self.assertEqual(fragment["agentInstanceId"], "production-main")
+        self.assertIn("capability", fragment)
+        self.assertIn("summary", fragment)
+        self.assertIn("groups", fragment)
+        self.assertIn("tasks", fragment)
+        self.assertEqual(fragment["summary"]["estimatedTasks"], len(fragment["tasks"]))
+        for task in fragment["tasks"]:
+            for key in [
+                "id",
+                "label",
+                "requiredCapability",
+                "operation",
+                "dependsOn",
+                "parallelizable",
+                "inputRefs",
+                "locks",
+                "requiresApproval",
+                "idempotencyKey",
+                "progressWeight",
+            ]:
+                self.assertIn(key, task)
+            self.assertNotIn("executor", task)
+            self.assertIsInstance(task["dependsOn"], list)
+            self.assertIsInstance(task["inputRefs"], list)
+            self.assertIsInstance(task["locks"], list)
+            for ref in task["inputRefs"]:
+                self.assertNotIn("*", ref["ref"])
+                self.assertNotIn("?", ref["ref"])
+
     def test_agent_describe_returns_valid_contract(self):
         description = self.payload(self.server._tool_agent_describe())
 
@@ -174,6 +205,187 @@ class ProductionMcpServerTest(unittest.TestCase):
 
         payload = self.payload(asyncio.run(self.server.call_tool("agent_describe", {})))
         self.assertEqual(payload["agentType"], "production")
+
+    def test_agent_plan_ingest_scans_untracked_and_adds_apply_barrier(self):
+        (self.workspace / "raw" / "untracked").mkdir(parents=True)
+        (self.workspace / "raw" / "untracked" / "b.md").write_text("# B\n", encoding="utf-8")
+        (self.workspace / "raw" / "untracked" / "a.md").write_text("# A\n", encoding="utf-8")
+
+        fragment = self.payload(
+            self.server._tool_agent_plan(
+                {
+                    "capability": "knowledge.update",
+                    "operation": "ingest",
+                    "workspace": {"revision": "rev-1"},
+                    "constraints": {"maxConcurrency": 2, "requireApprovalForMutations": True},
+                }
+            )
+        )
+
+        self.assert_task_graph_fragment(fragment)
+        self.assertEqual(fragment["capability"], "knowledge.update")
+        self.assertEqual([task["operation"] for task in fragment["tasks"]], ["ingest", "ingest", "ingest_apply"])
+        self.assertNotIn("export", [task["operation"] for task in fragment["tasks"]])
+        self.assertEqual(fragment["groups"][0]["id"], "ingest")
+        self.assertEqual(fragment["groups"][0]["recommendedConcurrency"], 2)
+        apply_task = fragment["tasks"][-1]
+        self.assertTrue(apply_task["barrier"])
+        self.assertEqual(apply_task["dependsOnGroup"], "ingest")
+        self.assertEqual(apply_task["locks"], ["workspace-write"])
+        self.assertTrue(all(task["requiresApproval"] for task in fragment["tasks"]))
+        self.assertTrue(all(len(task["idempotencyKey"]) == 64 for task in fragment["tasks"]))
+        self.assertEqual(fragment["tasks"][0]["inputRefs"][0]["ref"], "raw/untracked/a.md")
+        self.assertEqual(fragment["tasks"][1]["inputRefs"][0]["ref"], "raw/untracked/b.md")
+
+    def test_agent_plan_empty_ingest_returns_empty_fragment(self):
+        fragment = self.payload(
+            self.server._tool_agent_plan(
+                {
+                    "capability": "knowledge.update",
+                    "operation": "ingest",
+                    "workspace": {"revision": "rev-empty"},
+                }
+            )
+        )
+
+        self.assert_task_graph_fragment(fragment)
+        self.assertEqual(fragment["tasks"], [])
+        self.assertIn("No Markdown files", fragment["summary"]["initialSynthesis"][0])
+
+    def test_agent_plan_build_creates_one_task_per_template(self):
+        (self.workspace / "templates" / "a.md").write_text("---\noutput: alpha.md\n---\n# A\n", encoding="utf-8")
+        (self.workspace / "templates" / "nested").mkdir()
+        (self.workspace / "templates" / "nested" / "b.md").write_text("# B\n", encoding="utf-8")
+
+        fragment = self.payload(
+            self.server._tool_agent_plan(
+                {
+                    "capability": "document.build",
+                    "operation": "build",
+                    "workspace": {"revision": "rev-build"},
+                    "constraints": {"requireApprovalForMutations": True},
+                }
+            )
+        )
+
+        self.assert_task_graph_fragment(fragment)
+        self.assertEqual([task["operation"] for task in fragment["tasks"]], ["build", "build"])
+        self.assertEqual([task["inputRefs"][0]["ref"] for task in fragment["tasks"]], ["templates/a.md", "templates/nested/b.md"])
+        self.assertEqual(
+            [task["expectedOutputRefs"][0]["ref"] for task in fragment["tasks"]],
+            ["deliverables/alpha.md", "deliverables/nested/b.md"],
+        )
+        self.assertTrue(all(task["requiresApproval"] for task in fragment["tasks"]))
+        self.assertNotIn("export", [task["operation"] for task in fragment["tasks"]])
+
+    def test_agent_plan_publish_creates_one_task_per_deliverable(self):
+        (self.workspace / "deliverables" / "a.md").write_text("# A\n", encoding="utf-8")
+        (self.workspace / "deliverables" / "b.md").write_text("# B\n", encoding="utf-8")
+
+        fragment = self.payload(
+            self.server._tool_agent_plan(
+                {
+                    "capability": "document.publish",
+                    "operation": "export",
+                    "workspace": {"revision": "rev-publish"},
+                    "constraints": {"maxConcurrency": 3},
+                }
+            )
+        )
+
+        self.assert_task_graph_fragment(fragment)
+        self.assertEqual([task["operation"] for task in fragment["tasks"]], ["export", "export"])
+        self.assertEqual([task["inputRefs"][0]["ref"] for task in fragment["tasks"]], ["deliverables/a.md", "deliverables/b.md"])
+        self.assertEqual(fragment["tasks"][0]["locks"], ["deliverable:deliverables/a.md"])
+        self.assertEqual(fragment["groups"][0]["recommendedConcurrency"], 3)
+
+    def test_agent_plan_pipeline_full_scenario(self):
+        (self.workspace / "raw" / "untracked").mkdir(parents=True)
+        (self.workspace / "raw" / "untracked" / "source.md").write_text("# Source\n", encoding="utf-8")
+        (self.workspace / "templates" / "report.md").write_text("---\noutput: report.md\n---\n# Report\n", encoding="utf-8")
+
+        fragment = self.payload(
+            self.server._tool_agent_plan(
+                {
+                    "capability": "knowledge.pipeline",
+                    "operation": "pipeline",
+                    "workspace": {"revision": "rev-pipeline"},
+                    "constraints": {"requireApprovalForMutations": True},
+                }
+            )
+        )
+
+        self.assert_task_graph_fragment(fragment)
+        operations = [task["operation"] for task in fragment["tasks"]]
+        self.assertEqual(operations, ["ingest", "ingest_apply", "build", "export", "polish"])
+        build = next(task for task in fragment["tasks"] if task["operation"] == "build")
+        export = next(task for task in fragment["tasks"] if task["operation"] == "export")
+        polish = next(task for task in fragment["tasks"] if task["operation"] == "polish")
+        self.assertIn("ingest-apply", build["dependsOn"])
+        self.assertIn(build["id"], export["dependsOn"])
+        self.assertIn(export["id"], polish["dependsOn"])
+        self.assertEqual(export["inputRefs"][0]["ref"], "deliverables/report.md")
+
+    def test_agent_plan_pipeline_respects_requested_steps(self):
+        (self.workspace / "raw" / "untracked").mkdir(parents=True)
+        (self.workspace / "raw" / "untracked" / "source.md").write_text("# Source\n", encoding="utf-8")
+        (self.workspace / "templates" / "report.md").write_text("# Report\n", encoding="utf-8")
+
+        fragment = self.payload(
+            self.server._tool_agent_plan(
+                {
+                    "capability": "knowledge.pipeline",
+                    "operation": "pipeline",
+                    "workspace": {"revision": "rev-pipeline-steps"},
+                    "arguments": {"steps": ["ingest"]},
+                }
+            )
+        )
+
+        self.assert_task_graph_fragment(fragment)
+        operations = [task["operation"] for task in fragment["tasks"]]
+        self.assertEqual(operations, ["ingest", "ingest_apply"])
+        self.assertNotIn("build", operations)
+        self.assertNotIn("export", operations)
+
+    def test_agent_plan_aggregates_when_max_tasks_is_exceeded(self):
+        (self.workspace / "templates" / "a.md").write_text("# A\n", encoding="utf-8")
+        (self.workspace / "templates" / "b.md").write_text("# B\n", encoding="utf-8")
+
+        fragment = self.payload(
+            self.server._tool_agent_plan(
+                {
+                    "capability": "document.build",
+                    "operation": "build",
+                    "workspace": {"revision": "rev-aggregate"},
+                    "constraints": {"maxTasks": 1},
+                }
+            )
+        )
+
+        self.assert_task_graph_fragment(fragment)
+        self.assertEqual(len(fragment["tasks"]), 1)
+        self.assertEqual(fragment["tasks"][0]["id"], "build-batch")
+        self.assertEqual(fragment["tasks"][0]["arguments"]["templates"], ["templates/a.md", "templates/b.md"])
+        self.assertEqual(fragment["tasks"][0]["progressWeight"], 2)
+
+    def test_agent_plan_is_listed_and_callable(self):
+        tools = asyncio.run(self.server.list_tools())
+        self.assertIn("agent_plan", [tool.name for tool in tools])
+
+        payload = self.payload(
+            asyncio.run(
+                self.server.call_tool(
+                    "agent_plan",
+                    {
+                        "capability": "knowledge.update",
+                        "operation": "ingest",
+                        "workspace": {"revision": "rev-call"},
+                    },
+                )
+            )
+        )
+        self.assertEqual(payload["capability"], "knowledge.update")
 
     def test_start_job_dry_run_returns_plan_without_confirmation(self):
         result = asyncio.run(self.server._tool_start_job({"type": "doctor", "dryRun": True}))
