@@ -119,6 +119,35 @@ class ProductionMcpServerTest(unittest.TestCase):
         self.assertEqual(payload["plan"]["inputs"], ["raw/untracked/doc-a.md", "doc-b.md"])
         self.assertIn("node /app/bin/wiki.js ingest raw/untracked/doc-a.md doc-b.md", payload["commands"])
 
+    def test_ingest_dry_run_expands_input_globs(self):
+        (self.workspace / "raw" / "untracked").mkdir(parents=True)
+        (self.workspace / "raw" / "untracked" / "b.md").write_text("# B\n", encoding="utf-8")
+        (self.workspace / "raw" / "untracked" / "a.md").write_text("# A\n", encoding="utf-8")
+        result = asyncio.run(
+            self.server._tool_start_job(
+                {
+                    "type": "ingest",
+                    "inputs": ["raw/untracked/*.md"],
+                    "dryRun": True,
+                }
+            )
+        )
+        payload = self.payload(result)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["plan"]["inputs"], ["raw/untracked/a.md", "raw/untracked/b.md"])
+
+    def test_ingest_dry_run_rejects_unmatched_input_globs(self):
+        with self.assertRaisesRegex(ValueError, r"No files match raw/untracked/\*.md"):
+            asyncio.run(
+                self.server._tool_start_job(
+                    {
+                        "type": "ingest",
+                        "inputs": ["raw/untracked/*.md"],
+                        "dryRun": True,
+                    }
+                )
+            )
+
     def test_ingest_plan_dry_run_accepts_target_inputs_without_workspace_write_lock(self):
         result = asyncio.run(
             self.server._tool_start_job(

@@ -34,7 +34,7 @@ import uvicorn
 
 app = Server("agent-wiki-production")
 
-_AGENT_VERSION = "0.11.10"
+_AGENT_VERSION = "0.12.0"
 _MCP_TOKEN = os.environ.get("MCP_AUTH_TOKEN", "")
 _MCP_READ_TOKEN = os.environ.get("MCP_READ_TOKEN", "")
 _MCP_WRITE_TOKEN = os.environ.get("MCP_WRITE_TOKEN", "")
@@ -672,7 +672,7 @@ async def _tool_start_job(args: dict[str, Any]) -> list[TextContent]:
     dry_run = bool(args.get("dryRun", False))
     confirm = bool(args.get("confirm", False))
     steps = _resolve_steps(job_type, args.get("steps"))
-    inputs = _resolve_string_list(args.get("inputs"), "inputs")
+    inputs = _expand_input_globs(_resolve_string_list(args.get("inputs"), "inputs"))
     templates = _resolve_string_list(args.get("templates"), "templates")
     deliverables = _resolve_string_list(args.get("deliverables"), "deliverables")
     stabilize = bool(args.get("stabilize", False))
@@ -839,6 +839,26 @@ def _resolve_string_list(value: Any, name: str) -> list[str]:
         if ".." in Path(item).parts:
             raise ValueError(f"Invalid {name} path: {item}")
     return items
+
+
+def _has_glob_pattern(value: str) -> bool:
+    return any(char in value for char in "*?[")
+
+
+def _expand_input_globs(inputs: list[str]) -> list[str]:
+    expanded: list[str] = []
+    for item in inputs:
+        if not _has_glob_pattern(item):
+            expanded.append(item)
+            continue
+        pattern = Path(item)
+        if pattern.is_absolute() or ".." in pattern.parts:
+            raise ValueError(f"Invalid input glob: {item}")
+        matches = sorted(path for path in _WORKSPACE_PATH.glob(pattern.as_posix()) if path.is_file())
+        if not matches:
+            raise ValueError(f"No files match {item}")
+        expanded.extend(_relative_workspace_path(path) for path in matches)
+    return expanded
 
 
 def _normalize_target_path(value: str, root: str) -> str:
