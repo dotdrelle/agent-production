@@ -151,7 +151,7 @@ class ProductionMcpServerTest(unittest.TestCase):
         self.assertEqual(description["orchestration"]["canPlan"], True)
         self.assertEqual(description["orchestration"]["canExecute"], True)
         self.assertEqual(description["orchestration"]["canCancel"], True)
-        self.assertEqual(description["orchestration"]["supportsIdempotency"], False)
+        self.assertEqual(description["orchestration"]["supportsIdempotency"], True)
         self.assertEqual(description["orchestration"]["supportsParallelWorkers"], True)
         self.assertIn("recommendedConcurrency", description["limits"])
         self.assertIn("maxConcurrency", description["limits"])
@@ -464,6 +464,62 @@ class ProductionMcpServerTest(unittest.TestCase):
             self.assertEqual(job["workspace"], "request-wins")
             self.assertEqual(status["workspace"], {"name": "request-wins"})
             await self.server._tool_agent_cancel({"jobId": accepted["jobId"]})
+
+        asyncio.run(scenario())
+
+    def test_agent_execute_same_idempotency_key_reuses_active_job(self):
+        async def scenario():
+            async def hold_job(_job_id):
+                await asyncio.Future()
+
+            self.server._run_job = hold_job
+            request = {
+                "taskId": "task-idempotent-active",
+                "idempotencyKey": "idem-active",
+                "operation": "doctor",
+                "workspace": {"name": "requested-workspace"},
+            }
+            first = self.payload(await self.server._tool_agent_execute(request))
+            second = self.payload(await self.server._tool_agent_execute(request))
+
+            self.assertTrue(first["accepted"])
+            self.assertTrue(second["accepted"])
+            self.assertEqual(first["jobId"], second["jobId"])
+            self.assertEqual(second["idempotent"], True)
+            self.assertEqual(len(list((self.server._JOBS_DIR / "jobs").glob("*.json"))), 1)
+            await self.server._tool_agent_cancel({"jobId": first["jobId"]})
+
+        asyncio.run(scenario())
+
+    def test_agent_execute_lost_response_reuses_finished_idempotent_job(self):
+        async def scenario():
+            async def successful_cli_step(
+                _job_id,
+                _step,
+                _inputs,
+                _templates,
+                _deliverables,
+                stabilize=False,
+                config_path=None,
+            ):
+                return 0
+
+            self.server._run_cli_step = successful_cli_step
+            request = {
+                "taskId": "task-idempotent-done",
+                "idempotencyKey": "idem-done",
+                "operation": "doctor",
+                "workspace": {"name": "requested-workspace"},
+            }
+            first = self.payload(await self.server._tool_agent_execute(request))
+            await self.server._ACTIVE_TASKS[first["jobId"]]
+            second = self.payload(await self.server._tool_agent_execute(request))
+
+            self.assertEqual(first["jobId"], second["jobId"])
+            self.assertEqual(second["idempotent"], True)
+            self.assertEqual(second["terminal"], True)
+            self.assertEqual(second["result"]["status"], "succeeded")
+            self.assertEqual(len(list((self.server._JOBS_DIR / "jobs").glob("*.json"))), 1)
 
         asyncio.run(scenario())
 

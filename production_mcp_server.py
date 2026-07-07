@@ -204,6 +204,10 @@ def _terminal_status(status: Any) -> bool:
     return str(status or "").lower() in {"done", "failed", "cancelled", "canceled", "complete", "completed", "success", "error"}
 
 
+def _active_status(status: Any) -> bool:
+    return str(status or "").lower() in {"queued", "running", "cancelling"}
+
+
 def _agent_request_workspace(args: dict[str, Any]) -> dict[str, Any]:
     workspace = args.get("workspace")
     if not isinstance(workspace, dict):
@@ -362,7 +366,7 @@ def _agent_description() -> dict[str, Any]:
             "canExecute": True,
             "canCancel": True,
             "canResume": False,
-            "supportsIdempotency": False,
+            "supportsIdempotency": True,
             "supportsParallelWorkers": True,
         },
         "limits": _agent_limits(),
@@ -487,6 +491,7 @@ def _agent_execute_input_schema() -> dict[str, Any]:
         "type": "object",
         "properties": {
             "taskId": {"type": "string"},
+            "idempotencyKey": {"type": "string"},
             "operation": {"type": "string", "enum": sorted(_AGENT_OPERATION_TRANSLATION)},
             "workspace": {
                 "type": "object",
@@ -578,6 +583,10 @@ def _ensure_dirs() -> None:
     _LOCKS_DIR.mkdir(parents=True, exist_ok=True)
 
 
+def _idempotency_path() -> Path:
+    return _JOBS_DIR / "idempotency.json"
+
+
 def _job_path(job_id: str) -> Path:
     return _JOBS_DIR / "jobs" / f"{job_id}.json"
 
@@ -598,7 +607,9 @@ def _read_json(path: Path) -> dict[str, Any]:
 
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    tmp_path = path.with_suffix(f"{path.suffix}.tmp")
+    tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    tmp_path.replace(path)
 
 
 def _append_log(job_id: str, line: str) -> None:
@@ -618,6 +629,69 @@ def _load_job(job_id: str) -> dict[str, Any]:
 def _save_job(job: dict[str, Any]) -> None:
     job["updatedAt"] = _now()
     _write_json(_job_path(str(job["jobId"])), job)
+    _update_idempotency_status_for_job(job)
+
+
+def _normalize_idempotency_key(value: Any) -> str | None:
+    key = str(value or "").strip()
+    return key or None
+
+
+def _load_idempotency_store() -> dict[str, Any]:
+    path = _idempotency_path()
+    if not path.exists():
+        return {}
+    with contextlib.suppress(Exception):
+        payload = _read_json(path)
+        if isinstance(payload, dict):
+            return {str(key): value for key, value in payload.items() if isinstance(value, dict)}
+    return {}
+
+
+def _save_idempotency_store(payload: dict[str, Any]) -> None:
+    _ensure_dirs()
+    _write_json(_idempotency_path(), payload)
+
+
+def _record_idempotency(key: str, job_id: str, status: str) -> None:
+    store = _load_idempotency_store()
+    store[key] = {"jobId": job_id, "status": status}
+    _save_idempotency_store(store)
+
+
+def _update_idempotency_status_for_job(job: dict[str, Any]) -> None:
+    job_id = str(job.get("jobId") or "")
+    if not job_id:
+        return
+    store = _load_idempotency_store()
+    changed = False
+    for entry in store.values():
+        if isinstance(entry, dict) and entry.get("jobId") == job_id:
+            entry["status"] = str(job.get("status") or entry.get("status") or "unknown")
+            changed = True
+    if changed:
+        _save_idempotency_store(store)
+
+
+def _idempotent_job_for_key(key: str) -> dict[str, Any] | None:
+    store = _load_idempotency_store()
+    entry = store.get(key)
+    if not isinstance(entry, dict):
+        return None
+    job_id = str(entry.get("jobId") or "").strip()
+    if not job_id:
+        return None
+    try:
+        job = _load_job(job_id)
+    except ValueError:
+        store.pop(key, None)
+        _save_idempotency_store(store)
+        return None
+    status = str(job.get("status") or entry.get("status") or "unknown")
+    if entry.get("status") != status:
+        entry["status"] = status
+        _save_idempotency_store(store)
+    return job
 
 
 def _recent_jobs(limit: int = 10) -> list[dict[str, Any]]:
@@ -1016,6 +1090,26 @@ def _tool_agent_plan(args: dict[str, Any]) -> list[TextContent]:
 
 async def _tool_agent_execute(args: dict[str, Any]) -> list[TextContent]:
     workspace = _agent_request_workspace(args)
+    idempotency_key = _normalize_idempotency_key(args.get("idempotencyKey"))
+    if idempotency_key:
+        existing = _idempotent_job_for_key(idempotency_key)
+        if existing:
+            status_payload = _agent_task_status(existing, _job_progress(existing, _read_log_tail(str(existing["jobId"]), 500)))
+            response = {
+                "accepted": True,
+                "idempotent": True,
+                "agentInstanceId": _AGENT_INSTANCE_ID,
+                "taskId": args.get("taskId"),
+                "jobId": existing["jobId"],
+                "status": existing.get("status", "unknown"),
+            }
+            if _terminal_status(existing.get("status")):
+                response["terminal"] = True
+                response["result"] = status_payload.get("result")
+            elif _active_status(existing.get("status")):
+                response["terminal"] = False
+            return _json_text(response)
+
     start_args = _agent_start_job_args(args, workspace)
     result = _json_payload(await _tool_start_job(start_args, workspace_name_override=workspace["name"]))
     if not result.get("ok"):
@@ -1028,9 +1122,12 @@ async def _tool_agent_execute(args: dict[str, Any]) -> list[TextContent]:
                 **({"activeJobId": result.get("activeJobId")} if result.get("activeJobId") else {}),
             }
         )
+    if idempotency_key:
+        _record_idempotency(idempotency_key, result["jobId"], result.get("status", "queued"))
     return _json_text(
         {
             "accepted": True,
+            **({"idempotent": False} if idempotency_key else {}),
             "agentInstanceId": _AGENT_INSTANCE_ID,
             "taskId": args.get("taskId"),
             "jobId": result["jobId"],
