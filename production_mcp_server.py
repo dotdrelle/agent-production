@@ -42,8 +42,22 @@ _CURRENT_SCOPES: contextvars.ContextVar[set[str]] = contextvars.ContextVar("mcp_
 _RATE_LIMIT_REQUESTS = int(os.environ.get("MCP_RATE_LIMIT_REQUESTS", "120"))
 _RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("MCP_RATE_LIMIT_WINDOW_SECONDS", "60"))
 _RATE_BUCKETS: dict[str, list[float]] = {}
+
+
+def _int_env(name: str, default: int) -> int:
+    try:
+        return max(0, int(os.environ.get(name, str(default))))
+    except ValueError:
+        return default
+
+
 _WORKSPACE_NAME = os.environ.get("WORKSPACE_NAME", "workspace")
 _WORKSPACE_PATH = Path(os.environ.get("WIKI_WORKSPACE_PATH", "/workspace")).resolve()
+_AGENT_INSTANCE_ID = os.environ.get("PRODUCTION_INSTANCE_ID", "production-main")
+_RECOMMENDED_CONCURRENCY = _int_env("PRODUCTION_RECOMMENDED_CONCURRENCY", 2)
+_MAX_CONCURRENCY = _int_env("PRODUCTION_MAX_CONCURRENCY", 4)
+_MAX_TASKS_PER_PLAN = _int_env("PRODUCTION_MAX_TASKS_PER_PLAN", 0)
+_MAX_TASK_DURATION_MS = _int_env("PRODUCTION_MAX_TASK_DURATION_MS", 0)
 _LOG_PREFIX = f"[production-mcp/{_WORKSPACE_NAME}]"
 _IMPORTS = os.environ.get("WIKI_IMPORTS", "")
 _IMPORT_PATH_MAPPINGS = os.environ.get("PRODUCTION_IMPORT_PATH_MAPPINGS", "")
@@ -69,6 +83,13 @@ _STEP_COMMANDS: dict[str, list[str]] = {
     "polish": ["node", _WIKI_BIN, "export", "--polish"],
 }
 _MUTATING_STEPS = {"copy", "ingest", "ingest_plan", "ingest_apply", "build", "export", "polish", "pipeline"}
+_CAPABILITY_STEP_MAP: dict[str, list[str]] = {
+    "knowledge.update": ["ingest"],
+    "document.build": ["build"],
+    "document.publish": ["export", "polish"],
+    "workspace.diagnose": ["doctor"],
+    "knowledge.pipeline": ["pipeline"],
+}
 
 _WRITE_TOOLS = {"production_start_job", "production_cancel_job"}
 
@@ -165,6 +186,94 @@ def _mask_secret_text(value: Any) -> str:
 
 def _terminal_status(status: Any) -> bool:
     return str(status or "").lower() in {"done", "failed", "cancelled", "canceled", "complete", "completed", "success", "error"}
+
+
+def _agent_description() -> dict[str, Any]:
+    return {
+        "contractVersion": "1",
+        "agentType": "production",
+        "agentInstanceId": _AGENT_INSTANCE_ID,
+        "displayName": "Production",
+        "capabilities": _agent_capabilities(),
+        "orchestration": {
+            "canPlan": True,
+            "canExpandPlan": False,
+            "canExecute": True,
+            "canCancel": True,
+            "canResume": False,
+            "supportsIdempotency": False,
+            "supportsParallelWorkers": True,
+        },
+        "limits": _agent_limits(),
+        "health": {"status": "available" if _WORKSPACE_PATH.exists() else "unavailable"},
+    }
+
+
+def _agent_limits() -> dict[str, int]:
+    limits = {
+        "recommendedConcurrency": _RECOMMENDED_CONCURRENCY,
+        "maxConcurrency": _MAX_CONCURRENCY,
+    }
+    if _MAX_TASKS_PER_PLAN:
+        limits["maxTasksPerPlan"] = _MAX_TASKS_PER_PLAN
+    if _MAX_TASK_DURATION_MS:
+        limits["maxTaskDurationMs"] = _MAX_TASK_DURATION_MS
+    return limits
+
+
+def _agent_capabilities() -> list[dict[str, Any]]:
+    capabilities: list[dict[str, Any]] = []
+    for capability_id, steps in _CAPABILITY_STEP_MAP.items():
+        supported = [step for step in steps if step in _ALLOWED_STEPS]
+        if not supported:
+            continue
+        mutating = any(step in _MUTATING_STEPS for step in supported)
+        capabilities.append(
+            {
+                "id": capability_id,
+                "version": "1",
+                "description": _capability_description(capability_id),
+                "inputSchema": _capability_input_schema(capability_id, supported),
+                "outputSchema": {"type": "object", "additionalProperties": True},
+                "supportedOperations": supported,
+                **({"mutationClass": "workspace", "defaultRequiresApproval": True} if mutating else {}),
+            }
+        )
+    return capabilities
+
+
+def _capability_description(capability_id: str) -> str:
+    descriptions = {
+        "knowledge.update": "Update the workspace knowledge base from concrete Markdown inputs.",
+        "document.build": "Build deliverables from llm-wiki templates.",
+        "document.publish": "Export or polish existing deliverables.",
+        "workspace.diagnose": "Diagnose workspace configuration and runtime readiness.",
+        "knowledge.pipeline": "Run the production pipeline over the workspace.",
+    }
+    return descriptions.get(capability_id, capability_id)
+
+
+def _capability_input_schema(capability_id: str, supported: list[str]) -> dict[str, Any]:
+    properties: dict[str, Any] = {
+        "operation": {"type": "string", "enum": supported},
+        "configPath": {"type": "string"},
+        "callerLabel": {"type": "string"},
+    }
+    if capability_id == "knowledge.update":
+        properties["inputs"] = {"type": "array", "items": {"type": "string"}}
+    if capability_id == "document.build":
+        properties["templates"] = {"type": "array", "items": {"type": "string"}}
+        properties["stabilize"] = {"type": "boolean"}
+    if capability_id == "document.publish":
+        properties["deliverables"] = {"type": "array", "items": {"type": "string"}}
+    if capability_id == "knowledge.pipeline":
+        properties["steps"] = {"type": "array", "items": {"type": "string"}}
+    return {
+        "type": "object",
+        "properties": properties,
+        "required": ["operation"],
+        "additionalProperties": False,
+    }
 
 
 def _activity_for_job(job: dict[str, Any], progress: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -446,6 +555,11 @@ def _render_landing_page(endpoint_url: str, scheme: str) -> str:
 async def list_tools() -> list[Tool]:
     return [
         Tool(
+            name="agent_describe",
+            description="Return the production agent orchestration contract and capability declarations.",
+            inputSchema={"type": "object", "properties": {}, "additionalProperties": False},
+        ),
+        Tool(
             name="production_status",
             description="Check agent-wiki-production configuration, active lock, allowed steps, and recent jobs.",
             inputSchema={"type": "object", "properties": {}, "additionalProperties": False},
@@ -577,6 +691,8 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
         if denied is not None:
             return denied
         match name:
+            case "agent_describe":
+                result = _tool_agent_describe()
             case "production_status":
                 result = _tool_status()
             case "production_list_templates":
@@ -598,6 +714,10 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
     except Exception as exc:
         print(f"{_LOG_PREFIX} tools/result {name} error {int((time.time() - start) * 1000)}ms {_mask_secret_text(exc)}")
         return _json_text({"ok": False, "error": str(exc)})
+
+
+def _tool_agent_describe() -> list[TextContent]:
+    return _json_text(_agent_description())
 
 
 def _tool_status() -> list[TextContent]:

@@ -71,16 +71,28 @@ def install_stubs():
     sys.modules["uvicorn"].run = lambda *args, **kwargs: None
 
 
-def load_module(workspace):
+def load_module(workspace, env=None):
     install_stubs()
-    os.environ["WIKI_WORKSPACE_PATH"] = str(workspace)
-    os.environ["WORKSPACE_NAME"] = "test-workspace"
-    os.environ["PRODUCTION_REQUIRE_CONFIRMATION"] = "true"
-    path = Path(__file__).with_name("production_mcp_server.py")
-    spec = importlib.util.spec_from_file_location("production_mcp_server_test_subject", path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+    updates = {
+        "WIKI_WORKSPACE_PATH": str(workspace),
+        "WORKSPACE_NAME": "test-workspace",
+        "PRODUCTION_REQUIRE_CONFIRMATION": "true",
+        **(env or {}),
+    }
+    previous = {key: os.environ.get(key) for key in updates}
+    os.environ.update(updates)
+    try:
+        path = Path(__file__).with_name("production_mcp_server.py")
+        spec = importlib.util.spec_from_file_location(f"production_mcp_server_test_subject_{time.time_ns()}", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
 
 class ProductionMcpServerTest(unittest.TestCase):
@@ -96,6 +108,72 @@ class ProductionMcpServerTest(unittest.TestCase):
 
     def payload(self, result):
         return json.loads(result[0].text)
+
+    def test_agent_describe_returns_valid_contract(self):
+        description = self.payload(self.server._tool_agent_describe())
+
+        self.assertEqual(description["contractVersion"], "1")
+        self.assertEqual(description["agentType"], "production")
+        self.assertEqual(description["agentInstanceId"], "production-main")
+        self.assertEqual(description["displayName"], "Production")
+        self.assertEqual(description["health"]["status"], "available")
+        self.assertEqual(description["orchestration"]["canPlan"], True)
+        self.assertEqual(description["orchestration"]["canExecute"], True)
+        self.assertEqual(description["orchestration"]["canCancel"], True)
+        self.assertEqual(description["orchestration"]["supportsIdempotency"], False)
+        self.assertEqual(description["orchestration"]["supportsParallelWorkers"], True)
+        self.assertIn("recommendedConcurrency", description["limits"])
+        self.assertIn("maxConcurrency", description["limits"])
+
+        capabilities = {item["id"]: item for item in description["capabilities"]}
+        self.assertEqual(capabilities["knowledge.update"]["supportedOperations"], ["ingest"])
+        self.assertEqual(capabilities["document.build"]["supportedOperations"], ["build"])
+        self.assertEqual(capabilities["document.publish"]["supportedOperations"], ["export", "polish"])
+        self.assertEqual(capabilities["workspace.diagnose"]["supportedOperations"], ["doctor"])
+        self.assertEqual(capabilities["knowledge.pipeline"]["supportedOperations"], ["pipeline"])
+        self.assertTrue(capabilities["knowledge.update"]["defaultRequiresApproval"])
+        self.assertEqual(capabilities["knowledge.update"]["mutationClass"], "workspace")
+        self.assertNotIn("defaultRequiresApproval", capabilities["workspace.diagnose"])
+
+    def test_agent_describe_uses_env_instance_and_limits(self):
+        server = load_module(
+            self.workspace,
+            {
+                "PRODUCTION_INSTANCE_ID": "production-test",
+                "PRODUCTION_RECOMMENDED_CONCURRENCY": "3",
+                "PRODUCTION_MAX_CONCURRENCY": "8",
+                "PRODUCTION_MAX_TASKS_PER_PLAN": "42",
+                "PRODUCTION_MAX_TASK_DURATION_MS": "900000",
+            },
+        )
+        description = self.payload(server._tool_agent_describe())
+
+        self.assertEqual(description["agentInstanceId"], "production-test")
+        self.assertEqual(description["limits"]["recommendedConcurrency"], 3)
+        self.assertEqual(description["limits"]["maxConcurrency"], 8)
+        self.assertEqual(description["limits"]["maxTasksPerPlan"], 42)
+        self.assertEqual(description["limits"]["maxTaskDurationMs"], 900000)
+
+    def test_agent_describe_capabilities_follow_allowed_steps(self):
+        server = load_module(
+            self.workspace,
+            {"PRODUCTION_ALLOWED_STEPS": "doctor,ingest,polish,pipeline"},
+        )
+        description = self.payload(server._tool_agent_describe())
+        capabilities = {item["id"]: item for item in description["capabilities"]}
+
+        self.assertEqual(capabilities["knowledge.update"]["supportedOperations"], ["ingest"])
+        self.assertNotIn("document.build", capabilities)
+        self.assertEqual(capabilities["document.publish"]["supportedOperations"], ["polish"])
+        self.assertEqual(capabilities["workspace.diagnose"]["supportedOperations"], ["doctor"])
+        self.assertEqual(capabilities["knowledge.pipeline"]["supportedOperations"], ["pipeline"])
+
+    def test_agent_describe_is_listed_and_callable(self):
+        tools = asyncio.run(self.server.list_tools())
+        self.assertIn("agent_describe", [tool.name for tool in tools])
+
+        payload = self.payload(asyncio.run(self.server.call_tool("agent_describe", {})))
+        self.assertEqual(payload["agentType"], "production")
 
     def test_start_job_dry_run_returns_plan_without_confirmation(self):
         result = asyncio.run(self.server._tool_start_job({"type": "doctor", "dryRun": True}))
