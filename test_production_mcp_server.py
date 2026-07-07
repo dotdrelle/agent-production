@@ -387,6 +387,149 @@ class ProductionMcpServerTest(unittest.TestCase):
         )
         self.assertEqual(payload["capability"], "knowledge.update")
 
+    def test_agent_execute_status_done_on_doctor(self):
+        async def scenario():
+            async def successful_cli_step(
+                _job_id,
+                _step,
+                _inputs,
+                _templates,
+                _deliverables,
+                stabilize=False,
+                config_path=None,
+            ):
+                return 0
+
+            self.server._run_cli_step = successful_cli_step
+            accepted = self.payload(
+                await self.server._tool_agent_execute(
+                    {
+                        "operation": "doctor",
+                        "workspace": {"name": "requested-workspace"},
+                    }
+                )
+            )
+
+            self.assertTrue(accepted["accepted"])
+            await self.server._ACTIVE_TASKS[accepted["jobId"]]
+            status = self.payload(self.server._tool_agent_status({"jobId": accepted["jobId"]}))
+
+            self.assertEqual(status["status"], "done")
+            self.assertEqual(status["progress"]["percent"], 100)
+            self.assertEqual(status["result"]["status"], "succeeded")
+            self.assertIn("durationMs", status["result"]["metrics"])
+
+        asyncio.run(scenario())
+
+    def test_agent_cancel_cancels_one_job(self):
+        async def scenario():
+            async def hold_job(_job_id):
+                await asyncio.Future()
+
+            self.server._run_job = hold_job
+            accepted = self.payload(
+                await self.server._tool_agent_execute(
+                    {
+                        "operation": "doctor",
+                        "workspace": {"name": "requested-workspace"},
+                    }
+                )
+            )
+
+            status = self.payload(await self.server._tool_agent_cancel({"jobId": accepted["jobId"]}))
+
+            self.assertEqual(status["jobId"], accepted["jobId"])
+            self.assertEqual(status["status"], "cancelled")
+            self.assertEqual(status["result"]["status"], "cancelled")
+
+        asyncio.run(scenario())
+
+    def test_agent_execute_uses_request_workspace_name(self):
+        async def scenario():
+            async def hold_job(_job_id):
+                await asyncio.Future()
+
+            self.server._run_job = hold_job
+            accepted = self.payload(
+                await self.server._tool_agent_execute(
+                    {
+                        "operation": "doctor",
+                        "workspace": {"name": "request-wins"},
+                    }
+                )
+            )
+            job = self.server._load_job(accepted["jobId"])
+            status = self.payload(self.server._tool_agent_status({"jobId": accepted["jobId"]}))
+
+            self.assertEqual(job["workspace"], "request-wins")
+            self.assertEqual(status["workspace"], {"name": "request-wins"})
+            await self.server._tool_agent_cancel({"jobId": accepted["jobId"]})
+
+        asyncio.run(scenario())
+
+    def test_agent_status_failed_job_includes_task_result_error(self):
+        async def scenario():
+            async def failing_cli_step(
+                _job_id,
+                _step,
+                _inputs,
+                _templates,
+                _deliverables,
+                stabilize=False,
+                config_path=None,
+            ):
+                return 2
+
+            self.server._run_cli_step = failing_cli_step
+            accepted = self.payload(
+                await self.server._tool_agent_execute(
+                    {
+                        "operation": "doctor",
+                        "workspace": {"name": "requested-workspace"},
+                    }
+                )
+            )
+
+            await self.server._ACTIVE_TASKS[accepted["jobId"]]
+            status = self.payload(self.server._tool_agent_status({"jobId": accepted["jobId"]}))
+
+            self.assertEqual(status["status"], "failed")
+            self.assertEqual(status["result"]["status"], "failed")
+            self.assertEqual(status["result"]["error"]["code"], "execution_failed")
+            self.assertIs(status["result"]["error"]["retryable"], False)
+
+        asyncio.run(scenario())
+
+    def test_agent_execute_status_cancel_are_listed_and_callable(self):
+        async def scenario():
+            async def hold_job(_job_id):
+                await asyncio.Future()
+
+            self.server._run_job = hold_job
+            tools = await self.server.list_tools()
+            names = [tool.name for tool in tools]
+            self.assertIn("agent_execute", names)
+            self.assertIn("agent_status", names)
+            self.assertIn("agent_cancel", names)
+
+            accepted = self.payload(
+                await self.server.call_tool(
+                    "agent_execute",
+                    {
+                        "operation": "doctor",
+                        "workspace": {"name": "requested-workspace"},
+                    },
+                )
+            )
+            status = self.payload(await self.server.call_tool("agent_status", {"jobId": accepted["jobId"]}))
+            cancelled = self.payload(await self.server.call_tool("agent_cancel", {"jobId": accepted["jobId"]}))
+
+            self.assertTrue(accepted["accepted"])
+            self.assertEqual(status["status"], "queued")
+            self.assertEqual(cancelled["status"], "cancelled")
+
+        asyncio.run(scenario())
+
     def test_start_job_dry_run_returns_plan_without_confirmation(self):
         result = asyncio.run(self.server._tool_start_job({"type": "doctor", "dryRun": True}))
         payload = self.payload(result)

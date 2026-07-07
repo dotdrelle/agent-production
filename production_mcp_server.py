@@ -90,8 +90,18 @@ _CAPABILITY_STEP_MAP: dict[str, list[str]] = {
     "workspace.diagnose": ["doctor"],
     "knowledge.pipeline": ["pipeline"],
 }
+_AGENT_OPERATION_TRANSLATION: dict[str, dict[str, Any]] = {
+    "doctor": {"type": "doctor"},
+    "ingest": {"type": "ingest"},
+    "ingest_plan": {"type": "ingest_plan"},
+    "ingest_apply": {"type": "ingest_apply"},
+    "build": {"type": "build"},
+    "export": {"type": "export"},
+    "polish": {"type": "polish"},
+    "pipeline": {"type": "pipeline"},
+}
 
-_WRITE_TOOLS = {"production_start_job", "production_cancel_job"}
+_WRITE_TOOLS = {"agent_execute", "agent_cancel", "production_start_job", "production_cancel_job"}
 
 def _any_token_configured() -> bool:
     return bool(_MCP_TOKEN or _MCP_READ_TOKEN or _MCP_WRITE_TOKEN)
@@ -177,6 +187,12 @@ def _json_text(payload: dict[str, Any]) -> list[TextContent]:
     return [TextContent(type="text", text=json.dumps(payload, ensure_ascii=False, indent=2))]
 
 
+def _json_payload(result: list[TextContent]) -> dict[str, Any]:
+    if not result:
+        return {}
+    return json.loads(result[0].text)
+
+
 def _mask_secret_text(value: Any) -> str:
     text = str(value)
     text = re.sub(r"(?i)(authorization:\s*bearer\s+)[^\s,;]+", r"\1***", text)
@@ -186,6 +202,151 @@ def _mask_secret_text(value: Any) -> str:
 
 def _terminal_status(status: Any) -> bool:
     return str(status or "").lower() in {"done", "failed", "cancelled", "canceled", "complete", "completed", "success", "error"}
+
+
+def _agent_request_workspace(args: dict[str, Any]) -> dict[str, Any]:
+    workspace = args.get("workspace")
+    if not isinstance(workspace, dict):
+        raise ValueError("agent_execute requires a workspace object.")
+    requested_path = workspace.get("path")
+    if requested_path:
+        resolved = Path(str(requested_path)).expanduser().resolve()
+        if resolved != _WORKSPACE_PATH:
+            raise ValueError(f"Requested workspace path does not match this agent workspace: {resolved}")
+    name = str(workspace.get("name") or "").strip()
+    if not name:
+        name = _WORKSPACE_NAME
+    return {
+        "name": name,
+        **({"path": str(requested_path)} if requested_path else {}),
+        **({"revision": str(workspace.get("revision"))} if workspace.get("revision") is not None else {}),
+    }
+
+
+def _agent_start_job_args(args: dict[str, Any], workspace: dict[str, Any]) -> dict[str, Any]:
+    operation = str(args.get("operation") or "").strip()
+    translation = _AGENT_OPERATION_TRANSLATION.get(operation)
+    if translation is None:
+        raise ValueError(f"Unsupported agent operation: {operation}")
+    arguments = args.get("arguments") if isinstance(args.get("arguments"), dict) else {}
+    job_args: dict[str, Any] = dict(translation)
+    for source_key, target_key in [
+        ("inputs", "inputs"),
+        ("templates", "templates"),
+        ("deliverables", "deliverables"),
+        ("steps", "steps"),
+        ("stabilize", "stabilize"),
+        ("configPath", "configPath"),
+        ("callerLabel", "callerLabel"),
+    ]:
+        if source_key in arguments:
+            job_args[target_key] = arguments[source_key]
+    if args.get("taskId") and not job_args.get("callerLabel"):
+        job_args["callerLabel"] = str(args["taskId"])
+    if "confirm" in arguments:
+        job_args["confirm"] = bool(arguments["confirm"])
+    else:
+        job_args["confirm"] = True
+    return job_args
+
+
+def _agent_task_status(job: dict[str, Any], progress: dict[str, Any]) -> dict[str, Any]:
+    status = str(job.get("status") or "unknown")
+    payload: dict[str, Any] = {
+        "jobId": job.get("jobId"),
+        "taskId": job.get("callerLabel"),
+        "agentInstanceId": _AGENT_INSTANCE_ID,
+        "workspace": {"name": str(job.get("workspace") or _WORKSPACE_NAME)},
+        "operation": job.get("type"),
+        "status": status,
+        "progress": {
+            "percent": _agent_progress_percent(progress, status),
+            "phase": progress.get("phase"),
+            "detail": progress.get("detail"),
+            "currentStep": progress.get("currentStep"),
+        },
+        "startedAt": job.get("startedAt"),
+        "updatedAt": job.get("updatedAt"),
+        "finishedAt": job.get("finishedAt"),
+    }
+    if _terminal_status(status):
+        payload["result"] = _agent_task_result(job)
+    return payload
+
+
+def _agent_progress_percent(progress: dict[str, Any], status: str) -> int:
+    percent = progress.get("percent")
+    if isinstance(percent, (int, float)):
+        return max(0, min(100, round(float(percent))))
+    if status == "done":
+        return 100
+    if status in {"failed", "cancelled"}:
+        return 0
+    return 0
+
+
+def _agent_task_result(job: dict[str, Any]) -> dict[str, Any]:
+    status = str(job.get("status") or "")
+    result: dict[str, Any] = {
+        "status": _agent_result_status(status),
+        "outputRefs": _agent_output_refs_for_job(job),
+        "metrics": {"durationMs": _duration_ms(job)},
+    }
+    if status in {"failed", "cancelled", "canceled", "error"}:
+        result["error"] = _agent_error_from_job(job)
+    return result
+
+
+def _agent_result_status(status: str) -> str:
+    if status in {"done", "complete", "completed", "success"}:
+        return "succeeded"
+    if status in {"cancelled", "canceled"}:
+        return "cancelled"
+    return "failed"
+
+
+def _agent_output_refs_for_job(job: dict[str, Any]) -> list[dict[str, str]]:
+    refs: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for ref in _output_refs_for_job(job):
+        value = str(ref.get("ref") or ref.get("path") or "")
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        refs.append({"type": "file", "ref": value})
+    return refs
+
+
+def _duration_ms(job: dict[str, Any]) -> int:
+    started = _parse_iso_datetime(job.get("startedAt") or job.get("createdAt"))
+    finished = _parse_iso_datetime(job.get("finishedAt") or job.get("updatedAt"))
+    if not started or not finished:
+        return 0
+    return max(0, round((finished - started).total_seconds() * 1000))
+
+
+def _parse_iso_datetime(value: Any) -> datetime | None:
+    if not value:
+        return None
+    with contextlib.suppress(Exception):
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    return None
+
+
+def _agent_error_from_job(job: dict[str, Any]) -> dict[str, Any]:
+    status = str(job.get("status") or "")
+    if status in {"cancelled", "canceled"}:
+        return {"code": "cancelled", "message": "Job cancelled.", "retryable": False}
+    message = str(job.get("error") or "Execution failed.")
+    return {
+        "code": "execution_failed",
+        "message": message,
+        "retryable": _is_retryable_error(message),
+    }
+
+
+def _is_retryable_error(message: str) -> bool:
+    return bool(re.search(r"(?i)\b(timeout|temporar|throttl|rate.?limit|quota|busy|unavailable)\b", message))
 
 
 def _agent_description() -> dict[str, Any]:
@@ -318,6 +479,57 @@ def _agent_plan_input_schema() -> dict[str, Any]:
             },
         },
         "additionalProperties": True,
+    }
+
+
+def _agent_execute_input_schema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            "taskId": {"type": "string"},
+            "operation": {"type": "string", "enum": sorted(_AGENT_OPERATION_TRANSLATION)},
+            "workspace": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "path": {"type": "string"},
+                    "revision": {"type": "string"},
+                },
+                "additionalProperties": True,
+            },
+            "arguments": {
+                "type": "object",
+                "properties": {
+                    "inputs": {"type": "array", "items": {"type": "string"}},
+                    "templates": {"type": "array", "items": {"type": "string"}},
+                    "deliverables": {"type": "array", "items": {"type": "string"}},
+                    "steps": {"type": "array", "items": {"type": "string"}},
+                    "stabilize": {"type": "boolean"},
+                    "configPath": {"type": "string"},
+                    "callerLabel": {"type": "string"},
+                    "confirm": {"type": "boolean"},
+                },
+                "additionalProperties": True,
+            },
+            "constraints": {
+                "type": "object",
+                "properties": {
+                    "requireApprovalForMutations": {"type": "boolean"},
+                },
+                "additionalProperties": True,
+            },
+        },
+        "required": ["operation", "workspace"],
+        "additionalProperties": True,
+    }
+
+
+def _agent_job_id_input_schema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {"jobId": {"type": "string"}},
+        "required": ["jobId"],
+        "additionalProperties": False,
     }
 
 
@@ -582,6 +794,11 @@ def _render_landing_page(endpoint_url: str, scheme: str) -> str:
     <section class="panel">
       <h2>Available tools</h2>
       <ul>
+        <li><code>agent_describe</code><span>Return the orchestration contract.</span></li>
+        <li><code>agent_plan</code><span>Plan orchestrated task fragments.</span></li>
+        <li><code>agent_execute</code><span>Execute one planned production operation.</span></li>
+        <li><code>agent_status</code><span>Read one orchestrated task status.</span></li>
+        <li><code>agent_cancel</code><span>Cancel one orchestrated task.</span></li>
         <li><code>production_status</code><span>Check workspace and job readiness.</span></li>
         <li><code>production_list_templates</code><span>List build templates and matching deliverables.</span></li>
         <li><code>production_start_job</code><span>Start an allowlisted production job and get a jobId.</span></li>
@@ -608,6 +825,21 @@ async def list_tools() -> list[Tool]:
             name="agent_plan",
             description="Plan production tasks for a requested capability and return a TaskGraphFragment without executing it.",
             inputSchema=_agent_plan_input_schema(),
+        ),
+        Tool(
+            name="agent_execute",
+            description="Execute one orchestrated production task from a planned operation and concrete arguments.",
+            inputSchema=_agent_execute_input_schema(),
+        ),
+        Tool(
+            name="agent_status",
+            description="Read one orchestrated production task status.",
+            inputSchema=_agent_job_id_input_schema(),
+        ),
+        Tool(
+            name="agent_cancel",
+            description="Cancel one orchestrated production task by jobId.",
+            inputSchema=_agent_job_id_input_schema(),
         ),
         Tool(
             name="production_status",
@@ -745,6 +977,12 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
                 result = _tool_agent_describe()
             case "agent_plan":
                 result = _tool_agent_plan(arguments)
+            case "agent_execute":
+                result = await _tool_agent_execute(arguments)
+            case "agent_status":
+                result = _tool_agent_status(arguments)
+            case "agent_cancel":
+                result = await _tool_agent_cancel(arguments)
             case "production_status":
                 result = _tool_status()
             case "production_list_templates":
@@ -774,6 +1012,55 @@ def _tool_agent_describe() -> list[TextContent]:
 
 def _tool_agent_plan(args: dict[str, Any]) -> list[TextContent]:
     return _json_text(_agent_plan(args))
+
+
+async def _tool_agent_execute(args: dict[str, Any]) -> list[TextContent]:
+    workspace = _agent_request_workspace(args)
+    start_args = _agent_start_job_args(args, workspace)
+    result = _json_payload(await _tool_start_job(start_args, workspace_name_override=workspace["name"]))
+    if not result.get("ok"):
+        return _json_text(
+            {
+                "accepted": False,
+                "agentInstanceId": _AGENT_INSTANCE_ID,
+                "taskId": args.get("taskId"),
+                "error": result.get("error") or "execution_rejected",
+                **({"activeJobId": result.get("activeJobId")} if result.get("activeJobId") else {}),
+            }
+        )
+    return _json_text(
+        {
+            "accepted": True,
+            "agentInstanceId": _AGENT_INSTANCE_ID,
+            "taskId": args.get("taskId"),
+            "jobId": result["jobId"],
+            "status": result.get("status", "queued"),
+        }
+    )
+
+
+def _tool_agent_status(args: dict[str, Any]) -> list[TextContent]:
+    job_id = str(args.get("jobId", "")).strip()
+    job = _load_job(job_id)
+    progress = _job_progress(job, _read_log_tail(job_id, 500))
+    return _json_text(_agent_task_status(job, progress))
+
+
+async def _tool_agent_cancel(args: dict[str, Any]) -> list[TextContent]:
+    job_id = str(args.get("jobId", "")).strip()
+    result = _json_payload(await _tool_cancel_job({"jobId": job_id}))
+    if not result.get("ok"):
+        payload = {
+            "ok": False,
+            "jobId": job_id,
+            "error": result.get("error") or "cancel_failed",
+        }
+        job = result.get("job")
+        if isinstance(job, dict):
+            payload["status"] = _agent_task_status(job, _job_progress(job, _read_log_tail(job_id, 500)))
+        return _json_text(payload)
+    job = result.get("job") if isinstance(result.get("job"), dict) else _load_job(job_id)
+    return _json_text(_agent_task_status(job, _job_progress(job, _read_log_tail(job_id, 500))))
 
 
 def _tool_status() -> list[TextContent]:
@@ -843,7 +1130,7 @@ def _tool_list_templates(args: dict[str, Any]) -> list[TextContent]:
     )
 
 
-async def _tool_start_job(args: dict[str, Any]) -> list[TextContent]:
+async def _tool_start_job(args: dict[str, Any], workspace_name_override: str | None = None) -> list[TextContent]:
     job_type = str(args.get("type", "")).strip()
     dry_run = bool(args.get("dryRun", False))
     confirm = bool(args.get("confirm", False))
@@ -854,6 +1141,7 @@ async def _tool_start_job(args: dict[str, Any]) -> list[TextContent]:
     stabilize = bool(args.get("stabilize", False))
     config_path = _resolve_config_path(args.get("configPath"))
     caller_label = str(args["callerLabel"]).strip()[:120] if args.get("callerLabel") else None
+    workspace_name = str(workspace_name_override or _WORKSPACE_NAME).strip() or _WORKSPACE_NAME
 
     if job_type not in _ALLOWED_STEPS:
         raise ValueError(f"Job type is not allowed: {job_type}")
@@ -871,7 +1159,7 @@ async def _tool_start_job(args: dict[str, Any]) -> list[TextContent]:
     plan = {
         "type": job_type,
         "steps": steps,
-        "workspace": _WORKSPACE_NAME,
+        "workspace": workspace_name,
         "inputs": inputs,
         "templates": templates,
         "deliverables": deliverables,
@@ -892,7 +1180,7 @@ async def _tool_start_job(args: dict[str, Any]) -> list[TextContent]:
     job_id = f"prod_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
     job = {
         "jobId": job_id,
-        "workspace": _WORKSPACE_NAME,
+        "workspace": workspace_name,
         "type": job_type,
         "inputs": inputs,
         "templates": templates,
