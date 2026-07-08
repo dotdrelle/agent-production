@@ -20,6 +20,16 @@ and runs long operations as background jobs.
 | `production_cancel_job`     | Cancel a running job.                                                                   |
 | `production_list_jobs`      | List recent jobs.                                                                       |
 
+Orchestration contract (used by `llm-wiki-manager`'s generic orchestrator):
+
+| Tool             | Purpose                                                                                    |
+| ---------------- | ------------------------------------------------------------------------------------------ |
+| `agent_describe` | Declare capabilities (`knowledge.update`, `document.build`, …), limits, and health.        |
+| `agent_plan`     | Build a task-graph fragment for an objective (concrete input files, locks, idempotency keys). |
+| `agent_execute`  | Start one bounded task; idempotent — a retry with a known `idempotencyKey` returns the existing job. |
+| `agent_status`   | Report orchestrated task progress and its final `TaskResult`.                              |
+| `agent_cancel`   | Cancel the job bound to one orchestrated task.                                             |
+
 ## Configuration
 
 ```bash

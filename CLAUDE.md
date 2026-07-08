@@ -7,6 +7,17 @@ over MCP. It runs allowlisted long-running jobs such as `doctor`, `ingest`,
 `ingest_plan`, `ingest_apply`, `build`, `export`, `polish`, and the default
 pipeline as background tasks.
 
+Since 0.12.0 it is also a full **orchestrable agent** (planner + executor) for
+the manager's agnostic orchestration: it implements `agent_describe`,
+`agent_plan`, `agent_execute`, `agent_status` and `agent_cancel`. The
+translation from orchestration operations (e.g. `knowledge.update`,
+`document.build`) to internal production steps lives exclusively in this
+server — Donna must never learn it. `agent_plan` resolves concrete input files
+(never returns literal globs) and stamps mutating tasks with an
+`idempotencyKey`; `agent_execute` persists key→job mappings in
+`jobs/idempotency.json` so a retry with a known key returns the existing
+job/result instead of starting a new one.
+
 ## Architecture
 
 - `production_mcp_server.py`: Starlette/uvicorn MCP server, bearer-auth
@@ -57,14 +68,15 @@ pipeline as background tasks.
   trace files can link back to the production job that launched them.
 - Keep `_AGENT_VERSION` aligned with the coordinated `llm-wiki-manager`
   release version so status responses identify the deployed agent bundle.
-  Current release line: `0.11.4`. Alignment is checked by
+  Current release line: `0.12.0`. Alignment is checked by
   `llm-wiki-manager/scripts/check-versions.js` and synced by the root
   `build-and-push.sh`.
 - **Auth, scopes, rate limiting** (0.10.3): `MCP_AUTH_TOKEN` remains a legacy
   full-access (read+write) token; `MCP_READ_TOKEN`/`MCP_WRITE_TOKEN` grant
   scoped access instead. `_token_scopes` compares with `hmac.compare_digest`
   (constant-time). `_require_tool_scope` denies `_WRITE_TOOLS`
-  (`production_start_job`, `production_cancel_job`) to read-only callers;
+  (`agent_execute`, `agent_cancel`, `production_start_job`,
+  `production_cancel_job`) to read-only callers;
   the current request's scope is threaded through a `contextvars.ContextVar`
   set by `_BearerAuthMiddleware`, not passed explicitly. Requests are
   rate-limited (`MCP_RATE_LIMIT_REQUESTS`/`MCP_RATE_LIMIT_WINDOW_SECONDS`,
@@ -73,10 +85,10 @@ pipeline as background tasks.
   near-verbatim across all four agent repos plus `llm-wiki`'s `mcpHttp.ts`
   (TypeScript) — see `agent-cme/CLAUDE.md`'s fuller note on why that hasn't
   been consolidated into a shared package.
-- **Multi-user status** (0.11.0): 0.11.0 is an industrialized single-user
-  deployment baseline across the wikiLLM workspace; the multi-user model is
-  specified in `llm-wiki/docs/industrialisation.md` and planned for 0.12.0 —
-  see `agent-cme/CLAUDE.md`'s fuller note. This agent's token scoping is
+- **Multi-user status**: the wikiLLM workspace remains a single-user
+  deployment baseline; the multi-user model is specified in
+  `llm-wiki/docs/industrialisation.md` and planned next — see
+  `agent-cme/CLAUDE.md`'s fuller note. This agent's token scoping is
   read/write, not per-user; do not deploy it as a shared endpoint for
   distinct end users before that lot lands.
 - MCP tool descriptions, `_activity` metadata, progress details, status page
