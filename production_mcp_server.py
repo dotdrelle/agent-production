@@ -84,7 +84,7 @@ _STEP_COMMANDS: dict[str, list[str]] = {
 }
 _MUTATING_STEPS = {"copy", "ingest", "ingest_plan", "ingest_apply", "build", "export", "polish", "pipeline"}
 _CAPABILITY_STEP_MAP: dict[str, list[str]] = {
-    "knowledge.update": ["ingest"],
+    "knowledge.update": ["ingest", "ingest_plan", "ingest_apply"],
     "document.build": ["build"],
     "document.publish": ["export", "polish"],
     "workspace.diagnose": ["doctor"],
@@ -436,7 +436,12 @@ def _capability_input_schema(capability_id: str, supported: list[str]) -> dict[s
     return {
         "type": "object",
         "properties": properties,
-        "required": ["operation"],
+        # No "required": this schema describes the task-level `arguments`
+        # object; `operation` is a sibling field of the task in the
+        # orchestration contract. Requiring it here made Donna's plan
+        # validator reject every fragment this very agent proposed
+        # (invalid_arguments), which silently killed the parallel path.
+        "required": [],
         "additionalProperties": False,
     }
 
@@ -1529,8 +1534,8 @@ def _plan_knowledge_update(
                 "ingest-batch",
                 f"Plan ingest for {len(files)} source file(s)",
                 "knowledge.update",
-                "ingest",
-                {"mode": "plan", "inputs": files},
+                "ingest_plan",
+                {"inputs": files},
                 [],
                 True,
                 _file_refs(files),
@@ -1552,8 +1557,8 @@ def _plan_knowledge_update(
                     _task_id("ingest", file_ref),
                     f"Ingest {Path(file_ref).name}",
                     "knowledge.update",
-                    "ingest",
-                    {"mode": "plan", "inputs": [file_ref]},
+                    "ingest_plan",
+                    {"inputs": [file_ref]},
                     [],
                     True,
                     _file_refs([file_ref]),

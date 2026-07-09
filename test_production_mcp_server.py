@@ -157,7 +157,7 @@ class ProductionMcpServerTest(unittest.TestCase):
         self.assertIn("maxConcurrency", description["limits"])
 
         capabilities = {item["id"]: item for item in description["capabilities"]}
-        self.assertEqual(capabilities["knowledge.update"]["supportedOperations"], ["ingest"])
+        self.assertEqual(capabilities["knowledge.update"]["supportedOperations"], ["ingest", "ingest_plan", "ingest_apply"])
         self.assertEqual(capabilities["document.build"]["supportedOperations"], ["build"])
         self.assertEqual(capabilities["document.publish"]["supportedOperations"], ["export", "polish"])
         self.assertEqual(capabilities["workspace.diagnose"]["supportedOperations"], ["doctor"])
@@ -224,7 +224,7 @@ class ProductionMcpServerTest(unittest.TestCase):
 
         self.assert_task_graph_fragment(fragment)
         self.assertEqual(fragment["capability"], "knowledge.update")
-        self.assertEqual([task["operation"] for task in fragment["tasks"]], ["ingest", "ingest", "ingest_apply"])
+        self.assertEqual([task["operation"] for task in fragment["tasks"]], ["ingest_plan", "ingest_plan", "ingest_apply"])
         self.assertNotIn("export", [task["operation"] for task in fragment["tasks"]])
         self.assertEqual(fragment["groups"][0]["id"], "ingest")
         self.assertEqual(fragment["groups"][0]["recommendedConcurrency"], 2)
@@ -317,7 +317,7 @@ class ProductionMcpServerTest(unittest.TestCase):
 
         self.assert_task_graph_fragment(fragment)
         operations = [task["operation"] for task in fragment["tasks"]]
-        self.assertEqual(operations, ["ingest", "ingest_apply", "build", "export", "polish"])
+        self.assertEqual(operations, ["ingest_plan", "ingest_apply", "build", "export", "polish"])
         build = next(task for task in fragment["tasks"] if task["operation"] == "build")
         export = next(task for task in fragment["tasks"] if task["operation"] == "export")
         polish = next(task for task in fragment["tasks"] if task["operation"] == "polish")
@@ -344,7 +344,7 @@ class ProductionMcpServerTest(unittest.TestCase):
 
         self.assert_task_graph_fragment(fragment)
         operations = [task["operation"] for task in fragment["tasks"]]
-        self.assertEqual(operations, ["ingest", "ingest_apply"])
+        self.assertEqual(operations, ["ingest_plan", "ingest_apply"])
         self.assertNotIn("build", operations)
         self.assertNotIn("export", operations)
 
