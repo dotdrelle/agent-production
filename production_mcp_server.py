@@ -34,7 +34,7 @@ import uvicorn
 
 app = Server("agent-wiki-production")
 
-_AGENT_VERSION = "0.13.0"
+_AGENT_VERSION = "0.13.1"
 _MCP_TOKEN = os.environ.get("MCP_AUTH_TOKEN", "")
 _MCP_READ_TOKEN = os.environ.get("MCP_READ_TOKEN", "")
 _MCP_WRITE_TOKEN = os.environ.get("MCP_WRITE_TOKEN", "")
@@ -1960,6 +1960,14 @@ def _planned_task(
         "requiresApproval": requires_approval,
         "idempotencyKey": _idempotency_key(workspace_revision, capability, operation, arguments, input_refs) if operation in _MUTATING_STEPS else None,
         "progressWeight": progress_weight,
+        # Retries belong to the specialized agent contract. The runtime keeps
+        # the same logical task id and creates new technical attempts; Donna
+        # must never cancel/restart production jobs herself.
+        "retryPolicy": {
+            "maxAttempts": 3,
+            "retryableErrors": ["execution_failed", "workspace_busy", "dispatcher_error"],
+            "allowAgentFallback": False,
+        },
     }
     if group_id:
         task["groupId"] = group_id

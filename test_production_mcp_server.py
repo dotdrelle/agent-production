@@ -267,6 +267,8 @@ class ProductionMcpServerTest(unittest.TestCase):
         self.assertEqual(fragment["tasks"][1]["inputRefs"][0]["ref"], "raw/untracked/b.md")
         self.assertEqual(fragment["tasks"][0]["locks"], ["ingest-plan:raw/untracked/a.md"])
         self.assertEqual(fragment["tasks"][1]["locks"], ["ingest-plan:raw/untracked/b.md"])
+        self.assertTrue(all(task["retryPolicy"]["maxAttempts"] == 3 for task in fragment["tasks"]))
+        self.assertTrue(all("execution_failed" in task["retryPolicy"]["retryableErrors"] for task in fragment["tasks"]))
 
     def test_agent_plan_empty_ingest_returns_empty_fragment(self):
         fragment = self.payload(
