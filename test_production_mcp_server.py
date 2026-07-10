@@ -265,6 +265,8 @@ class ProductionMcpServerTest(unittest.TestCase):
         self.assertTrue(all(len(task["idempotencyKey"]) == 64 for task in fragment["tasks"]))
         self.assertEqual(fragment["tasks"][0]["inputRefs"][0]["ref"], "raw/untracked/a.md")
         self.assertEqual(fragment["tasks"][1]["inputRefs"][0]["ref"], "raw/untracked/b.md")
+        self.assertEqual(fragment["tasks"][0]["locks"], ["ingest-plan:raw/untracked/a.md"])
+        self.assertEqual(fragment["tasks"][1]["locks"], ["ingest-plan:raw/untracked/b.md"])
 
     def test_agent_plan_empty_ingest_returns_empty_fragment(self):
         fragment = self.payload(

@@ -34,7 +34,7 @@ import uvicorn
 
 app = Server("agent-wiki-production")
 
-_AGENT_VERSION = "0.12.12"
+_AGENT_VERSION = "0.13.0"
 _MCP_TOKEN = os.environ.get("MCP_AUTH_TOKEN", "")
 _MCP_READ_TOKEN = os.environ.get("MCP_READ_TOKEN", "")
 _MCP_WRITE_TOKEN = os.environ.get("MCP_WRITE_TOKEN", "")
@@ -1605,7 +1605,7 @@ def _plan_knowledge_update(
                     True,
                     _file_refs([file_ref]),
                     [plan_ref],
-                    ["read"],
+                    [f"ingest-plan:{file_ref}"],
                     constraints,
                     workspace_revision,
                     group_id="ingest",
