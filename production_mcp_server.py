@@ -34,7 +34,7 @@ import uvicorn
 
 app = Server("agent-wiki-production")
 
-_AGENT_VERSION = "0.12.11"
+_AGENT_VERSION = "0.12.12"
 _MCP_TOKEN = os.environ.get("MCP_AUTH_TOKEN", "")
 _MCP_READ_TOKEN = os.environ.get("MCP_READ_TOKEN", "")
 _MCP_WRITE_TOKEN = os.environ.get("MCP_WRITE_TOKEN", "")
@@ -543,6 +543,22 @@ def _agent_job_id_input_schema() -> dict[str, Any]:
     }
 
 
+def _agent_status_input_schema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            "jobId": {"type": "string", "minLength": 1},
+            "capability": {"type": "string", "minLength": 1},
+            "operation": {"type": "string", "minLength": 1},
+        },
+        "oneOf": [
+            {"required": ["jobId"]},
+            {"required": ["capability", "operation"]},
+        ],
+        "additionalProperties": False,
+    }
+
+
 def _activity_for_job(job: dict[str, Any], progress: dict[str, Any] | None = None) -> dict[str, Any]:
     job_id = str(job.get("jobId") or "")
     status = str(job.get("status") or (progress or {}).get("status") or "running")
@@ -912,8 +928,8 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="agent_status",
-            description="Read one orchestrated production task status.",
-            inputSchema=_agent_job_id_input_schema(),
+            description="Read one orchestrated task by jobId, or discover current inputs for a capability and operation without starting work.",
+            inputSchema=_agent_status_input_schema(),
         ),
         Tool(
             name="agent_cancel",
@@ -1143,9 +1159,35 @@ async def _tool_agent_execute(args: dict[str, Any]) -> list[TextContent]:
 
 def _tool_agent_status(args: dict[str, Any]) -> list[TextContent]:
     job_id = str(args.get("jobId", "")).strip()
+    if not job_id:
+        return _json_text(_agent_capability_status(args))
     job = _load_job(job_id)
     progress = _job_progress(job, _read_log_tail(job_id, 500))
     return _json_text(_agent_task_status(job, progress))
+
+
+def _agent_capability_status(args: dict[str, Any]) -> dict[str, Any]:
+    capability = str(args.get("capability", "")).strip()
+    operation = str(args.get("operation", "")).strip()
+    if capability != "knowledge.update" or operation != "ingest":
+        raise ValueError(f"Input discovery is not supported for {capability or 'missing capability'}/{operation or 'missing operation'}.")
+    files = _resolve_plan_files(None, "raw/untracked", default_scan=True)
+    return {
+        "contractVersion": "1",
+        "agentInstanceId": _AGENT_INSTANCE_ID,
+        "capability": capability,
+        "operation": operation,
+        "available": _WORKSPACE_PATH.exists(),
+        "pendingInputs": [
+            {
+                "type": "file",
+                "ref": file_ref,
+                "label": Path(file_ref).name,
+                "mediaType": "text/markdown",
+            }
+            for file_ref in files
+        ],
+    }
 
 
 async def _tool_agent_cancel(args: dict[str, Any]) -> list[TextContent]:

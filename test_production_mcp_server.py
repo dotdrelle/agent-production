@@ -206,6 +206,35 @@ class ProductionMcpServerTest(unittest.TestCase):
         payload = self.payload(asyncio.run(self.server.call_tool("agent_describe", {})))
         self.assertEqual(payload["agentType"], "production")
 
+    def test_agent_status_discovers_pending_capability_inputs_recursively(self):
+        source = self.workspace / "raw" / "untracked"
+        (source / "nested").mkdir(parents=True)
+        (source / "b.md").write_text("# B\n", encoding="utf-8")
+        (source / "nested" / "a.md").write_text("# A\n", encoding="utf-8")
+        (source / "ignored.txt").write_text("ignored\n", encoding="utf-8")
+
+        status = self.payload(self.server._tool_agent_status({
+            "capability": "knowledge.update",
+            "operation": "ingest",
+        }))
+
+        self.assertEqual(status["contractVersion"], "1")
+        self.assertEqual(status["agentInstanceId"], "production-main")
+        self.assertEqual(status["capability"], "knowledge.update")
+        self.assertEqual(status["operation"], "ingest")
+        self.assertTrue(status["available"])
+        self.assertEqual(
+            [item["ref"] for item in status["pendingInputs"]],
+            ["raw/untracked/b.md", "raw/untracked/nested/a.md"],
+        )
+        self.assertEqual(status["pendingInputs"][0]["mediaType"], "text/markdown")
+
+    def test_agent_status_keeps_job_status_schema_and_rejects_unknown_discovery(self):
+        schema = self.server._agent_status_input_schema()
+        self.assertEqual(len(schema["oneOf"]), 2)
+        with self.assertRaisesRegex(ValueError, "not supported"):
+            self.server._tool_agent_status({"capability": "document.build", "operation": "build"})
+
     def test_agent_plan_ingest_scans_untracked_and_adds_apply_barrier(self):
         (self.workspace / "raw" / "untracked").mkdir(parents=True)
         (self.workspace / "raw" / "untracked" / "b.md").write_text("# B\n", encoding="utf-8")
