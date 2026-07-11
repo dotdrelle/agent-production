@@ -199,6 +199,26 @@ class ProductionMcpServerTest(unittest.TestCase):
         self.assertEqual(capabilities["workspace.diagnose"]["supportedOperations"], ["doctor"])
         self.assertEqual(capabilities["knowledge.pipeline"]["supportedOperations"], ["pipeline"])
 
+    def test_ingest_plan_falls_back_to_one_executable_task_when_parallel_helpers_are_disabled(self):
+        server = load_module(
+            self.workspace,
+            {"PRODUCTION_ALLOWED_STEPS": "doctor,ingest,polish,pipeline"},
+        )
+        source = self.workspace / "raw" / "untracked" / "brief.md"
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_text("# Brief\n", encoding="utf-8")
+
+        fragment = server._plan_knowledge_update(
+            "ingest",
+            {},
+            server._planning_constraints({"maxConcurrency": 4}),
+            "revision-1",
+        )
+
+        self.assertEqual(len(fragment["tasks"]), 1)
+        self.assertEqual(fragment["tasks"][0]["operation"], "ingest")
+        self.assertFalse(fragment["tasks"][0]["parallelizable"])
+
     def test_agent_describe_is_listed_and_callable(self):
         tools = asyncio.run(self.server.list_tools())
         self.assertIn("agent_describe", [tool.name for tool in tools])

@@ -778,9 +778,18 @@ def _active_lock() -> dict[str, Any] | None:
 def _conflicting_lock(scopes: list[str]) -> dict[str, Any] | None:
     requested = set(scopes)
     requested_workspace = "workspace-write" in requested
+    # "read" is a shared scope: read-only jobs (e.g. ingest --plan-only, which
+    # only reads sources and writes a uniquely-named plan file) may run
+    # concurrently. Only exclusive scopes (workspace-write, deliverable:*,
+    # template:*) conflict. Without this, per-file ingest_plan tasks serialize
+    # and every parallel one fails with target_busy.
+    requested_exclusive = requested - {"read"}
     for lock in _active_locks():
         active_scopes = set(lock.get("scopes") or [lock.get("scope") or "workspace-write"])
-        if requested_workspace or "workspace-write" in active_scopes or requested.intersection(active_scopes):
+        if requested_workspace or "workspace-write" in active_scopes:
+            return lock
+        active_exclusive = active_scopes - {"read"}
+        if requested_exclusive & active_exclusive:
             return lock
     return None
 
@@ -1541,7 +1550,12 @@ def _plan_knowledge_update(
 
     max_depth = constraints["maxDepth"]
     max_tasks = constraints["maxTasks"]
-    if (max_depth is not None and max_depth < 2) or (max_tasks is not None and max_tasks < 2):
+    # The parallel ingest graph uses the internal plan/apply operations. A
+    # deployment may deliberately allow only the aggregate `ingest` step; in
+    # that case advertise and execute a valid sequential plan instead of
+    # returning tasks that the same agent has forbidden itself to execute.
+    parallel_ingest_available = {"ingest_plan", "ingest_apply"}.issubset(_ALLOWED_STEPS)
+    if not parallel_ingest_available or (max_depth is not None and max_depth < 2) or (max_tasks is not None and max_tasks < 2):
         task = _planned_task(
             "ingest-all",
             f"Ingest {len(files)} source file(s)",
