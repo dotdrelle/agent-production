@@ -34,7 +34,7 @@ import uvicorn
 
 app = Server("agent-wiki-production")
 
-_AGENT_VERSION = "0.13.1"
+_AGENT_VERSION = "0.14.0"
 _MCP_TOKEN = os.environ.get("MCP_AUTH_TOKEN", "")
 _MCP_READ_TOKEN = os.environ.get("MCP_READ_TOKEN", "")
 _MCP_WRITE_TOKEN = os.environ.get("MCP_WRITE_TOKEN", "")
@@ -616,9 +616,17 @@ def _log_path(job_id: str) -> Path:
     return _JOBS_DIR / "logs" / f"{job_id}.log"
 
 
-def _lock_path(scope: str = "workspace-write") -> Path:
+def _lock_path(scope: str = "workspace-write", job_id: str | None = None) -> Path:
     digest = hashlib.sha256(scope.encode("utf-8")).hexdigest()[:16]
     safe_workspace = re.sub(r"[^A-Za-z0-9_.-]+", "_", _WORKSPACE_NAME)
+    # "read" is a shared scope: each read-only holder gets its own lock file so
+    # multiple concurrent read jobs (e.g. per-file ingest --plan-only) coexist
+    # instead of colliding on a single per-scope file (FileExistsError ->
+    # target_busy). Exclusive scopes keep one per-scope file whose atomic
+    # creation is the mutex; concurrency is decided by _conflicting_lock.
+    if scope == "read" and job_id is not None:
+        safe_job = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(job_id))
+        return _LOCKS_DIR / safe_workspace / f"{digest}.{safe_job}.lock"
     return _LOCKS_DIR / safe_workspace / f"{digest}.lock"
 
 
@@ -800,7 +808,7 @@ def _create_locks(job_id: str, scopes: list[str]) -> None:
     payload = {"workspace": _WORKSPACE_NAME, "jobId": job_id, "scopes": scopes, "createdAt": _now()}
     try:
         for scope in scopes:
-            path = _lock_path(scope)
+            path = _lock_path(scope, job_id)
             path.parent.mkdir(parents=True, exist_ok=True)
             with path.open("x", encoding="utf-8") as handle:
                 handle.write(json.dumps({**payload, "scope": scope}, ensure_ascii=False, indent=2) + "\n")
@@ -1758,7 +1766,7 @@ def _plan_pipeline(request_args: dict[str, Any], constraints: dict[str, Any], wo
 
     templates = _resolve_plan_files(request_args.get("templates"), "templates", default_scan=True)
     if "build" in requested_steps and templates and "build" in _ALLOWED_STEPS:
-        build_tasks, build_outputs = _build_tasks(templates, request_args, constraints, workspace_revision, previous_ids, capability="knowledge.pipeline")
+        build_tasks, build_outputs = _build_tasks(templates, request_args, constraints, workspace_revision, previous_ids, capability="document.build")
         tasks.extend(build_tasks)
         groups.extend(_groups_for_tasks(build_tasks, "build", "Build deliverables", constraints["maxConcurrency"], len(templates)))
         expected_outputs.extend(build_outputs)
@@ -1769,13 +1777,13 @@ def _plan_pipeline(request_args: dict[str, Any], constraints: dict[str, Any], wo
         deliverables = _resolve_plan_files(request_args.get("deliverables"), "deliverables", default_scan=True)
     publish_operation = "export" if "export" in requested_steps and "export" in _ALLOWED_STEPS else ""
     if deliverables and publish_operation:
-        publish_tasks = _publish_tasks(publish_operation, deliverables, request_args, constraints, workspace_revision, previous_ids, capability="knowledge.pipeline")
+        publish_tasks = _publish_tasks(publish_operation, deliverables, request_args, constraints, workspace_revision, previous_ids, capability="document.publish")
         tasks.extend(publish_tasks)
         groups.extend(_groups_for_tasks(publish_tasks, publish_operation, f"{publish_operation.title()} deliverables", constraints["maxConcurrency"], len(deliverables)))
         expected_outputs.extend(_file_refs(deliverables))
         previous_ids = [task["id"] for task in publish_tasks]
     if deliverables and "polish" in requested_steps and "polish" in _ALLOWED_STEPS:
-        polish_tasks = _publish_tasks("polish", deliverables, request_args, constraints, workspace_revision, previous_ids, capability="knowledge.pipeline")
+        polish_tasks = _publish_tasks("polish", deliverables, request_args, constraints, workspace_revision, previous_ids, capability="document.publish")
         tasks.extend(polish_tasks)
         groups.extend(_groups_for_tasks(polish_tasks, "polish", "Polish deliverables", constraints["maxConcurrency"], len(deliverables)))
         expected_outputs.extend(_file_refs(deliverables))
@@ -1846,7 +1854,7 @@ def _build_tasks(
             True,
             _file_refs(templates),
             _file_refs(deliverables),
-            _job_lock_scopes(["build"], templates, [], []),
+            _job_lock_scopes(["build"], [], templates, []),
             constraints,
             workspace_revision,
             group_id="build",
@@ -1871,7 +1879,7 @@ def _build_tasks(
                 True,
                 _file_refs([template]),
                 [{"type": "file", "ref": deliverable}],
-                _job_lock_scopes(["build"], [template], [], []),
+                _job_lock_scopes(["build"], [], [template], []),
                 constraints,
                 workspace_revision,
                 group_id="build",
