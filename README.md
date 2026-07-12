@@ -4,6 +4,8 @@
 
 Workspace-scoped MCP server for running `llm-wiki` production jobs.
 
+Current coordinated release: **0.14.5**.
+
 This agent is intentionally separate from `llm-wiki` chat/search. It mounts one
 workspace at `/workspace`, exposes a small allowlisted set of production actions,
 and runs long operations as background jobs.

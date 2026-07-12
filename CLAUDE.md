@@ -1,5 +1,8 @@
 # Repository Guide
 
+Current coordinated release: **0.14.5**. Keep `_AGENT_VERSION` aligned with
+the manager, engine, and external agents.
+
 ## Goal
 
 `agent-wiki-production` exposes workspace-scoped `llm-wiki` production actions
