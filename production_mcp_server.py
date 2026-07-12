@@ -34,7 +34,7 @@ import uvicorn
 
 app = Server("agent-wiki-production")
 
-_AGENT_VERSION = "0.14.1"
+_AGENT_VERSION = "0.14.2"
 _MCP_TOKEN = os.environ.get("MCP_AUTH_TOKEN", "")
 _MCP_READ_TOKEN = os.environ.get("MCP_READ_TOKEN", "")
 _MCP_WRITE_TOKEN = os.environ.get("MCP_WRITE_TOKEN", "")
@@ -408,31 +408,46 @@ def _agent_capabilities() -> list[dict[str, Any]]:
 
 
 def _capability_description(capability_id: str) -> str:
+    # Descriptions are written to be self-sufficient for ANY MCP operator
+    # (our own orchestrator or a third-party host such as Claude): they state
+    # what the capability does, what it reads/writes, and how it is split, so
+    # no caller-side hardcoded knowledge is required.
     descriptions = {
-        "knowledge.update": "Update the workspace knowledge base from concrete Markdown inputs.",
-        "document.build": "Build deliverables from llm-wiki templates.",
-        "document.publish": "Export or polish existing deliverables.",
-        "workspace.diagnose": "Diagnose workspace configuration and runtime readiness.",
-        "knowledge.pipeline": "Run the production pipeline over the workspace.",
+        "knowledge.update": (
+            "Ingest Markdown source files already present in the workspace (by default the pending files under raw/untracked) "
+            "into the llm-wiki knowledge base. Reads local Markdown only — it never fetches from Confluence or any remote source. "
+            "Files are processed per source file; the runtime decides ordering and how many run in parallel (callers do not set a batch size). "
+            "Use knowledge.update to build or refresh wiki knowledge from documents that are already on disk."
+        ),
+        "document.build": (
+            "Build llm-wiki deliverables from templates in templates/, writing the results under deliverables/. "
+            "Use when the user wants to (re)generate a deliverable document from the current knowledge base and templates."
+        ),
+        "document.publish": (
+            "Export or polish EXISTING llm-wiki deliverables from deliverables/ (final publication of wiki documents). "
+            "This is not a source/Confluence export: to pull external source content, use the source-export agent instead."
+        ),
+        "workspace.diagnose": "Diagnose workspace configuration and runtime readiness (read-only doctor checks); it creates no jobs.",
+        "knowledge.pipeline": "Run the full production pipeline (ingest → build → export/polish) over the workspace in one ordered sequence.",
     }
     return descriptions.get(capability_id, capability_id)
 
 
 def _capability_input_schema(capability_id: str, supported: list[str]) -> dict[str, Any]:
     properties: dict[str, Any] = {
-        "operation": {"type": "string", "enum": supported},
-        "configPath": {"type": "string"},
-        "callerLabel": {"type": "string"},
+        "operation": {"type": "string", "enum": supported, "description": f"Which supported operation to run for this capability. One of: {', '.join(supported)}."},
+        "configPath": {"type": "string", "description": "Optional .wikirc file path relative to the workspace root (e.g. .wikirc.yaml.openai). Omit to use the workspace default."},
+        "callerLabel": {"type": "string", "description": "Optional identifier of the caller, logged with the job for traceability."},
     }
     if capability_id == "knowledge.update":
-        properties["inputs"] = {"type": "array", "items": {"type": "string"}}
+        properties["inputs"] = {"type": "array", "items": {"type": "string"}, "description": "Optional explicit list of Markdown source files (relative to the workspace root) to ingest. If omitted, all pending files under raw/untracked are ingested."}
     if capability_id == "document.build":
-        properties["templates"] = {"type": "array", "items": {"type": "string"}}
-        properties["stabilize"] = {"type": "boolean"}
+        properties["templates"] = {"type": "array", "items": {"type": "string"}, "description": "Optional template files (relative to the workspace root or templates/) to build. If omitted, all applicable templates are built."}
+        properties["stabilize"] = {"type": "boolean", "description": "When true, run the build in stabilize mode (deterministic re-generation) instead of a normal build."}
     if capability_id == "document.publish":
-        properties["deliverables"] = {"type": "array", "items": {"type": "string"}}
+        properties["deliverables"] = {"type": "array", "items": {"type": "string"}, "description": "Deliverable files (relative to the workspace root or deliverables/) to export or polish. These must already exist under deliverables/."}
     if capability_id == "knowledge.pipeline":
-        properties["steps"] = {"type": "array", "items": {"type": "string"}}
+        properties["steps"] = {"type": "array", "items": {"type": "string"}, "description": "Ordered pipeline steps to run (e.g. ingest, build, export). If omitted, the default full pipeline order is used."}
     return {
         "type": "object",
         "properties": properties,
@@ -930,27 +945,43 @@ async def list_tools() -> list[Tool]:
     return [
         Tool(
             name="agent_describe",
-            description="Return the production agent orchestration contract and capability declarations.",
+            description=(
+                "Return this agent's generic multi-agent orchestration contract: its declared capabilities "
+                "(knowledge.update, document.build, document.publish, knowledge.pipeline) and their input schemas. "
+                "It tells an orchestrator what this agent can do and how to plan it. A caller that just wants to run a "
+                "job directly does not need this — use the production_* tools (e.g. production_start_job) instead."
+            ),
             inputSchema={"type": "object", "properties": {}, "additionalProperties": False},
         ),
         Tool(
             name="agent_plan",
-            description="Plan production tasks for a requested capability and return a TaskGraphFragment without executing it.",
+            description=(
+                "Orchestration-contract planning. Given a capability and objective, return an executable task-graph "
+                "fragment (tasks, dependencies, recommended concurrency) WITHOUT executing anything. Intended for an "
+                "orchestrator that composes work across agents; a direct caller should use production_start_job instead."
+            ),
             inputSchema=_agent_plan_input_schema(),
         ),
         Tool(
             name="agent_execute",
-            description="Execute one orchestrated production task from a planned operation and concrete arguments.",
+            description=(
+                "Orchestration-contract execution. Run ONE planned task (typically produced by agent_plan) from its "
+                "operation and concrete arguments. Returns a jobId immediately; poll agent_status. Direct callers who "
+                "are not orchestrating a task graph should prefer production_start_job."
+            ),
             inputSchema=_agent_execute_input_schema(),
         ),
         Tool(
             name="agent_status",
-            description="Read one orchestrated task by jobId, or discover current inputs for a capability and operation without starting work.",
+            description=(
+                "Orchestration-contract status. Read one task by jobId; or, given a capability and operation with no "
+                "jobId, discover the inputs that operation would use (e.g. the pending source files) without starting work."
+            ),
             inputSchema=_agent_status_input_schema(),
         ),
         Tool(
             name="agent_cancel",
-            description="Cancel one orchestrated production task by jobId.",
+            description="Orchestration-contract cancel. Cancel one planned/running production task by its jobId.",
             inputSchema=_agent_job_id_input_schema(),
         ),
         Tool(
@@ -978,6 +1009,7 @@ async def list_tools() -> list[Tool]:
                 "Start an llm-wiki production job asynchronously. Use only after explicit user request. "
                 "For type=\"ingest\" or type=\"ingest_plan\", this reads Markdown files already present in the workspace, including files exported by agent-cme; it does not fetch from Confluence directly. "
                 "Use type=\"ingest_apply\" only to apply ingest plan files produced by type=\"ingest_plan\". "
+                "type=\"export\" (and type=\"polish\") means publishing an existing llm-wiki DELIVERABLE from deliverables/ — it is NOT a source/Confluence export. To export Confluence or other external source content into Markdown, use the source-export agent's export tool (e.g. agent-cme's cme_export_run), not this job. "
                 "Bearer authentication and the step allowlist are the primary controls. "
                 "If PRODUCTION_REQUIRE_CONFIRMATION=true, mutating jobs also require confirm=true."
             ),
