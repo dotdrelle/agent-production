@@ -34,7 +34,7 @@ import uvicorn
 
 app = Server("agent-wiki-production")
 
-_AGENT_VERSION = "0.14.11"
+_AGENT_VERSION = "0.14.13"
 _MCP_TOKEN = os.environ.get("MCP_AUTH_TOKEN", "")
 _MCP_READ_TOKEN = os.environ.get("MCP_READ_TOKEN", "")
 _MCP_WRITE_TOKEN = os.environ.get("MCP_WRITE_TOKEN", "")
@@ -256,6 +256,15 @@ def _agent_start_job_args(args: dict[str, Any], workspace: dict[str, Any]) -> di
 
 def _agent_task_status(job: dict[str, Any], progress: dict[str, Any]) -> dict[str, Any]:
     status = str(job.get("status") or "unknown")
+    # agent_status is authoritative for orchestration state, but it must not
+    # narrow the richer production progress contract. The runtime merges this
+    # response into the existing activity, so dropping batch/throttle/trace
+    # fields here made them disappear after every status poll.
+    status_progress = {
+        **progress,
+        "percent": _agent_progress_percent(progress, status),
+        **_agent_processing_progress(job, progress),
+    }
     payload: dict[str, Any] = {
         "jobId": job.get("jobId"),
         "taskId": job.get("callerLabel"),
@@ -263,12 +272,7 @@ def _agent_task_status(job: dict[str, Any], progress: dict[str, Any]) -> dict[st
         "workspace": {"name": str(job.get("workspace") or _WORKSPACE_NAME)},
         "operation": job.get("type"),
         "status": status,
-        "progress": {
-            "percent": _agent_progress_percent(progress, status),
-            "phase": progress.get("phase"),
-            "detail": progress.get("detail"),
-            "currentStep": progress.get("currentStep"),
-        },
+        "progress": status_progress,
         "startedAt": job.get("startedAt"),
         "updatedAt": job.get("updatedAt"),
         "finishedAt": job.get("finishedAt"),
@@ -276,6 +280,63 @@ def _agent_task_status(job: dict[str, Any], progress: dict[str, Any]) -> dict[st
     if _terminal_status(status):
         payload["result"] = _agent_task_result(job)
     return payload
+
+
+def _agent_processing_progress(job: dict[str, Any], progress: dict[str, Any]) -> dict[str, Any]:
+    raw_steps = job.get("steps") if isinstance(job.get("steps"), list) else []
+    steps = [
+        {
+            "id": str(step.get("name") or f"step-{index + 1}"),
+            "name": str(step.get("name") or f"Step {index + 1}"),
+            "status": str(step.get("status") or "pending"),
+            "startedAt": step.get("startedAt"),
+            "finishedAt": step.get("finishedAt"),
+        }
+        for index, step in enumerate(raw_steps)
+        if isinstance(step, dict)
+    ]
+    active_index = next(
+        (index for index, step in enumerate(steps) if step["status"] in {"running", "queued", "pending"}),
+        len(steps) - 1 if steps else 0,
+    )
+    batch_index = progress.get("batchIndex")
+    batch_count = progress.get("batchCount")
+    wait_ms = progress.get("waitMs")
+    retry_at = progress.get("retryAt")
+    last_event = str(progress.get("lastEvent") or "")
+    throttling_active = bool(wait_ms or retry_at or last_event in _WAIT_EVENTS or last_event == "provider:throttle")
+    processing = {
+        key: value
+        for key, value in {
+            "sourceIndex": progress.get("sourceIndex"),
+            "sourceCount": progress.get("sourceCount"),
+            "sourceDoneCount": progress.get("sourceDoneCount"),
+            "instructionCount": progress.get("instructionCount"),
+            "stabilizeKept": progress.get("stabilizeKept"),
+            "stabilizeMerged": progress.get("stabilizeMerged"),
+            "stabilizeInserted": progress.get("stabilizeInserted"),
+            "stabilizeRemoved": progress.get("stabilizeRemoved"),
+        }.items()
+        if value is not None
+    }
+    return {
+        "stepIndex": active_index + 1 if steps else None,
+        "stepTotal": len(steps),
+        "steps": steps,
+        "batch": {
+            "index": int(batch_index) + 1,
+            "total": int(batch_count),
+            "status": "done" if "complete" in str(progress.get("detail") or "").lower() else "running",
+            "startedAt": progress.get("currentBatchStartedAt"),
+        } if batch_index is not None and batch_count is not None else None,
+        "throttling": {
+            "active": throttling_active,
+            "waitMs": wait_ms,
+            "retryAt": retry_at,
+            "event": last_event or None,
+        },
+        "processing": processing,
+    }
 
 
 def _agent_progress_percent(progress: dict[str, Any], status: str) -> int:
@@ -1671,24 +1732,40 @@ def _plan_knowledge_update(
 
     apply_allowed = "ingest_apply" in _ALLOWED_STEPS
     if apply_allowed:
-        apply_task = _planned_task(
-            "ingest-apply",
-            "Apply ingest plans",
-            "knowledge.update",
-            "ingest_apply",
-            {"inputs": [ref["ref"] for ref in plan_refs]},
-            [task["id"] for task in tasks],
-            False,
-            plan_refs,
-            [{"type": "directory", "ref": "wiki"}],
-            _job_lock_scopes(["ingest_apply"], [ref["ref"] for ref in plan_refs], [], []),
-            constraints,
-            workspace_revision,
-            depends_on_group="ingest",
-            barrier=True,
-            progress_weight=max(1, len(files)),
-        )
-        tasks.append(apply_task)
+        plan_tasks = list(tasks)
+        if aggregate_ingest:
+            apply_specs = [("ingest-apply", plan_tasks[0], plan_refs[0], len(files), None)]
+        else:
+            apply_specs = [
+                (
+                    "ingest-apply" if len(files) == 1 else _task_id("ingest-apply", file_ref),
+                    plan_task,
+                    plan_ref,
+                    1,
+                    plan_task.get("priority"),
+                )
+                for file_ref, plan_task, plan_ref in zip(files, plan_tasks, plan_refs, strict=True)
+            ]
+        for apply_id, plan_task, plan_ref, progress_weight, priority in apply_specs:
+            tasks.append(
+                _planned_task(
+                    apply_id,
+                    f"Apply ingest plan for {Path(plan_ref['ref']).name}",
+                    "knowledge.update",
+                    "ingest_apply",
+                    {"inputs": [plan_ref["ref"]]},
+                    [plan_task["id"]],
+                    False,
+                    [plan_ref],
+                    [{"type": "directory", "ref": "wiki"}],
+                    _job_lock_scopes(["ingest_apply"], [plan_ref["ref"]], [], []),
+                    constraints,
+                    workspace_revision,
+                    barrier=True,
+                    progress_weight=progress_weight,
+                    priority=priority,
+                )
+            )
 
     synthesis = [f"{len(files)} source file(s) resolved from raw/untracked."]
     if aggregate_ingest:
@@ -2770,7 +2847,7 @@ def _parse_trace_progress(trace_file: str) -> dict[str, Any]:
                 state["sourceCount"] = ingest_input_count
                 state["sourceDoneCount"] = ingest_done_count
                 state["detail"] = f"Source {ingest_done_count + 1}/{ingest_input_count}"
-                state["percent"] = max(1, min(99, round(((ingest_done_count + 0.15) / ingest_input_count) * 100)))
+                state["percent"] = _ingest_source_percent(ingest_done_count, ingest_input_count, 0.15)
         elif name == "ingest:source":
             state["phase"] = "ingest"
             state["source"] = fields.get("source") or state.get("source")
@@ -2782,12 +2859,16 @@ def _parse_trace_progress(trace_file: str) -> dict[str, Any]:
             source_name = Path(str(state.get("source") or "")).name
             state["label"] = f"Ingest {source_name}".strip()
             state["detail"] = "Preparing LLM"
+            if ingest_input_count is not None and ingest_input_count > 0:
+                state["percent"] = _ingest_source_percent(ingest_done_count, ingest_input_count, 0.35)
         elif name == "ingest:plan":
             state["phase"] = "ingest"
             state["source"] = fields.get("source") or state.get("source")
             source_name = Path(str(state.get("source") or "")).name
             state["label"] = f"Ingest {source_name}".strip()
             state["detail"] = "Ingestion plan received"
+            if ingest_input_count is not None and ingest_input_count > 0:
+                state["percent"] = _ingest_source_percent(ingest_done_count, ingest_input_count, 0.85)
         elif name == "ingest:source-done":
             state["phase"] = "ingest"
             ingest_done_count += 1
@@ -2977,6 +3058,12 @@ def _int_field(value: Any) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _ingest_source_percent(done_count: int, source_count: int, source_fraction: float) -> int:
+    """Map a real per-source ingest milestone onto the whole ingest job."""
+    fraction = max(0.0, min(1.0, float(source_fraction)))
+    return max(1, min(99, round(((done_count + fraction) / source_count) * 100)))
 
 
 def _batch_percent(batch_index: int, batch_count: int, completed: bool) -> int | None:

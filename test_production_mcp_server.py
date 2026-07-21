@@ -96,6 +96,27 @@ def load_module(workspace, env=None):
 
 
 class ProductionMcpServerTest(unittest.TestCase):
+    def test_ingest_progress_advances_between_source_start_and_completion(self):
+        progress = self.server._parse_trace_progress
+        trace = self.workspace / "trace.log"
+        trace.write_text(
+            "\n".join(
+                [
+                    "2026-07-21T10:00:00Z +0ms INFO ingest:run-start inputCount=1",
+                    "2026-07-21T10:00:01Z +1ms INFO ingest:source-selection resolvedCount=1",
+                    "2026-07-21T10:00:02Z +2ms INFO ingest:source-start sourcePath=raw/a.md",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        self.assertEqual(progress("trace.log")["percent"], 15)
+        with trace.open("a", encoding="utf-8") as stream:
+            stream.write("\n2026-07-21T10:00:03Z +3ms INFO ingest:prompt source=raw/a.md")
+        self.assertEqual(progress("trace.log")["percent"], 35)
+        with trace.open("a", encoding="utf-8") as stream:
+            stream.write("\n2026-07-21T10:00:04Z +4ms INFO ingest:plan source=raw/a.md")
+        self.assertEqual(progress("trace.log")["percent"], 85)
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.workspace = Path(self.tmp.name)
@@ -255,7 +276,7 @@ class ProductionMcpServerTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "not supported"):
             self.server._tool_agent_status({"capability": "document.build", "operation": "build"})
 
-    def test_agent_plan_ingest_scans_untracked_and_adds_apply_barrier(self):
+    def test_agent_plan_ingest_scans_untracked_and_checkpoints_each_source(self):
         (self.workspace / "raw" / "untracked").mkdir(parents=True)
         (self.workspace / "raw" / "untracked" / "b.md").write_text("# B\n", encoding="utf-8")
         (self.workspace / "raw" / "untracked" / "a.md").write_text("# A\n", encoding="utf-8")
@@ -273,14 +294,21 @@ class ProductionMcpServerTest(unittest.TestCase):
 
         self.assert_task_graph_fragment(fragment)
         self.assertEqual(fragment["capability"], "knowledge.update")
-        self.assertEqual([task["operation"] for task in fragment["tasks"]], ["ingest_plan", "ingest_plan", "ingest_apply"])
+        self.assertEqual(
+            [task["operation"] for task in fragment["tasks"]],
+            ["ingest_plan", "ingest_plan", "ingest_apply", "ingest_apply"],
+        )
         self.assertNotIn("export", [task["operation"] for task in fragment["tasks"]])
         self.assertEqual(fragment["groups"][0]["id"], "ingest")
         self.assertEqual(fragment["groups"][0]["recommendedConcurrency"], 2)
-        apply_task = fragment["tasks"][-1]
-        self.assertTrue(apply_task["barrier"])
-        self.assertEqual(apply_task["dependsOnGroup"], "ingest")
-        self.assertEqual(apply_task["locks"], ["workspace-write"])
+        apply_tasks = fragment["tasks"][2:]
+        self.assertTrue(all(task["barrier"] for task in apply_tasks))
+        self.assertEqual(apply_tasks[0]["dependsOn"], [fragment["tasks"][0]["id"]])
+        self.assertEqual(apply_tasks[1]["dependsOn"], [fragment["tasks"][1]["id"]])
+        self.assertEqual(apply_tasks[0]["arguments"]["inputs"], [fragment["tasks"][0]["expectedOutputRefs"][0]["ref"]])
+        self.assertEqual(apply_tasks[1]["arguments"]["inputs"], [fragment["tasks"][1]["expectedOutputRefs"][0]["ref"]])
+        self.assertTrue(all(task["locks"] == ["workspace-write"] for task in apply_tasks))
+        self.assertEqual([task["priority"] for task in apply_tasks], [1, 2])
         self.assertTrue(all(task["requiresApproval"] for task in fragment["tasks"]))
         self.assertTrue(all(len(task["idempotencyKey"]) == 64 for task in fragment["tasks"]))
         self.assertEqual(fragment["tasks"][0]["inputRefs"][0]["ref"], "raw/untracked/a.md")
@@ -289,6 +317,38 @@ class ProductionMcpServerTest(unittest.TestCase):
         self.assertEqual(fragment["tasks"][1]["locks"], ["ingest-plan:raw/untracked/b.md"])
         self.assertTrue(all(task["retryPolicy"]["maxAttempts"] == 3 for task in fragment["tasks"]))
         self.assertTrue(all("execution_failed" in task["retryPolicy"]["retryableErrors"] for task in fragment["tasks"]))
+
+    def test_agent_status_preserves_detailed_build_progress(self):
+        job = {
+            "jobId": "job-build",
+            "type": "build",
+            "status": "running",
+            "workspace": "test-workspace",
+        }
+        progress = {
+            "percent": 47,
+            "phase": "build",
+            "detail": "Batch 2/4 · LLM throttled",
+            "currentStep": "build",
+            "batchIndex": 1,
+            "batchCount": 4,
+            "lastEvent": "provider:throttle",
+            "waitMs": 1200,
+            "retryAt": "2026-07-21T10:00:01Z",
+            "currentBatchStartedAt": "2026-07-21T10:00:00Z",
+            "traceFile": ".wiki/logs/build.trace",
+        }
+
+        payload = self.server._agent_task_status(job, progress)
+
+        status_progress = payload["progress"]
+        for key, value in progress.items():
+            self.assertEqual(status_progress[key], value)
+        self.assertEqual(status_progress["stepIndex"], None)
+        self.assertEqual(status_progress["stepTotal"], 0)
+        self.assertEqual(status_progress["steps"], [])
+        self.assertEqual(status_progress["batch"], {"index": 2, "total": 4, "status": "running", "startedAt": "2026-07-21T10:00:00Z"})
+        self.assertEqual(status_progress["throttling"]["active"], True)
 
     def test_agent_plan_empty_ingest_returns_empty_fragment(self):
         fragment = self.payload(
