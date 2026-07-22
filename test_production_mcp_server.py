@@ -303,8 +303,15 @@ class ProductionMcpServerTest(unittest.TestCase):
         self.assertEqual(fragment["groups"][0]["recommendedConcurrency"], 2)
         apply_tasks = fragment["tasks"][2:]
         self.assertTrue(all(task["barrier"] for task in apply_tasks))
+        # ingest_apply holds a single global workspace-write lock, so the applies
+        # must be strictly serialized: each depends on its own ingest_plan AND on
+        # the previous apply, otherwise two become ready at once and all but one
+        # fail with target_busy.
         self.assertEqual(apply_tasks[0]["dependsOn"], [fragment["tasks"][0]["id"]])
-        self.assertEqual(apply_tasks[1]["dependsOn"], [fragment["tasks"][1]["id"]])
+        self.assertEqual(
+            apply_tasks[1]["dependsOn"],
+            [fragment["tasks"][1]["id"], apply_tasks[0]["id"]],
+        )
         self.assertEqual(apply_tasks[0]["arguments"]["inputs"], [fragment["tasks"][0]["expectedOutputRefs"][0]["ref"]])
         self.assertEqual(apply_tasks[1]["arguments"]["inputs"], [fragment["tasks"][1]["expectedOutputRefs"][0]["ref"]])
         self.assertTrue(all(task["locks"] == ["workspace-write"] for task in apply_tasks))
@@ -460,6 +467,34 @@ class ProductionMcpServerTest(unittest.TestCase):
         self.assertEqual(operations, ["ingest_plan", "ingest_apply"])
         self.assertNotIn("build", operations)
         self.assertNotIn("export", operations)
+
+    def test_pipeline_preserves_serial_ingest_apply_dependencies(self):
+        pending = self.workspace / "raw" / "untracked"
+        pending.mkdir(parents=True)
+        (pending / "a.md").write_text("# A\n", encoding="utf-8")
+        (pending / "b.md").write_text("# B\n", encoding="utf-8")
+
+        fragment = self.payload(
+            self.server._tool_agent_plan(
+                {
+                    "capability": "knowledge.pipeline",
+                    "operation": "pipeline",
+                    "workspace": {"revision": "rev-pipeline-serial-apply"},
+                    "arguments": {"steps": ["ingest"]},
+                    "constraints": {"maxConcurrency": 2},
+                }
+            )
+        )
+
+        plan_tasks = [task for task in fragment["tasks"] if task["operation"] == "ingest_plan"]
+        apply_tasks = [task for task in fragment["tasks"] if task["operation"] == "ingest_apply"]
+        self.assertEqual(len(plan_tasks), 2)
+        self.assertEqual(len(apply_tasks), 2)
+        self.assertEqual(apply_tasks[0]["dependsOn"], [plan_tasks[0]["id"]])
+        self.assertEqual(
+            apply_tasks[1]["dependsOn"],
+            [plan_tasks[1]["id"], apply_tasks[0]["id"]],
+        )
 
     def test_agent_plan_aggregates_when_max_tasks_is_exceeded(self):
         (self.workspace / "templates" / "a.md").write_text("# A\n", encoding="utf-8")

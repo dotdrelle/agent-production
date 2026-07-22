@@ -34,7 +34,7 @@ import uvicorn
 
 app = Server("agent-wiki-production")
 
-_AGENT_VERSION = "0.14.14"
+_AGENT_VERSION = "0.14.15"
 _MCP_TOKEN = os.environ.get("MCP_AUTH_TOKEN", "")
 _MCP_READ_TOKEN = os.environ.get("MCP_READ_TOKEN", "")
 _MCP_WRITE_TOKEN = os.environ.get("MCP_WRITE_TOKEN", "")
@@ -1746,7 +1746,17 @@ def _plan_knowledge_update(
                 )
                 for file_ref, plan_task, plan_ref in zip(files, plan_tasks, plan_refs, strict=True)
             ]
+        # ingest_apply mutates the wiki under a single global workspace-write
+        # lock. Making each apply depend only on its own ingest_plan let two
+        # applies become ready at once; the production write lock then accepted
+        # one and rejected the rest with target_busy. Keep ingest_plan parallel
+        # but chain each apply to the previous one so the writes run strictly
+        # serialized (in addition to each apply waiting on its own plan).
+        previous_apply_id: str | None = None
         for apply_id, plan_task, plan_ref, progress_weight, priority in apply_specs:
+            depends_on = [plan_task["id"]]
+            if previous_apply_id is not None:
+                depends_on.append(previous_apply_id)
             tasks.append(
                 _planned_task(
                     apply_id,
@@ -1754,7 +1764,7 @@ def _plan_knowledge_update(
                     "knowledge.update",
                     "ingest_apply",
                     {"inputs": [plan_ref["ref"]]},
-                    [plan_task["id"]],
+                    depends_on,
                     False,
                     [plan_ref],
                     [{"type": "directory", "ref": "wiki"}],
@@ -1766,6 +1776,7 @@ def _plan_knowledge_update(
                     priority=priority,
                 )
             )
+            previous_apply_id = apply_id
 
     synthesis = [f"{len(files)} source file(s) resolved from raw/untracked."]
     if aggregate_ingest:
