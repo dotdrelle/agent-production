@@ -34,7 +34,7 @@ import uvicorn
 
 app = Server("agent-wiki-production")
 
-_AGENT_VERSION = "0.14.15"
+_AGENT_VERSION = "0.14.16"
 _MCP_TOKEN = os.environ.get("MCP_AUTH_TOKEN", "")
 _MCP_READ_TOKEN = os.environ.get("MCP_READ_TOKEN", "")
 _MCP_WRITE_TOKEN = os.environ.get("MCP_WRITE_TOKEN", "")
@@ -1734,33 +1734,32 @@ def _plan_knowledge_update(
     if apply_allowed:
         plan_tasks = list(tasks)
         if aggregate_ingest:
-            apply_specs = [("ingest-apply", plan_tasks[0], plan_refs[0], len(files), None)]
+            apply_specs = [("ingest-apply", plan_tasks[0], plan_refs[0], f"{len(files)} source files", len(files), None)]
         else:
             apply_specs = [
                 (
                     "ingest-apply" if len(files) == 1 else _task_id("ingest-apply", file_ref),
                     plan_task,
                     plan_ref,
+                    Path(file_ref).name,
                     1,
                     plan_task.get("priority"),
                 )
                 for file_ref, plan_task, plan_ref in zip(files, plan_tasks, plan_refs, strict=True)
             ]
-        # ingest_apply mutates the wiki under a single global workspace-write
-        # lock. Making each apply depend only on its own ingest_plan let two
-        # applies become ready at once; the production write lock then accepted
-        # one and rejected the rest with target_busy. Keep ingest_plan parallel
-        # but chain each apply to the previous one so the writes run strictly
-        # serialized (in addition to each apply waiting on its own plan).
+        # ingest_apply takes the global workspace-write lock, which conflicts
+        # with BOTH another apply and every still-running ingest_plan read lock.
+        # Wait for the complete parallel planning group before starting any
+        # apply, then chain applies so writes remain strictly serialized.
         previous_apply_id: str | None = None
-        for apply_id, plan_task, plan_ref, progress_weight, priority in apply_specs:
+        for apply_id, plan_task, plan_ref, source_label, progress_weight, priority in apply_specs:
             depends_on = [plan_task["id"]]
             if previous_apply_id is not None:
                 depends_on.append(previous_apply_id)
             tasks.append(
                 _planned_task(
                     apply_id,
-                    f"Apply ingest plan for {Path(plan_ref['ref']).name}",
+                    f"Apply Ingest {source_label}",
                     "knowledge.update",
                     "ingest_apply",
                     {"inputs": [plan_ref["ref"]]},
@@ -1771,6 +1770,7 @@ def _plan_knowledge_update(
                     _job_lock_scopes(["ingest_apply"], [plan_ref["ref"]], [], []),
                     constraints,
                     workspace_revision,
+                    depends_on_group=ingest_group["id"],
                     barrier=True,
                     progress_weight=progress_weight,
                     priority=priority,

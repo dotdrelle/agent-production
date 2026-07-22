@@ -303,10 +303,9 @@ class ProductionMcpServerTest(unittest.TestCase):
         self.assertEqual(fragment["groups"][0]["recommendedConcurrency"], 2)
         apply_tasks = fragment["tasks"][2:]
         self.assertTrue(all(task["barrier"] for task in apply_tasks))
-        # ingest_apply holds a single global workspace-write lock, so the applies
-        # must be strictly serialized: each depends on its own ingest_plan AND on
-        # the previous apply, otherwise two become ready at once and all but one
-        # fail with target_busy.
+        # The write lock conflicts with both applies and still-running planning
+        # read locks: wait for the whole ingest group, then serialize applies.
+        self.assertTrue(all(task["dependsOnGroup"] == "ingest" for task in apply_tasks))
         self.assertEqual(apply_tasks[0]["dependsOn"], [fragment["tasks"][0]["id"]])
         self.assertEqual(
             apply_tasks[1]["dependsOn"],
@@ -314,6 +313,7 @@ class ProductionMcpServerTest(unittest.TestCase):
         )
         self.assertEqual(apply_tasks[0]["arguments"]["inputs"], [fragment["tasks"][0]["expectedOutputRefs"][0]["ref"]])
         self.assertEqual(apply_tasks[1]["arguments"]["inputs"], [fragment["tasks"][1]["expectedOutputRefs"][0]["ref"]])
+        self.assertEqual([task["label"] for task in apply_tasks], ["Apply Ingest a.md", "Apply Ingest b.md"])
         self.assertTrue(all(task["locks"] == ["workspace-write"] for task in apply_tasks))
         self.assertEqual([task["priority"] for task in apply_tasks], [1, 2])
         self.assertTrue(all(task["requiresApproval"] for task in fragment["tasks"]))
@@ -490,6 +490,7 @@ class ProductionMcpServerTest(unittest.TestCase):
         apply_tasks = [task for task in fragment["tasks"] if task["operation"] == "ingest_apply"]
         self.assertEqual(len(plan_tasks), 2)
         self.assertEqual(len(apply_tasks), 2)
+        self.assertTrue(all(task["dependsOnGroup"] == "ingest" for task in apply_tasks))
         self.assertEqual(apply_tasks[0]["dependsOn"], [plan_tasks[0]["id"]])
         self.assertEqual(
             apply_tasks[1]["dependsOn"],
