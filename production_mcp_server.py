@@ -34,7 +34,7 @@ import uvicorn
 
 app = Server("agent-wiki-production")
 
-_AGENT_VERSION = "0.14.19"
+_AGENT_VERSION = "0.14.20"
 _MCP_TOKEN = os.environ.get("MCP_AUTH_TOKEN", "")
 _MCP_READ_TOKEN = os.environ.get("MCP_READ_TOKEN", "")
 _MCP_WRITE_TOKEN = os.environ.get("MCP_WRITE_TOKEN", "")
@@ -54,8 +54,18 @@ def _int_env(name: str, default: int) -> int:
 _WORKSPACE_NAME = os.environ.get("WORKSPACE_NAME", "workspace")
 _WORKSPACE_PATH = Path(os.environ.get("WIKI_WORKSPACE_PATH", "/workspace")).resolve()
 _AGENT_INSTANCE_ID = os.environ.get("PRODUCTION_INSTANCE_ID", "production-main")
-_RECOMMENDED_CONCURRENCY = _int_env("PRODUCTION_RECOMMENDED_CONCURRENCY", 2)
-_MAX_CONCURRENCY = _int_env("PRODUCTION_MAX_CONCURRENCY", 4)
+# Concurrency the agent advertises to the orchestrator (agent_describe.limits).
+# These are the PRIMARY throughput levers: the runtime takes the MIN of the
+# agent's recommendedConcurrency, its maxConcurrency, any manager ceiling
+# (WIKI_MANAGER_CAPABILITY_CONCURRENCY) and per-task limits — so it is
+# recommendedConcurrency that usually sets how many tasks run in parallel.
+# Defaults are intermediate (effective ≈ 4 parallel): enough to actually use a
+# capable machine instead of idling, while staying safe on a single LLM backend.
+# Tune per docs/configuration.md — low profile 2/4, high profile 8/16. The LLM
+# endpoint must accept this many concurrent requests, and ingest_apply stays
+# serialized regardless (global workspace-write lock).
+_RECOMMENDED_CONCURRENCY = _int_env("PRODUCTION_RECOMMENDED_CONCURRENCY", 4)
+_MAX_CONCURRENCY = _int_env("PRODUCTION_MAX_CONCURRENCY", 8)
 _MAX_TASKS_PER_PLAN = _int_env("PRODUCTION_MAX_TASKS_PER_PLAN", 0)
 _MAX_TASK_DURATION_MS = _int_env("PRODUCTION_MAX_TASK_DURATION_MS", 0)
 _LOG_PREFIX = f"[production-mcp/{_WORKSPACE_NAME}]"
@@ -278,7 +288,7 @@ def _agent_task_status(job: dict[str, Any], progress: dict[str, Any]) -> dict[st
         "finishedAt": job.get("finishedAt"),
     }
     if _terminal_status(status):
-        payload["result"] = _agent_task_result(job)
+        payload["result"] = _agent_task_result(job, progress)
     return payload
 
 
@@ -350,12 +360,22 @@ def _agent_progress_percent(progress: dict[str, Any], status: str) -> int:
     return 0
 
 
-def _agent_task_result(job: dict[str, Any]) -> dict[str, Any]:
+def _agent_task_result(job: dict[str, Any], progress: dict[str, Any] | None = None) -> dict[str, Any]:
     status = str(job.get("status") or "")
+    trace_progress = progress or {}
+    metrics: dict[str, Any] = {"durationMs": _duration_ms(job)}
+    input_tokens = _int_field(trace_progress.get("inputTokens"))
+    output_tokens = _int_field(trace_progress.get("outputTokens"))
+    if input_tokens is not None:
+        metrics["inputTokens"] = input_tokens
+    if output_tokens is not None:
+        metrics["outputTokens"] = output_tokens
+    if input_tokens is not None or output_tokens is not None:
+        metrics["totalTokens"] = (input_tokens or 0) + (output_tokens or 0)
     result: dict[str, Any] = {
         "status": _agent_result_status(status),
         "outputRefs": _agent_output_refs_for_job(job),
-        "metrics": {"durationMs": _duration_ms(job)},
+        "metrics": metrics,
     }
     if status in {"failed", "cancelled", "canceled", "error"}:
         result["error"] = _agent_error_from_job(job)
@@ -2716,6 +2736,8 @@ def _job_progress(job: dict[str, Any], log_tail: list[str]) -> dict[str, Any]:
         "waitMs": trace.get("waitMs"),
         "retryAt": trace.get("retryAt"),
         "currentBatchStartedAt": trace.get("currentBatchStartedAt"),
+        "inputTokens": trace.get("inputTokens"),
+        "outputTokens": trace.get("outputTokens"),
     }
     if status == "done":
         progress["percent"] = 100
@@ -2960,6 +2982,13 @@ def _parse_trace_progress(trace_file: str) -> dict[str, Any]:
             message = fields.get("message")
             state["detail"] = f"Stabilization failed: {message}" if message else "Stabilization failed"
             state["percent"] = 98
+        elif name == "trace:summary":
+            input_tokens = _int_field(fields.get("llmInputTokens"))
+            output_tokens = _int_field(fields.get("llmOutputTokens"))
+            if input_tokens is not None:
+                state["inputTokens"] = input_tokens
+            if output_tokens is not None:
+                state["outputTokens"] = output_tokens
         elif name == "llm:start":
             is_stabilize_llm = fields.get("label") == "build:stabilize"
             state["phase"] = "stabilize" if is_stabilize_llm else "llm"

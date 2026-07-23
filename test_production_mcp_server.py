@@ -117,6 +117,28 @@ class ProductionMcpServerTest(unittest.TestCase):
             stream.write("\n2026-07-21T10:00:04Z +4ms INFO ingest:plan source=raw/a.md")
         self.assertEqual(progress("trace.log")["percent"], 85)
 
+    def test_trace_summary_exposes_llm_tokens_to_agent_result_metrics(self):
+        trace = self.workspace / "trace.log"
+        trace.write_text(
+            "2026-07-21T10:00:04Z +4ms INFO trace:summary "
+            "llmInputTokens=1203 llmOutputTokens=456\n",
+            encoding="utf-8",
+        )
+        progress = self.server._parse_trace_progress("trace.log")
+        self.assertEqual(progress["inputTokens"], 1203)
+        self.assertEqual(progress["outputTokens"], 456)
+        result = self.server._agent_task_result(
+            {
+                "status": "done",
+                "startedAt": "2026-07-21T10:00:00Z",
+                "finishedAt": "2026-07-21T10:01:00Z",
+            },
+            progress,
+        )
+        self.assertEqual(result["metrics"]["inputTokens"], 1203)
+        self.assertEqual(result["metrics"]["outputTokens"], 456)
+        self.assertEqual(result["metrics"]["totalTokens"], 1659)
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.workspace = Path(self.tmp.name)

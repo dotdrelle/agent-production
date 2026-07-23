@@ -61,6 +61,17 @@ job/result instead of starting a new one.
   `export`, or `polish` commands.
 - Use `PRODUCTION_REQUIRE_CONFIRMATION=true` when a deployment needs an extra
   application-level guard for mutating jobs.
+- **Concurrency levers** — the agent advertises its capacity in
+  `agent_describe.limits`: `PRODUCTION_RECOMMENDED_CONCURRENCY` (default **4**)
+  and `PRODUCTION_MAX_CONCURRENCY` (default **8**). The runtime takes the MIN of
+  these, any manager ceiling (`WIKI_MANAGER_CAPABILITY_CONCURRENCY`) and per-task
+  limits, so `recommendedConcurrency` is usually the effective number of tasks
+  run in parallel — raising only `MAX` does nothing. `agent_plan` sizes its
+  groups' `recommendedConcurrency` from the passed constraint capped by
+  `_MAX_CONCURRENCY`. Real parallelism is then bounded by the locks above
+  (`ingest_apply` is serialized). Profiles: low `2/4`, default `4/8`, high
+  `8/16`; the wiki LLM backend must accept that many concurrent requests. Full
+  guide: the manager's `docs/configuration.md` § "Parallelism & throughput".
 - `production_start_job` accepts optional `configPath` (a `.wikirc.*` filename
   relative to the workspace root) to select a config profile for a single job.
   When supplied, the subprocess receives `WIKI_CONFIG_PATH=<configPath>`.

@@ -53,6 +53,15 @@ export PRODUCTION_REQUIRE_CONFIRMATION=true
 export MCP_AUTH_TOKEN=<generated-local-token>
 export WIKI_CONFIG_PATH=.wikirc.yaml.openai
 export WIKI_IMPORTS=
+
+# Parallelism / throughput (advertised in agent_describe.limits). The runtime
+# takes the MIN of these and any manager ceiling, so recommendedConcurrency is
+# the effective number of tasks run in parallel. Defaults 4/8 (≈ 4 parallel).
+# Low profile 2/4, high profile 8/16. The wiki LLM backend must accept this many
+# concurrent requests; ingest_apply stays serialized (global workspace-write
+# lock). See the manager docs/configuration.md § "Parallelism & throughput".
+export PRODUCTION_RECOMMENDED_CONCURRENCY=4
+export PRODUCTION_MAX_CONCURRENCY=8
 ```
 
 `MCP_AUTH_TOKEN`, `WIKI_CONFIG_PATH`, and `WIKI_IMPORTS` default to empty strings in the standalone Docker Compose file. Leave `WIKI_IMPORTS` empty unless you explicitly use the legacy `copy` step.
