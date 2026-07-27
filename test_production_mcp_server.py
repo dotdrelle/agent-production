@@ -335,7 +335,17 @@ class ProductionMcpServerTest(unittest.TestCase):
         )
         self.assertEqual(apply_tasks[0]["arguments"]["inputs"], [fragment["tasks"][0]["expectedOutputRefs"][0]["ref"]])
         self.assertEqual(apply_tasks[1]["arguments"]["inputs"], [fragment["tasks"][1]["expectedOutputRefs"][0]["ref"]])
-        self.assertEqual([task["label"] for task in apply_tasks], ["Apply Ingest a.md", "Apply Ingest b.md"])
+        # Labels name the effect, not the CLI flag: the two tasks a user sees
+        # per file must read as "analyzed" then "written".
+        self.assertEqual(
+            [task["label"] for task in fragment["tasks"][:2]],
+            ["Analyze a.md", "Analyze b.md"],
+        )
+        self.assertEqual(
+            [task["label"] for task in apply_tasks],
+            ["Write a.md to the wiki", "Write b.md to the wiki"],
+        )
+        self.assertEqual(fragment["groups"][0]["label"], "Analyze sources")
         self.assertTrue(all(task["locks"] == ["workspace-write"] for task in apply_tasks))
         self.assertEqual([task["priority"] for task in apply_tasks], [1, 2])
         self.assertTrue(all(task["requiresApproval"] for task in fragment["tasks"]))

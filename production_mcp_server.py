@@ -34,7 +34,7 @@ import uvicorn
 
 app = Server("agent-wiki-production")
 
-_AGENT_VERSION = "0.15.25"
+_AGENT_VERSION = "0.15.26"
 _MCP_TOKEN = os.environ.get("MCP_AUTH_TOKEN", "")
 _MCP_READ_TOKEN = os.environ.get("MCP_READ_TOKEN", "")
 _MCP_WRITE_TOKEN = os.environ.get("MCP_WRITE_TOKEN", "")
@@ -1679,7 +1679,8 @@ def _plan_knowledge_update(
     if not parallel_ingest_available or (max_depth is not None and max_depth < 2) or (max_tasks is not None and max_tasks < 2):
         task = _planned_task(
             "ingest-all",
-            f"Ingest {len(files)} source file(s)",
+            # Single aggregated task: this one really does analyze *and* write.
+            f"Analyze and write {len(files)} source file(s)",
             "knowledge.update",
             "ingest",
             {"inputs": files},
@@ -1697,7 +1698,11 @@ def _plan_knowledge_update(
     aggregate_ingest = max_tasks is not None and len(files) + 1 > max_tasks
     ingest_group = {
         "id": "ingest",
-        "label": "Plan source ingestion",
+        # "Plan"/"Apply" described the CLI flags, not what the user sees
+        # happening: two tasks per file with no hint that one reads and the
+        # other writes. Analyze/Write names the phase by its effect, which is
+        # also what makes the barrier and the serialized writes legible.
+        "label": "Analyze sources",
         "recommendedConcurrency": constraints["maxConcurrency"],
         "progressWeight": len(files),
     }
@@ -1709,7 +1714,7 @@ def _plan_knowledge_update(
         tasks.append(
             _planned_task(
                 "ingest-batch",
-                f"Plan ingest for {len(files)} source file(s)",
+                f"Analyze {len(files)} source file(s)",
                 "knowledge.update",
                 "ingest_plan",
                 {"inputs": files},
@@ -1732,7 +1737,7 @@ def _plan_knowledge_update(
             tasks.append(
                 _planned_task(
                     _task_id("ingest", file_ref),
-                    f"Ingest {Path(file_ref).name}",
+                    f"Analyze {Path(file_ref).name}",
                     "knowledge.update",
                     "ingest_plan",
                     {"inputs": [file_ref]},
@@ -1779,7 +1784,7 @@ def _plan_knowledge_update(
             tasks.append(
                 _planned_task(
                     apply_id,
-                    f"Apply Ingest {source_label}",
+                    f"Write {source_label} to the wiki",
                     "knowledge.update",
                     "ingest_apply",
                     {"inputs": [plan_ref["ref"]]},
@@ -1800,7 +1805,7 @@ def _plan_knowledge_update(
 
     synthesis = [f"{len(files)} source file(s) resolved from raw/untracked."]
     if aggregate_ingest:
-        synthesis.append("Ingest planning was aggregated to satisfy maxTasks.")
+        synthesis.append("Source analysis was aggregated into one task to satisfy maxTasks.")
     if not apply_allowed:
         synthesis.append("ingest_apply is not allowlisted; the apply barrier was omitted.")
     expected = [{"type": "directory", "ref": "wiki"}] if apply_allowed else plan_refs
