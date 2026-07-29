@@ -542,6 +542,21 @@ def _capability_input_schema(capability_id: str, supported: list[str]) -> dict[s
     }
 
 
+def _agent_operations() -> list[str]:
+    """Operations this agent will actually accept, from a single source.
+
+    The plan schema used to hard-code five names while `_CAPABILITY_STEP_MAP`
+    (declared right above it) routes `workspace.diagnose` to `doctor` and
+    `agent_describe` advertises `doctor`, `copy`, `ingest_plan` and
+    `ingest_apply` in `allowedSteps`. Donna planned the operation the agent had
+    itself advertised and `agent_plan` rejected it with
+    "'doctor' is not one of [...]". Deriving both schemas from the translation
+    table intersected with `PRODUCTION_ALLOWED_STEPS` makes it impossible for
+    what the agent advertises and what it validates to drift apart again.
+    """
+    return sorted(set(_AGENT_OPERATION_TRANSLATION) & _ALLOWED_STEPS)
+
+
 def _agent_plan_input_schema() -> dict[str, Any]:
     return {
         "type": "object",
@@ -549,7 +564,7 @@ def _agent_plan_input_schema() -> dict[str, Any]:
             "capability": {"type": "string", "enum": sorted(_CAPABILITY_STEP_MAP)},
             "operation": {
                 "type": "string",
-                "enum": ["ingest", "build", "export", "polish", "pipeline"],
+                "enum": _agent_operations(),
             },
             "objective": {"type": "string"},
             "workspace": {
@@ -593,7 +608,7 @@ def _agent_execute_input_schema() -> dict[str, Any]:
         "properties": {
             "taskId": {"type": "string"},
             "idempotencyKey": {"type": "string"},
-            "operation": {"type": "string", "enum": sorted(_AGENT_OPERATION_TRANSLATION)},
+            "operation": {"type": "string", "enum": _agent_operations()},
             "workspace": {
                 "type": "object",
                 "properties": {

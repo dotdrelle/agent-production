@@ -242,6 +242,33 @@ class ProductionMcpServerTest(unittest.TestCase):
         self.assertEqual(capabilities["workspace.diagnose"]["supportedOperations"], ["doctor"])
         self.assertEqual(capabilities["knowledge.pipeline"]["supportedOperations"], ["pipeline"])
 
+    def test_agent_plan_accepts_every_advertised_operation(self):
+        # The plan schema used to hard-code five operations while
+        # agent_describe advertised doctor/copy/ingest_plan/ingest_apply too,
+        # so Donna planning `doctor` got
+        # "'doctor' is not one of ['ingest','build','export','polish','pipeline']".
+        description = self.payload(self.server._tool_agent_describe())
+        advertised = {
+            operation
+            for capability in description["capabilities"]
+            for operation in capability["supportedOperations"]
+        }
+        plan_enum = set(self.server._agent_plan_input_schema()["properties"]["operation"]["enum"])
+        execute_enum = set(self.server._agent_execute_input_schema()["properties"]["operation"]["enum"])
+
+        self.assertIn("doctor", plan_enum)
+        self.assertTrue(advertised <= plan_enum, advertised - plan_enum)
+        self.assertEqual(plan_enum, execute_enum)
+
+    def test_agent_plan_operations_follow_allowed_steps(self):
+        server = load_module(
+            self.workspace,
+            {"PRODUCTION_ALLOWED_STEPS": "doctor,ingest,polish,pipeline"},
+        )
+        plan_enum = server._agent_plan_input_schema()["properties"]["operation"]["enum"]
+
+        self.assertEqual(plan_enum, ["doctor", "ingest", "pipeline", "polish"])
+
     def test_ingest_plan_falls_back_to_one_executable_task_when_parallel_helpers_are_disabled(self):
         server = load_module(
             self.workspace,
