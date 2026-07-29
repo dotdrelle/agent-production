@@ -9,10 +9,9 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends python3 python3-pip rsync && \
     rm -rf /var/lib/apt/lists/* && \
     pip3 install --no-cache-dir --break-system-packages \
-      "mcp>=1.9.4" \
+      "mcp>=1.9.4,<2" \
       starlette \
       uvicorn
-
 COPY production_mcp_server.py .
 
 ENV MCP_HOST=0.0.0.0
