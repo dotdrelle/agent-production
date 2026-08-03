@@ -34,7 +34,7 @@ import uvicorn
 
 app = Server("agent-wiki-production")
 
-_AGENT_VERSION = "0.15.38"
+_AGENT_VERSION = "0.15.40"
 _MCP_TOKEN = os.environ.get("MCP_AUTH_TOKEN", "")
 _MCP_READ_TOKEN = os.environ.get("MCP_READ_TOKEN", "")
 _MCP_WRITE_TOKEN = os.environ.get("MCP_WRITE_TOKEN", "")
@@ -73,7 +73,7 @@ _IMPORTS = os.environ.get("WIKI_IMPORTS", "")
 _IMPORT_PATH_MAPPINGS = os.environ.get("PRODUCTION_IMPORT_PATH_MAPPINGS", "")
 _ALLOWED_STEPS = {
     item.strip()
-    for item in os.environ.get("PRODUCTION_ALLOWED_STEPS", "doctor,copy,ingest,ingest_plan,ingest_apply,build,export,polish,pipeline").split(",")
+    for item in os.environ.get("PRODUCTION_ALLOWED_STEPS", "doctor,copy,ingest,ingest_plan,ingest_apply,build,export,polish,restore,pipeline").split(",")
     if item.strip()
 }
 _REQUIRE_CONFIRMATION = os.environ.get("PRODUCTION_REQUIRE_CONFIRMATION", "true").lower() not in {"0", "false", "no"}
@@ -91,14 +91,16 @@ _STEP_COMMANDS: dict[str, list[str]] = {
     "build": ["node", _WIKI_BIN, "build"],
     "export": ["node", _WIKI_BIN, "export"],
     "polish": ["node", _WIKI_BIN, "export", "--polish"],
+    "restore": ["node", _WIKI_BIN, "restore"],
 }
-_MUTATING_STEPS = {"copy", "ingest", "ingest_plan", "ingest_apply", "build", "export", "polish", "pipeline"}
+_MUTATING_STEPS = {"copy", "ingest", "ingest_plan", "ingest_apply", "build", "export", "polish", "restore", "pipeline"}
 _CAPABILITY_STEP_MAP: dict[str, list[str]] = {
     "knowledge.update": ["ingest", "ingest_plan", "ingest_apply"],
     "document.build": ["build"],
     "document.publish": ["export", "polish"],
     "workspace.diagnose": ["doctor"],
     "knowledge.pipeline": ["pipeline"],
+    "workspace.restore": ["restore"],
 }
 _AGENT_OPERATION_TRANSLATION: dict[str, dict[str, Any]] = {
     "doctor": {"type": "doctor"},
@@ -109,6 +111,7 @@ _AGENT_OPERATION_TRANSLATION: dict[str, dict[str, Any]] = {
     "export": {"type": "export"},
     "polish": {"type": "polish"},
     "pipeline": {"type": "pipeline"},
+    "restore": {"type": "restore"},
 }
 
 _WRITE_TOOLS = {"agent_execute", "agent_cancel", "production_start_job", "production_cancel_job"}
@@ -252,6 +255,10 @@ def _agent_start_job_args(args: dict[str, Any], workspace: dict[str, Any]) -> di
         ("stabilize", "stabilize"),
         ("configPath", "configPath"),
         ("callerLabel", "callerLabel"),
+        ("file", "restoreFile"),
+        ("to", "restoreRevision"),
+        ("dryRun", "executeDryRun"),
+        ("run", "restoreRun"),
     ]:
         if source_key in arguments:
             job_args[target_key] = arguments[source_key]
@@ -261,6 +268,12 @@ def _agent_start_job_args(args: dict[str, Any], workspace: dict[str, Any]) -> di
         job_args["confirm"] = bool(arguments["confirm"])
     else:
         job_args["confirm"] = True
+    if args.get("idempotencyKey"):
+        job_args["idempotencyKey"] = str(args["idempotencyKey"])
+    if args.get("runId"):
+        job_args["runId"] = str(args["runId"])
+    if args.get("capability"):
+        job_args["capability"] = str(args["capability"])
     return job_args
 
 
@@ -509,6 +522,10 @@ def _capability_description(capability_id: str) -> str:
             "This is not a source/Confluence export: to pull external source content, use the source-export agent instead."
         ),
         "workspace.diagnose": "Diagnose workspace configuration and runtime readiness (read-only doctor checks); it creates no jobs.",
+        "workspace.restore": (
+            "Restore a workspace file to a Git revision or revert one production run to its parent. "
+            "This is a mutating operation, always workspace-scoped, and requires explicit approval."
+        ),
         "knowledge.pipeline": "Run the full production pipeline (ingest → build → export/polish) over the workspace in one ordered sequence.",
     }
     return descriptions.get(capability_id, capability_id)
@@ -529,6 +546,11 @@ def _capability_input_schema(capability_id: str, supported: list[str]) -> dict[s
         properties["deliverables"] = {"type": "array", "items": {"type": "string"}, "description": "Deliverable files (relative to the workspace root or deliverables/) to export or polish. These must already exist under deliverables/."}
     if capability_id == "knowledge.pipeline":
         properties["steps"] = {"type": "array", "items": {"type": "string"}, "description": "Ordered pipeline steps to run (e.g. ingest, build, export). If omitted, the default full pipeline order is used."}
+    if capability_id == "workspace.restore":
+        properties["file"] = {"type": "string", "description": "Workspace-relative file to restore (use with to)."}
+        properties["to"] = {"type": "string", "description": "Git revision for file restore."}
+        properties["run"] = {"type": "string", "description": "Git run commit to revert to its parent (alternative to file+to)."}
+        properties["dryRun"] = {"type": "boolean", "description": "Validate the restore without writing files."}
     return {
         "type": "object",
         "properties": properties,
@@ -584,6 +606,10 @@ def _agent_plan_input_schema() -> dict[str, Any]:
                     "stabilize": {"type": "boolean"},
                     "configPath": {"type": "string"},
                     "callerLabel": {"type": "string"},
+                    "file": {"type": "string"},
+                    "to": {"type": "string"},
+                    "run": {"type": "string"},
+                    "dryRun": {"type": "boolean"},
                 },
                 "additionalProperties": True,
             },
@@ -607,6 +633,8 @@ def _agent_execute_input_schema() -> dict[str, Any]:
         "type": "object",
         "properties": {
             "taskId": {"type": "string"},
+            "runId": {"type": "string"},
+            "capability": {"type": "string"},
             "idempotencyKey": {"type": "string"},
             "operation": {"type": "string", "enum": _agent_operations()},
             "workspace": {
@@ -628,6 +656,10 @@ def _agent_execute_input_schema() -> dict[str, Any]:
                     "stabilize": {"type": "boolean"},
                     "configPath": {"type": "string"},
                     "callerLabel": {"type": "string"},
+                    "file": {"type": "string"},
+                    "to": {"type": "string"},
+                    "run": {"type": "string"},
+                    "dryRun": {"type": "boolean"},
                     "confirm": {"type": "boolean"},
                 },
                 "additionalProperties": True,
@@ -1114,11 +1146,11 @@ async def list_tools() -> list[Tool]:
                 "properties": {
                     "type": {
                         "type": "string",
-                        "enum": ["doctor", "copy", "ingest", "ingest_plan", "ingest_apply", "build", "export", "polish", "pipeline"],
+                        "enum": ["doctor", "copy", "ingest", "ingest_plan", "ingest_apply", "build", "export", "polish", "restore", "pipeline"],
                     },
                     "steps": {
                         "type": "array",
-                        "items": {"type": "string", "enum": ["doctor", "copy", "ingest", "ingest_plan", "ingest_apply", "build", "export", "polish"]},
+                        "items": {"type": "string", "enum": ["doctor", "copy", "ingest", "ingest_plan", "ingest_apply", "build", "export", "polish", "restore"]},
                         "description": "Required for type=pipeline. Ordered steps to run.",
                     },
                     "templates": {
@@ -1152,6 +1184,9 @@ async def list_tools() -> list[Tool]:
                         "type": "string",
                         "description": "Optional identifier of the caller (e.g. 'my-project/wiki-manager'). Logged in the job for traceability.",
                     },
+                    "restoreFile": {"type": "string", "description": "Workspace-relative file to restore."},
+                    "restoreRevision": {"type": "string", "description": "Git revision used for file restore."},
+                    "restoreRun": {"type": "string", "description": "Git run commit to revert to its parent."},
                     "confirm": {"type": "boolean", "description": "Set true after explicit user approval."},
                     "dryRun": {"type": "boolean", "description": "Validate and return the planned job without running it."},
                 },
@@ -1421,15 +1456,22 @@ def _tool_list_templates(args: dict[str, Any]) -> list[TextContent]:
 
 async def _tool_start_job(args: dict[str, Any], workspace_name_override: str | None = None) -> list[TextContent]:
     job_type = str(args.get("type", "")).strip()
-    dry_run = bool(args.get("dryRun", False))
+    preview_dry_run = bool(args.get("dryRun", False))
+    execute_dry_run = bool(args.get("executeDryRun", False))
     confirm = bool(args.get("confirm", False))
     steps = _resolve_steps(job_type, args.get("steps"))
     inputs = _expand_input_globs(_resolve_string_list(args.get("inputs"), "inputs"))
     templates = _resolve_string_list(args.get("templates"), "templates")
     deliverables = _resolve_string_list(args.get("deliverables"), "deliverables")
     stabilize = bool(args.get("stabilize", False))
+    restore_file = str(args.get("restoreFile") or "").strip() or None
+    restore_revision = str(args.get("restoreRevision") or "").strip() or None
+    restore_run = str(args.get("restoreRun") or "").strip() or None
     config_path = _resolve_config_path(args.get("configPath"))
     caller_label = str(args["callerLabel"]).strip()[:120] if args.get("callerLabel") else None
+    idempotency_key = _normalize_idempotency_key(args.get("idempotencyKey"))
+    capability = str(args.get("capability") or "").strip() or None
+    run_id = str(args.get("runId") or "").strip() or None
     workspace_name = str(workspace_name_override or _WORKSPACE_NAME).strip() or _WORKSPACE_NAME
 
     if job_type not in _ALLOWED_STEPS:
@@ -1441,6 +1483,8 @@ async def _tool_start_job(args: dict[str, Any], workspace_name_override: str | N
         raise ValueError(f"Workspace path does not exist: {_WORKSPACE_PATH}")
     if any(step in {"export", "polish"} for step in steps) and not deliverables:
         raise ValueError("export and polish jobs require at least one deliverable.")
+    if "restore" in steps and not ((restore_file and restore_revision) or restore_run):
+        raise ValueError("restore jobs require restoreFile+restoreRevision or restoreRun.")
     if inputs and not any(step in {"ingest", "ingest_plan", "ingest_apply"} for step in steps):
         raise ValueError("inputs can only be used with ingest, ingest_plan, ingest_apply, or pipeline jobs.")
     lock_scopes = _job_lock_scopes(steps, inputs, templates, deliverables)
@@ -1454,10 +1498,26 @@ async def _tool_start_job(args: dict[str, Any], workspace_name_override: str | N
         "deliverables": deliverables,
         "stabilize": stabilize,
         "configPath": config_path,
+        **({"restoreFile": restore_file, "restoreRevision": restore_revision, "restoreRun": restore_run, "dryRun": execute_dry_run} if "restore" in steps else {}),
         "lockScopes": lock_scopes,
     }
-    if dry_run:
-        return _json_text({"ok": True, "dryRun": True, "plan": plan, "commands": _command_labels(steps, inputs, templates, deliverables, stabilize)})
+    if preview_dry_run:
+        return _json_text({
+            "ok": True,
+            "dryRun": True,
+            "plan": plan,
+            "commands": _command_labels(
+                steps,
+                inputs,
+                templates,
+                deliverables,
+                stabilize,
+                restore_file=restore_file,
+                restore_revision=restore_revision,
+                restore_run=restore_run,
+                dry_run=True,
+            ),
+        })
     if _REQUIRE_CONFIRMATION and not confirm and any(step in _MUTATING_STEPS for step in steps):
         raise ValueError("Production jobs require confirm=true after explicit user approval.")
 
@@ -1477,7 +1537,11 @@ async def _tool_start_job(args: dict[str, Any], workspace_name_override: str | N
         "lockScopes": lock_scopes,
         "stabilize": stabilize,
         "configPath": config_path,
+        **({"restoreFile": restore_file, "restoreRevision": restore_revision, "restoreRun": restore_run, "dryRun": execute_dry_run} if "restore" in steps else {}),
         **({"callerLabel": caller_label} if caller_label else {}),
+        **({"idempotencyKey": idempotency_key} if idempotency_key else {}),
+        **({"capability": capability} if capability else {}),
+        **({"runId": run_id} if run_id else {}),
         "steps": [{"name": step, "status": "pending"} for step in steps],
         "status": "queued",
         "createdAt": _now(),
@@ -1581,6 +1645,40 @@ def _agent_plan(args: dict[str, Any]) -> dict[str, Any]:
         return _plan_pipeline(request_args, constraints, workspace_revision)
     if capability == "workspace.diagnose":
         return _empty_plan("workspace.diagnose", "Diagnose workspace", ["Production planning does not create diagnose tasks."])
+    if capability == "workspace.restore":
+        restore_file = str(request_args.get("file") or "").strip()
+        restore_revision = str(request_args.get("to") or request_args.get("revision") or "").strip()
+        restore_run = str(request_args.get("run") or "").strip()
+        if not restore_run and (not restore_file or not restore_revision):
+            raise ValueError("workspace.restore requires arguments.run, or arguments.file and arguments.to.")
+        label = f"Restore run {restore_run}" if restore_run else f"Restore {restore_file}"
+        arguments = ({"run": restore_run} if restore_run else {"file": restore_file, "to": restore_revision})
+        if request_args.get("dryRun") is True:
+            arguments["dryRun"] = True
+        input_refs = [] if restore_run else [{"type": "file", "ref": restore_file}]
+        output_refs = [] if restore_run else [{"type": "file", "ref": restore_file}]
+        task = _planned_task(
+            "restore-run" if restore_run else "restore-file",
+            label,
+            "workspace.restore",
+            "restore",
+            arguments,
+            [],
+            False,
+            input_refs,
+            output_refs,
+            ["workspace-write"],
+            constraints,
+            workspace_revision,
+        )
+        return _fragment(
+            "workspace.restore",
+            "Restore workspace run" if restore_run else "Restore workspace file",
+            [f"Restore run {restore_run}." if restore_run else f"Restore {restore_file} from revision {restore_revision}."],
+            [],
+            [task],
+            task["expectedOutputRefs"],
+        )
     raise ValueError(f"Unsupported planning capability: {capability}")
 
 
@@ -1625,6 +1723,14 @@ def _plan_capability_operation(args: dict[str, Any]) -> tuple[str, str]:
             capability = "document.publish"
         elif operation == "pipeline" or "pipeline" in objective:
             capability = "knowledge.pipeline"
+        # Deliberately no objective-keyword inference here, unlike the
+        # capabilities above: workspace.restore overwrites files from a Git
+        # revision, and "restore"/"rollback" appear in plenty of objectives
+        # that mean nothing of the sort ("restore the ingest pipeline").
+        # A destructive capability is only ever selected from an explicit
+        # operation or an explicit capability.
+        elif operation == "restore":
+            capability = "workspace.restore"
 
     if not operation:
         defaults = {
@@ -1632,12 +1738,13 @@ def _plan_capability_operation(args: dict[str, Any]) -> tuple[str, str]:
             "document.build": "build",
             "document.publish": "export",
             "knowledge.pipeline": "pipeline",
+            "workspace.restore": "restore",
         }
         operation = defaults.get(capability, "")
 
     if capability not in _CAPABILITY_STEP_MAP:
         raise ValueError("agent_plan requires a supported capability.")
-    if operation and operation not in {"ingest", "ingest_plan", "ingest_apply", "build", "export", "polish", "pipeline"}:
+    if operation and operation not in {"ingest", "ingest_plan", "ingest_apply", "build", "export", "polish", "restore", "pipeline"}:
         raise ValueError(f"Unsupported planning operation: {operation}")
     if operation == "ingest_plan":
         operation = "ingest"
@@ -2399,11 +2506,11 @@ def _resolve_steps(job_type: str, raw_steps: Any) -> list[str]:
         if not isinstance(raw_steps, list) or not raw_steps:
             return ["ingest", "build", "export", "polish"]
         steps = [str(item).strip() for item in raw_steps if str(item).strip()]
-    elif job_type in {"doctor", "copy", "ingest", "ingest_plan", "ingest_apply", "build", "export", "polish"}:
+    elif job_type in {"doctor", "copy", "ingest", "ingest_plan", "ingest_apply", "build", "export", "polish", "restore"}:
         steps = [job_type]
     else:
         raise ValueError(f"Unknown production job type: {job_type}")
-    invalid = [step for step in steps if step not in {"doctor", "copy", "ingest", "ingest_plan", "ingest_apply", "build", "export", "polish"}]
+    invalid = [step for step in steps if step not in {"doctor", "copy", "ingest", "ingest_plan", "ingest_apply", "build", "export", "polish", "restore"}]
     if invalid:
         raise ValueError(f"Unknown production step: {invalid[0]}")
     return steps
@@ -2468,7 +2575,7 @@ def _job_lock_scopes(
     deliverables: list[str],
 ) -> list[str]:
     scopes: set[str] = set()
-    if any(step in {"copy", "ingest", "ingest_apply"} for step in steps):
+    if any(step in {"copy", "ingest", "ingest_apply", "restore"} for step in steps):
         scopes.add("workspace-write")
     if "build" in steps:
         if templates:
@@ -2543,14 +2650,25 @@ async def _run_job(job_id: str) -> None:
                 step["result"] = {"copiedFiles": count}
                 step["exitCode"] = 0
             else:
+                cli_kwargs = {
+                    "stabilize": bool(job.get("stabilize", False)),
+                    "config_path": job.get("configPath"),
+                    "job_metadata": job,
+                }
+                if step["name"] == "restore":
+                    cli_kwargs.update({
+                        "restore_file": job.get("restoreFile"),
+                        "restore_revision": job.get("restoreRevision"),
+                        "restore_run": job.get("restoreRun"),
+                        "dry_run": bool(job.get("dryRun", False)),
+                    })
                 exit_code = await _run_cli_step(
                     job_id,
                     step["name"],
                     job.get("inputs", []),
                     job.get("templates", []),
                     job.get("deliverables", []),
-                    stabilize=bool(job.get("stabilize", False)),
-                    config_path=job.get("configPath"),
+                    **cli_kwargs,
                 )
                 step["exitCode"] = exit_code
                 step["result"] = _step_result_from_logs(job_id, step["name"])
@@ -2619,13 +2737,42 @@ async def _run_cli_step(
     deliverables: list[str],
     stabilize: bool = False,
     config_path: str | None = None,
+    restore_file: str | None = None,
+    restore_revision: str | None = None,
+    restore_run: str | None = None,
+    dry_run: bool = False,
+    job_metadata: dict[str, Any] | None = None,
 ) -> int:
     env = dict(os.environ)
     env["WIKI_RUN_CALLER"] = job_id
+    metadata = job_metadata or {}
+    env["WIKI_RUN_ID"] = str(metadata.get("runId") or job_id)
+    env["WIKI_TASK_ID"] = str(metadata.get("callerLabel") or step)
+    capability = str(metadata.get("capability") or "").strip()
+    if capability:
+        env["WIKI_CAPABILITY"] = capability
+    else:
+        env.pop("WIKI_CAPABILITY", None)
+    job_idempotency = metadata.get("idempotencyKey")
+    if job_idempotency:
+        env["WIKI_IDEMPOTENCY_KEY"] = str(job_idempotency)
+    else:
+        env.pop("WIKI_IDEMPOTENCY_KEY", None)
     if config_path:
         env["WIKI_CONFIG_PATH"] = config_path
         _append_log(job_id, f"[config] WIKI_CONFIG_PATH={config_path}")
-    for command in _step_commands(step, inputs, templates, deliverables, stabilize=stabilize):
+    commands = _step_commands(
+        step,
+        inputs,
+        templates,
+        deliverables,
+        stabilize=stabilize,
+        restore_file=restore_file,
+        restore_revision=restore_revision,
+        restore_run=restore_run,
+        dry_run=dry_run,
+    )
+    for command in commands:
         _append_log(job_id, f"[cmd] cwd={_WORKSPACE_PATH} {' '.join(command)}")
         proc = await asyncio.create_subprocess_exec(
             *command,
@@ -3164,7 +3311,17 @@ def _job_summary(job: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _step_commands(step: str, inputs: list[str], templates: list[str], deliverables: list[str], stabilize: bool = False) -> list[list[str]]:
+def _step_commands(
+    step: str,
+    inputs: list[str],
+    templates: list[str],
+    deliverables: list[str],
+    stabilize: bool = False,
+    restore_file: str | None = None,
+    restore_revision: str | None = None,
+    restore_run: str | None = None,
+    dry_run: bool = False,
+) -> list[list[str]]:
     if step == "copy":
         return []
     command = [*_STEP_COMMANDS[step]]
@@ -3178,16 +3335,46 @@ def _step_commands(step: str, inputs: list[str], templates: list[str], deliverab
         return [command]
     if step in {"export", "polish"}:
         return [[*command, deliverable] for deliverable in deliverables]
+    if step == "restore":
+        if restore_run:
+            command.extend(["--run", restore_run])
+        elif restore_file and restore_revision:
+            command.extend(["--file", restore_file, "--to", restore_revision])
+        else:
+            raise ValueError("restore requires file+to or run arguments")
+        if dry_run:
+            command.append("--dry-run")
+        return [command]
     return [command]
 
 
-def _command_labels(steps: list[str], inputs: list[str], templates: list[str], deliverables: list[str], stabilize: bool = False) -> list[str]:
+def _command_labels(
+    steps: list[str],
+    inputs: list[str],
+    templates: list[str],
+    deliverables: list[str],
+    stabilize: bool = False,
+    restore_file: str | None = None,
+    restore_revision: str | None = None,
+    restore_run: str | None = None,
+    dry_run: bool = False,
+) -> list[str]:
     labels: list[str] = []
     for step in steps:
         if step == "copy":
             labels.append(f"copy {len(_parse_imports())} import(s) to raw/untracked")
             continue
-        labels.extend(" ".join(command) for command in _step_commands(step, inputs, templates, deliverables, stabilize=stabilize))
+        labels.extend(" ".join(command) for command in _step_commands(
+            step,
+            inputs,
+            templates,
+            deliverables,
+            stabilize=stabilize,
+            restore_file=restore_file,
+            restore_revision=restore_revision,
+            restore_run=restore_run,
+            dry_run=dry_run,
+        ))
     return labels
 
 

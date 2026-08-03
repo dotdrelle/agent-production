@@ -48,7 +48,7 @@ export WIKI_WORKSPACE_PATH=<absolute-path-to-llm-wiki-workspace>
 Optional:
 
 ```bash
-export PRODUCTION_ALLOWED_STEPS=doctor,copy,ingest,ingest_plan,ingest_apply,build,export,polish,pipeline
+export PRODUCTION_ALLOWED_STEPS=doctor,copy,ingest,ingest_plan,ingest_apply,build,export,polish,restore,pipeline
 export PRODUCTION_REQUIRE_CONFIRMATION=true
 export MCP_AUTH_TOKEN=<generated-local-token>
 export WIKI_CONFIG_PATH=.wikirc.yaml.openai

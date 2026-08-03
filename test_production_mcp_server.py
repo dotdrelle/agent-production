@@ -152,6 +152,20 @@ class ProductionMcpServerTest(unittest.TestCase):
     def payload(self, result):
         return json.loads(result[0].text)
 
+    def test_shipped_allowed_step_defaults_include_restore(self):
+        root = Path(__file__).parent
+        for relative in ["Dockerfile", "docker-compose.yml", ".env.example", "README.md"]:
+            content = (root / relative).read_text(encoding="utf-8")
+            declarations = [
+                line for line in content.splitlines()
+                if "PRODUCTION_ALLOWED_STEPS" in line and not line.lstrip().startswith("#")
+            ]
+            self.assertTrue(declarations, f"{relative} must declare PRODUCTION_ALLOWED_STEPS")
+            self.assertTrue(
+                all("restore" in line.split("PRODUCTION_ALLOWED_STEPS", 1)[1] for line in declarations),
+                f"{relative} must allow restore in every shipped default",
+            )
+
     def assert_task_graph_fragment(self, fragment):
         self.assertEqual(fragment["contractVersion"], "1")
         self.assertEqual(fragment["agentInstanceId"], "production-main")
@@ -268,6 +282,148 @@ class ProductionMcpServerTest(unittest.TestCase):
         plan_enum = server._agent_plan_input_schema()["properties"]["operation"]["enum"]
 
         self.assertEqual(plan_enum, ["doctor", "ingest", "pipeline", "polish"])
+
+    def test_restore_contract_preserves_run_identity_and_capability(self):
+        job_args = self.server._agent_start_job_args(
+            {
+                "taskId": "restore-task",
+                "runId": "donna-run-42",
+                "capability": "workspace.restore",
+                "idempotencyKey": "restore-idem-42",
+                "operation": "restore",
+                "arguments": {"run": "abc123"},
+            },
+            {"name": "test-workspace"},
+        )
+
+        self.assertEqual(job_args["runId"], "donna-run-42")
+        self.assertEqual(job_args["capability"], "workspace.restore")
+        self.assertEqual(job_args["idempotencyKey"], "restore-idem-42")
+        self.assertEqual(job_args["restoreRun"], "abc123")
+
+        fragment = self.payload(self.server._tool_agent_plan({
+            "capability": "workspace.restore",
+            "operation": "restore",
+            "workspace": {"revision": "rev-restore"},
+            "arguments": {"run": "abc123", "dryRun": True},
+        }))
+        self.assert_task_graph_fragment(fragment)
+        self.assertEqual(fragment["tasks"][0]["arguments"], {"run": "abc123", "dryRun": True})
+        self.assertEqual(fragment["tasks"][0]["locks"], ["workspace-write"])
+
+        dry_run_job_args = self.server._agent_start_job_args(
+            {
+                "operation": "restore",
+                "capability": "workspace.restore",
+                "arguments": {"run": "abc123", "dryRun": True},
+            },
+            {"name": "test-workspace"},
+        )
+        self.assertNotIn("dryRun", dry_run_job_args)
+        self.assertTrue(dry_run_job_args["executeDryRun"])
+
+    def test_restore_is_never_inferred_from_the_objective_wording(self):
+        # workspace.restore overwrites files from a Git revision. Unlike the
+        # read-mostly capabilities, it must never be selected from free-text
+        # keywords: plenty of unrelated objectives contain "restore".
+        for objective in (
+            "restore the ingest pipeline after the outage",
+            "rollback plan for the documentation",
+        ):
+            capability, _ = self.server._plan_capability_operation({"objective": objective})
+            self.assertNotEqual(capability, "workspace.restore", objective)
+
+        # An explicit operation, or an explicit capability, still selects it.
+        self.assertEqual(
+            self.server._plan_capability_operation({"operation": "restore"})[0],
+            "workspace.restore",
+        )
+        self.assertEqual(
+            self.server._plan_capability_operation(
+                {"capability": "workspace.restore", "operation": "restore"}
+            )[0],
+            "workspace.restore",
+        )
+
+    def test_restore_dry_run_preview_contains_exact_command(self):
+        payload = self.payload(asyncio.run(self.server._tool_start_job({
+            "type": "restore",
+            "restoreRun": "abc123",
+            "dryRun": True,
+        })))
+
+        self.assertEqual(payload["commands"], [
+            f"node {self.server._WIKI_BIN} restore --run abc123 --dry-run"
+        ])
+
+    def test_agent_restore_dry_run_creates_a_tracked_job(self):
+        async def scenario():
+            async def hold_job(_job_id):
+                await asyncio.Future()
+
+            self.server._run_job = hold_job
+            result = self.payload(await self.server._tool_agent_execute({
+                "taskId": "restore-dry-run",
+                "operation": "restore",
+                "capability": "workspace.restore",
+                "workspace": {"name": "test-workspace"},
+                "arguments": {"run": "abc123", "dryRun": True},
+            }))
+
+            self.assertTrue(result["accepted"])
+            self.assertIn("jobId", result)
+            job = self.server._load_job(result["jobId"])
+            self.assertTrue(job["dryRun"])
+            await self.server._tool_agent_cancel({"jobId": result["jobId"]})
+
+        asyncio.run(scenario())
+
+    def test_restore_cli_uses_in_memory_job_metadata_and_exact_environment(self):
+        captured = {}
+
+        class EmptyStdout:
+            async def readline(self):
+                return b""
+
+        class SuccessfulProcess:
+            stdout = EmptyStdout()
+
+            async def wait(self):
+                return 0
+
+        async def create_subprocess_exec(*command, **kwargs):
+            captured["command"] = list(command)
+            captured["env"] = kwargs["env"]
+            return SuccessfulProcess()
+
+        self.server.asyncio.create_subprocess_exec = create_subprocess_exec
+        self.server._append_log = lambda *_args, **_kwargs: None
+        self.server._load_job = lambda _job_id: self.fail("_run_cli_step must not reload the job")
+
+        exit_code = asyncio.run(self.server._run_cli_step(
+            "prod-job-1",
+            "restore",
+            [],
+            [],
+            [],
+            restore_file="wiki/page.md",
+            restore_revision="deadbeef",
+            job_metadata={
+                "runId": "donna-run-42",
+                "callerLabel": "restore-task",
+                "capability": "workspace.restore",
+                "idempotencyKey": "restore-idem-42",
+            },
+        ))
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(captured["command"], [
+            "node", self.server._WIKI_BIN, "restore", "--file", "wiki/page.md", "--to", "deadbeef"
+        ])
+        self.assertEqual(captured["env"]["WIKI_RUN_ID"], "donna-run-42")
+        self.assertEqual(captured["env"]["WIKI_TASK_ID"], "restore-task")
+        self.assertEqual(captured["env"]["WIKI_CAPABILITY"], "workspace.restore")
+        self.assertEqual(captured["env"]["WIKI_IDEMPOTENCY_KEY"], "restore-idem-42")
 
     def test_ingest_plan_falls_back_to_one_executable_task_when_parallel_helpers_are_disabled(self):
         server = load_module(
@@ -605,6 +761,7 @@ class ProductionMcpServerTest(unittest.TestCase):
                 _deliverables,
                 stabilize=False,
                 config_path=None,
+                job_metadata=None,
             ):
                 return 0
 
@@ -709,6 +866,7 @@ class ProductionMcpServerTest(unittest.TestCase):
                 _deliverables,
                 stabilize=False,
                 config_path=None,
+                job_metadata=None,
             ):
                 return 0
 
@@ -741,6 +899,7 @@ class ProductionMcpServerTest(unittest.TestCase):
                 _deliverables,
                 stabilize=False,
                 config_path=None,
+                job_metadata=None,
             ):
                 return 2
 
@@ -916,6 +1075,7 @@ class ProductionMcpServerTest(unittest.TestCase):
                 _deliverables,
                 stabilize=False,
                 config_path=None,
+                job_metadata=None,
             ):
                 await asyncio.sleep(0.5)
                 return 0
