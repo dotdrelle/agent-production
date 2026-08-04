@@ -34,7 +34,7 @@ import uvicorn
 
 app = Server("agent-wiki-production")
 
-_AGENT_VERSION = "0.15.40"
+_AGENT_VERSION = "0.15.41"
 _MCP_TOKEN = os.environ.get("MCP_AUTH_TOKEN", "")
 _MCP_READ_TOKEN = os.environ.get("MCP_READ_TOKEN", "")
 _MCP_WRITE_TOKEN = os.environ.get("MCP_WRITE_TOKEN", "")
@@ -1896,13 +1896,18 @@ def _plan_knowledge_update(
             ]
         # ingest_apply takes the global workspace-write lock, which conflicts
         # with BOTH another apply and every still-running ingest_plan read lock.
-        # Wait for the complete parallel planning group before starting any
-        # apply, then chain applies so writes remain strictly serialized.
-        previous_apply_id: str | None = None
+        # The group barrier waits for the complete parallel planning group, and
+        # the lock itself serializes the writes.
+        #
+        # The applies used to be chained to each other on top of that. It was
+        # belt AND braces, and the belt cost a run: an apply whose plan failed
+        # is skipped, and every apply behind it in the chain inherited a
+        # dependency that would never succeed. One unreadable source file left
+        # nine perfectly good ones unwritten. Nothing was gained — two applies
+        # already cannot start together, since the second cannot acquire
+        # workspace-write while the first holds it.
         for apply_id, plan_task, plan_ref, source_label, progress_weight, priority in apply_specs:
             depends_on = [plan_task["id"]]
-            if previous_apply_id is not None:
-                depends_on.append(previous_apply_id)
             tasks.append(
                 _planned_task(
                     apply_id,
@@ -1923,7 +1928,6 @@ def _plan_knowledge_update(
                     priority=priority,
                 )
             )
-            previous_apply_id = apply_id
 
     synthesis = [f"{len(files)} source file(s) resolved from raw/untracked."]
     if aggregate_ingest:

@@ -509,13 +509,13 @@ class ProductionMcpServerTest(unittest.TestCase):
         apply_tasks = fragment["tasks"][2:]
         self.assertTrue(all(task["barrier"] for task in apply_tasks))
         # The write lock conflicts with both applies and still-running planning
-        # read locks: wait for the whole ingest group, then serialize applies.
+        # read locks: wait for the whole ingest group, and let the lock — not a
+        # dependency chain — serialize the writes. Chaining applies to each
+        # other made one unreadable source file skip every apply behind it.
         self.assertTrue(all(task["dependsOnGroup"] == "ingest" for task in apply_tasks))
         self.assertEqual(apply_tasks[0]["dependsOn"], [fragment["tasks"][0]["id"]])
-        self.assertEqual(
-            apply_tasks[1]["dependsOn"],
-            [fragment["tasks"][1]["id"], apply_tasks[0]["id"]],
-        )
+        self.assertEqual(apply_tasks[1]["dependsOn"], [fragment["tasks"][1]["id"]])
+        self.assertTrue(all("workspace-write" in task["locks"] for task in apply_tasks))
         self.assertEqual(apply_tasks[0]["arguments"]["inputs"], [fragment["tasks"][0]["expectedOutputRefs"][0]["ref"]])
         self.assertEqual(apply_tasks[1]["arguments"]["inputs"], [fragment["tasks"][1]["expectedOutputRefs"][0]["ref"]])
         # Labels name the effect, not the CLI flag: the two tasks a user sees
@@ -683,7 +683,7 @@ class ProductionMcpServerTest(unittest.TestCase):
         self.assertNotIn("build", operations)
         self.assertNotIn("export", operations)
 
-    def test_pipeline_preserves_serial_ingest_apply_dependencies(self):
+    def test_pipeline_keeps_each_ingest_apply_independent(self):
         pending = self.workspace / "raw" / "untracked"
         pending.mkdir(parents=True)
         (pending / "a.md").write_text("# A\n", encoding="utf-8")
@@ -705,12 +705,61 @@ class ProductionMcpServerTest(unittest.TestCase):
         apply_tasks = [task for task in fragment["tasks"] if task["operation"] == "ingest_apply"]
         self.assertEqual(len(plan_tasks), 2)
         self.assertEqual(len(apply_tasks), 2)
+        # La barrière de groupe attend la fin de TOUTE l'analyse parallèle.
         self.assertTrue(all(task["dependsOnGroup"] == "ingest" for task in apply_tasks))
+        # Chaque apply ne dépend que de son propre plan. Les enchaîner les uns
+        # aux autres était une ceinture par-dessus des bretelles : un apply
+        # ignoré parce que son plan a échoué faisait hériter la même
+        # impossibilité à tous les suivants, et un seul fichier illisible
+        # laissait neuf fichiers valides non écrits.
         self.assertEqual(apply_tasks[0]["dependsOn"], [plan_tasks[0]["id"]])
-        self.assertEqual(
-            apply_tasks[1]["dependsOn"],
-            [plan_tasks[1]["id"], apply_tasks[0]["id"]],
+        self.assertEqual(apply_tasks[1]["dependsOn"], [plan_tasks[1]["id"]])
+        # La sérialisation des écritures reste garantie, mais par le verrou :
+        # deux apply ne peuvent pas détenir workspace-write en même temps.
+        for task in apply_tasks:
+            self.assertIn("workspace-write", task["locks"])
+
+    def test_a_failed_analysis_does_not_strand_the_other_applies(self):
+        """A skipped apply must not take its siblings down with it.
+
+        Observed 2026-08-04: ten sources, nine analyzed, one producing
+        malformed JSON. The applies were chained, so the apply of the failed
+        source blocked every apply behind it and nine valid files were never
+        written. Each apply now depends on its own analysis only.
+        """
+        pending = self.workspace / "raw" / "untracked"
+        pending.mkdir(parents=True)
+        for name in ("a.md", "b.md", "c.md"):
+            (pending / name).write_text(f"# {name}\n", encoding="utf-8")
+
+        fragment = self.payload(
+            self.server._tool_agent_plan(
+                {
+                    "capability": "knowledge.update",
+                    "operation": "ingest",
+                    "workspace": {"revision": "rev-partial-ingest"},
+                    "arguments": {},
+                    "constraints": {"maxConcurrency": 3},
+                }
+            )
         )
+        plan_tasks = [task for task in fragment["tasks"] if task["operation"] == "ingest_plan"]
+        apply_tasks = [task for task in fragment["tasks"] if task["operation"] == "ingest_apply"]
+        self.assertEqual(len(plan_tasks), 3)
+        self.assertEqual(len(apply_tasks), 3)
+
+        apply_ids = {task["id"] for task in apply_tasks}
+        for apply_task, plan_task in zip(apply_tasks, plan_tasks, strict=True):
+            # No apply references another apply: whichever analysis fails, only
+            # its own apply becomes impossible.
+            self.assertEqual(apply_task["dependsOn"], [plan_task["id"]])
+            self.assertFalse(apply_ids.intersection(apply_task["dependsOn"]))
+
+        # Writes stay strictly serialized, by the lock rather than by the DAG.
+        self.assertTrue(all("workspace-write" in task["locks"] for task in apply_tasks))
+        # And every apply still waits for the whole analysis group, so no write
+        # starts while a read lock is still held.
+        self.assertTrue(all(task["dependsOnGroup"] == "ingest" for task in apply_tasks))
 
     def test_agent_plan_aggregates_when_max_tasks_is_exceeded(self):
         (self.workspace / "templates" / "a.md").write_text("# A\n", encoding="utf-8")
