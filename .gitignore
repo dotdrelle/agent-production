@@ -6,3 +6,9 @@
 __pycache__/
 *.py[cod]
 .pytest_cache/
+
+# Workspace LLM configuration: carries llm.apiKey and mcp.accessKey.
+.wikirc*
+
+# Artefacts FUSE : fichier remplacé alors qu'un processus le tenait ouvert.
+.fuse_hidden*
