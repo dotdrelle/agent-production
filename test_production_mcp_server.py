@@ -214,7 +214,7 @@ class ProductionMcpServerTest(unittest.TestCase):
         self.assertIn("maxConcurrency", description["limits"])
 
         capabilities = {item["id"]: item for item in description["capabilities"]}
-        self.assertEqual(capabilities["knowledge.update"]["supportedOperations"], ["ingest", "ingest_plan", "ingest_apply"])
+        self.assertEqual(capabilities["knowledge.update"]["supportedOperations"], ["ingest", "ingest_plan", "ingest_apply", "taxonomy"])
         self.assertEqual(capabilities["document.build"]["supportedOperations"], ["build"])
         self.assertEqual(capabilities["document.publish"]["supportedOperations"], ["export", "polish"])
         self.assertEqual(capabilities["workspace.diagnose"]["supportedOperations"], ["doctor"])
@@ -501,12 +501,15 @@ class ProductionMcpServerTest(unittest.TestCase):
         self.assertEqual(fragment["capability"], "knowledge.update")
         self.assertEqual(
             [task["operation"] for task in fragment["tasks"]],
-            ["ingest_plan", "ingest_plan", "ingest_apply", "ingest_apply"],
+            ["ingest_plan", "ingest_plan", "ingest_apply", "ingest_apply", "taxonomy"],
         )
         self.assertNotIn("export", [task["operation"] for task in fragment["tasks"]])
         self.assertEqual(fragment["groups"][0]["id"], "ingest")
         self.assertEqual(fragment["groups"][0]["recommendedConcurrency"], 2)
-        apply_tasks = fragment["tasks"][2:]
+        apply_tasks = [task for task in fragment["tasks"] if task["operation"] == "ingest_apply"]
+        taxonomy_tasks = [task for task in fragment["tasks"] if task["operation"] == "taxonomy"]
+        self.assertEqual(len(taxonomy_tasks), 1)
+        self.assertEqual(taxonomy_tasks[0]["dependsOn"], [task["id"] for task in apply_tasks])
         self.assertTrue(all(task["barrier"] for task in apply_tasks))
         # The write lock conflicts with both applies and still-running planning
         # read locks: wait for the whole ingest group, and let the lock — not a
@@ -540,6 +543,62 @@ class ProductionMcpServerTest(unittest.TestCase):
         self.assertTrue(all(task["retryPolicy"]["maxAttempts"] == 3 for task in fragment["tasks"]))
         self.assertTrue(all("execution_failed" in task["retryPolicy"]["retryableErrors"] for task in fragment["tasks"]))
 
+
+    def test_parallel_ingest_drops_taxonomy_when_depth_budget_forbids_it(self):
+        # The sequential branch refuses the taxonomy task when the caller's
+        # budget cannot represent it, and says so. This branch appended it
+        # unconditionally and — unlike the pipeline path — never passes through
+        # `_aggregate_if_needed`, so nothing downstream caught the overflow: a
+        # caller asking for two levels received three.
+        (self.workspace / "raw" / "untracked").mkdir(parents=True)
+        (self.workspace / "raw" / "untracked" / "a.md").write_text("# A\n", encoding="utf-8")
+        (self.workspace / "raw" / "untracked" / "b.md").write_text("# B\n", encoding="utf-8")
+
+        fragment = self.payload(
+            self.server._tool_agent_plan(
+                {
+                    "capability": "knowledge.update",
+                    "operation": "ingest",
+                    "workspace": {"revision": "rev-1"},
+                    "constraints": {"maxDepth": 2},
+                }
+            )
+        )
+
+        operations = [task["operation"] for task in fragment["tasks"]]
+        self.assertNotIn("taxonomy", operations)
+        # The promise must match the plan, or the orchestrator waits forever on
+        # an output nothing produces.
+        self.assertNotIn(
+            {"type": "directory", "ref": ".wiki/graph"}, fragment["expectedOutputs"]
+        )
+        self.assertTrue(
+            any(
+                "Taxonomy synthesis was omitted" in line
+                for line in fragment["summary"]["initialSynthesis"]
+            ),
+            fragment["summary"]["initialSynthesis"],
+        )
+
+    def test_parallel_ingest_drops_taxonomy_when_task_budget_forbids_it(self):
+        (self.workspace / "raw" / "untracked").mkdir(parents=True)
+        (self.workspace / "raw" / "untracked" / "a.md").write_text("# A\n", encoding="utf-8")
+        (self.workspace / "raw" / "untracked" / "b.md").write_text("# B\n", encoding="utf-8")
+
+        fragment = self.payload(
+            self.server._tool_agent_plan(
+                {
+                    "capability": "knowledge.update",
+                    "operation": "ingest",
+                    "workspace": {"revision": "rev-1"},
+                    # Two sources: two plans + two applies already fill the budget.
+                    "constraints": {"maxTasks": 4},
+                }
+            )
+        )
+
+        self.assertNotIn("taxonomy", [task["operation"] for task in fragment["tasks"]])
+        self.assertLessEqual(len(fragment["tasks"]), 4)
     def test_agent_status_preserves_detailed_build_progress(self):
         job = {
             "jobId": "job-build",
@@ -586,6 +645,28 @@ class ProductionMcpServerTest(unittest.TestCase):
         self.assert_task_graph_fragment(fragment)
         self.assertEqual(fragment["tasks"], [])
         self.assertIn("No Markdown files", fragment["summary"]["initialSynthesis"][0])
+
+    def test_agent_plan_taxonomy_creates_one_workspace_barrier(self):
+        fragment = self.payload(
+            self.server._tool_agent_plan(
+                {
+                    "capability": "knowledge.update",
+                    "operation": "taxonomy",
+                    "workspace": {"revision": "rev-taxonomy"},
+                    "constraints": {"requireApprovalForMutations": True},
+                }
+            )
+        )
+
+        self.assert_task_graph_fragment(fragment)
+        self.assertEqual(len(fragment["tasks"]), 1)
+        task = fragment["tasks"][0]
+        self.assertEqual(task["operation"], "taxonomy")
+        self.assertEqual(task["dependsOn"], [])
+        self.assertTrue(task["barrier"])
+        self.assertTrue(task["requiresApproval"])
+        self.assertIn("workspace-write", task["locks"])
+        self.assertEqual(fragment["expectedOutputs"], [{"type": "directory", "ref": ".wiki/graph"}])
 
     def test_agent_plan_build_creates_one_task_per_template(self):
         (self.workspace / "templates" / "a.md").write_text("---\noutput: alpha.md\n---\n# A\n", encoding="utf-8")
@@ -652,11 +733,11 @@ class ProductionMcpServerTest(unittest.TestCase):
 
         self.assert_task_graph_fragment(fragment)
         operations = [task["operation"] for task in fragment["tasks"]]
-        self.assertEqual(operations, ["ingest_plan", "ingest_apply", "build", "export", "polish"])
+        self.assertEqual(operations, ["ingest_plan", "ingest_apply", "taxonomy", "build", "export", "polish"])
         build = next(task for task in fragment["tasks"] if task["operation"] == "build")
         export = next(task for task in fragment["tasks"] if task["operation"] == "export")
         polish = next(task for task in fragment["tasks"] if task["operation"] == "polish")
-        self.assertIn("ingest-apply", build["dependsOn"])
+        self.assertIn("taxonomy-synthesis", build["dependsOn"])
         self.assertIn(build["id"], export["dependsOn"])
         self.assertIn(export["id"], polish["dependsOn"])
         self.assertEqual(export["inputRefs"][0]["ref"], "deliverables/report.md")
@@ -679,7 +760,7 @@ class ProductionMcpServerTest(unittest.TestCase):
 
         self.assert_task_graph_fragment(fragment)
         operations = [task["operation"] for task in fragment["tasks"]]
-        self.assertEqual(operations, ["ingest_plan", "ingest_apply"])
+        self.assertEqual(operations, ["ingest_plan", "ingest_apply", "taxonomy"])
         self.assertNotIn("build", operations)
         self.assertNotIn("export", operations)
 

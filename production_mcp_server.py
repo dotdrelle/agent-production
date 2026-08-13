@@ -73,7 +73,7 @@ _IMPORTS = os.environ.get("WIKI_IMPORTS", "")
 _IMPORT_PATH_MAPPINGS = os.environ.get("PRODUCTION_IMPORT_PATH_MAPPINGS", "")
 _ALLOWED_STEPS = {
     item.strip()
-    for item in os.environ.get("PRODUCTION_ALLOWED_STEPS", "doctor,copy,ingest,ingest_plan,ingest_apply,build,export,polish,restore,pipeline").split(",")
+    for item in os.environ.get("PRODUCTION_ALLOWED_STEPS", "doctor,copy,ingest,ingest_plan,ingest_apply,taxonomy,build,export,polish,restore,pipeline").split(",")
     if item.strip()
 }
 _REQUIRE_CONFIRMATION = os.environ.get("PRODUCTION_REQUIRE_CONFIRMATION", "true").lower() not in {"0", "false", "no"}
@@ -88,14 +88,15 @@ _STEP_COMMANDS: dict[str, list[str]] = {
     "ingest": ["node", _WIKI_BIN, "ingest"],
     "ingest_plan": ["node", _WIKI_BIN, "ingest", "--plan-only"],
     "ingest_apply": ["node", _WIKI_BIN, "ingest", "--apply"],
+    "taxonomy": ["node", _WIKI_BIN, "taxonomy", "--apply"],
     "build": ["node", _WIKI_BIN, "build"],
     "export": ["node", _WIKI_BIN, "export"],
     "polish": ["node", _WIKI_BIN, "export", "--polish"],
     "restore": ["node", _WIKI_BIN, "restore"],
 }
-_MUTATING_STEPS = {"copy", "ingest", "ingest_plan", "ingest_apply", "build", "export", "polish", "restore", "pipeline"}
+_MUTATING_STEPS = {"copy", "ingest", "ingest_plan", "ingest_apply", "taxonomy", "build", "export", "polish", "restore", "pipeline"}
 _CAPABILITY_STEP_MAP: dict[str, list[str]] = {
-    "knowledge.update": ["ingest", "ingest_plan", "ingest_apply"],
+    "knowledge.update": ["ingest", "ingest_plan", "ingest_apply", "taxonomy"],
     "document.build": ["build"],
     "document.publish": ["export", "polish"],
     "workspace.diagnose": ["doctor"],
@@ -107,6 +108,7 @@ _AGENT_OPERATION_TRANSLATION: dict[str, dict[str, Any]] = {
     "ingest": {"type": "ingest"},
     "ingest_plan": {"type": "ingest_plan"},
     "ingest_apply": {"type": "ingest_apply"},
+    "taxonomy": {"type": "taxonomy"},
     "build": {"type": "build"},
     "export": {"type": "export"},
     "polish": {"type": "polish"},
@@ -1146,11 +1148,11 @@ async def list_tools() -> list[Tool]:
                 "properties": {
                     "type": {
                         "type": "string",
-                        "enum": ["doctor", "copy", "ingest", "ingest_plan", "ingest_apply", "build", "export", "polish", "restore", "pipeline"],
+                        "enum": ["doctor", "copy", "ingest", "ingest_plan", "ingest_apply", "taxonomy", "build", "export", "polish", "restore", "pipeline"],
                     },
                     "steps": {
                         "type": "array",
-                        "items": {"type": "string", "enum": ["doctor", "copy", "ingest", "ingest_plan", "ingest_apply", "build", "export", "polish", "restore"]},
+                        "items": {"type": "string", "enum": ["doctor", "copy", "ingest", "ingest_plan", "ingest_apply", "taxonomy", "build", "export", "polish", "restore"]},
                         "description": "Required for type=pipeline. Ordered steps to run.",
                     },
                     "templates": {
@@ -1715,7 +1717,7 @@ def _plan_capability_operation(args: dict[str, Any]) -> tuple[str, str]:
         operation = legacy_type
 
     if not capability:
-        if operation in {"ingest", "ingest_plan", "ingest_apply"} or "ingest" in objective:
+        if operation in {"ingest", "ingest_plan", "ingest_apply", "taxonomy"} or "ingest" in objective or "taxonomy" in objective:
             capability = "knowledge.update"
         elif operation == "build" or "build" in objective or "document" in objective:
             capability = "document.build"
@@ -1744,7 +1746,7 @@ def _plan_capability_operation(args: dict[str, Any]) -> tuple[str, str]:
 
     if capability not in _CAPABILITY_STEP_MAP:
         raise ValueError("agent_plan requires a supported capability.")
-    if operation and operation not in {"ingest", "ingest_plan", "ingest_apply", "build", "export", "polish", "restore", "pipeline"}:
+    if operation and operation not in {"ingest", "ingest_plan", "ingest_apply", "taxonomy", "build", "export", "polish", "restore", "pipeline"}:
         raise ValueError(f"Unsupported planning operation: {operation}")
     if operation == "ingest_plan":
         operation = "ingest"
@@ -1779,8 +1781,35 @@ def _plan_knowledge_update(
     constraints: dict[str, Any],
     workspace_revision: str,
 ) -> dict[str, Any]:
-    if operation not in {"ingest", "ingest_apply"}:
+    if operation not in {"ingest", "ingest_apply", "taxonomy"}:
         raise ValueError(f"knowledge.update cannot plan operation: {operation}")
+    if operation == "taxonomy":
+        if "taxonomy" not in _ALLOWED_STEPS:
+            raise ValueError("taxonomy is not allowed by PRODUCTION_ALLOWED_STEPS.")
+        task = _planned_task(
+            "taxonomy-synthesis",
+            "Synthesize graph taxonomy",
+            "knowledge.update",
+            "taxonomy",
+            {},
+            [],
+            False,
+            [{"type": "directory", "ref": "wiki"}],
+            [{"type": "directory", "ref": ".wiki/graph"}],
+            _job_lock_scopes(["taxonomy"], [], [], []),
+            constraints,
+            workspace_revision,
+            barrier=True,
+            progress_weight=1,
+        )
+        return _fragment(
+            "knowledge.update",
+            "Synthesize graph taxonomy",
+            ["The current wiki corpus will be synthesized into semantic domains."],
+            [],
+            [task],
+            task["expectedOutputRefs"],
+        )
     if "ingest" not in _ALLOWED_STEPS:
         raise ValueError("ingest is not allowed by PRODUCTION_ALLOWED_STEPS.")
     files = _resolve_plan_files(request_args.get("inputs"), "raw/untracked", default_scan=True)
@@ -1815,7 +1844,31 @@ def _plan_knowledge_update(
             workspace_revision,
             progress_weight=len(files),
         )
-        return _fragment("knowledge.update", "Update knowledge", [f"{len(files)} source file(s) will be ingested as one aggregated task."], [], [task], task["expectedOutputRefs"])
+        tasks = [task]
+        expected = task["expectedOutputRefs"]
+        synthesis = [f"{len(files)} source file(s) will be ingested as one aggregated task."]
+        if "taxonomy" in _ALLOWED_STEPS and (max_depth is None or max_depth >= 2) and (max_tasks is None or max_tasks >= 2):
+            taxonomy = _planned_task(
+                "taxonomy-synthesis",
+                "Synthesize graph taxonomy",
+                "knowledge.update",
+                "taxonomy",
+                {},
+                [task["id"]],
+                False,
+                [{"type": "directory", "ref": "wiki"}],
+                [{"type": "directory", "ref": ".wiki/graph"}],
+                _job_lock_scopes(["taxonomy"], [], [], []),
+                constraints,
+                workspace_revision,
+                barrier=True,
+                progress_weight=max(1, len(files) / 4),
+            )
+            tasks.append(taxonomy)
+            expected = [{"type": "directory", "ref": "wiki"}, {"type": "directory", "ref": ".wiki/graph"}]
+        elif "taxonomy" in _ALLOWED_STEPS:
+            synthesis.append("Taxonomy synthesis was omitted because the requested plan depth or task limit cannot represent it safely.")
+        return _fragment("knowledge.update", "Update knowledge", synthesis, [], tasks, expected)
 
     aggregate_ingest = max_tasks is not None and len(files) + 1 > max_tasks
     ingest_group = {
@@ -1878,6 +1931,9 @@ def _plan_knowledge_update(
             )
 
     apply_allowed = "ingest_apply" in _ALLOWED_STEPS
+    # Declared before the branch: the expected-output list below reads it even
+    # when the apply phase is not allowlisted at all.
+    taxonomy_planned = False
     if apply_allowed:
         plan_tasks = list(tasks)
         if aggregate_ingest:
@@ -1929,12 +1985,60 @@ def _plan_knowledge_update(
                 )
             )
 
+        # Une seule synthèse globale, après TOUTES les écritures. Elle classe
+        # des familles condensées ; elle ne déclenche jamais un appel par page.
+        # Dépendre de chaque apply garantit qu'un corpus partiel n'est pas
+        # présenté comme la taxonomie finale et qu'un apply en échec bloque la
+        # synthèse au lieu de publier par-dessus un wiki incomplet.
+        # The budget must be honoured on THIS path too.
+        #
+        # The sequential branch above refuses the taxonomy task when the caller's
+        # maxTasks/maxDepth cannot represent it, and says so. This branch simply
+        # appended it, and — unlike the pipeline path — never passes through
+        # `_aggregate_if_needed`, so nothing downstream caught the overflow. A
+        # caller asking for a two-level plan received a three-level one:
+        # ingest_plan -> ingest_apply -> taxonomy.
+        taxonomy_fits = (
+            (max_depth is None or max_depth >= 3)
+            and (max_tasks is None or len(tasks) + 1 <= max_tasks)
+        )
+        taxonomy_planned = "taxonomy" in _ALLOWED_STEPS and taxonomy_fits
+        if taxonomy_planned:
+            apply_ids = [spec[0] for spec in apply_specs]
+            tasks.append(
+                _planned_task(
+                    "taxonomy-synthesis",
+                    "Synthesize graph taxonomy",
+                    "knowledge.update",
+                    "taxonomy",
+                    {},
+                    apply_ids,
+                    False,
+                    [{"type": "directory", "ref": "wiki"}],
+                    [{"type": "directory", "ref": ".wiki/graph"}],
+                    _job_lock_scopes(["taxonomy"], [], [], []),
+                    constraints,
+                    workspace_revision,
+                    barrier=True,
+                    progress_weight=max(1, len(files) / 4),
+                )
+            )
+
     synthesis = [f"{len(files)} source file(s) resolved from raw/untracked."]
     if aggregate_ingest:
         synthesis.append("Source analysis was aggregated into one task to satisfy maxTasks.")
     if not apply_allowed:
         synthesis.append("ingest_apply is not allowlisted; the apply barrier was omitted.")
-    expected = [{"type": "directory", "ref": "wiki"}] if apply_allowed else plan_refs
+    if apply_allowed and "taxonomy" in _ALLOWED_STEPS and not taxonomy_planned:
+        synthesis.append(
+            "Taxonomy synthesis was omitted because the requested plan depth or task limit cannot represent it safely."
+        )
+    # The promise must match the plan: announcing `.wiki/graph` while the
+    # taxonomy task was dropped would have the orchestrator wait on an output
+    # nothing produces.
+    expected = ([{"type": "directory", "ref": "wiki"}, {"type": "directory", "ref": ".wiki/graph"}]
+                if apply_allowed and taxonomy_planned
+                else [{"type": "directory", "ref": "wiki"}] if apply_allowed else plan_refs)
     return _fragment("knowledge.update", "Update knowledge", synthesis, [ingest_group], tasks, expected)
 
 
@@ -2510,11 +2614,11 @@ def _resolve_steps(job_type: str, raw_steps: Any) -> list[str]:
         if not isinstance(raw_steps, list) or not raw_steps:
             return ["ingest", "build", "export", "polish"]
         steps = [str(item).strip() for item in raw_steps if str(item).strip()]
-    elif job_type in {"doctor", "copy", "ingest", "ingest_plan", "ingest_apply", "build", "export", "polish", "restore"}:
+    elif job_type in {"doctor", "copy", "ingest", "ingest_plan", "ingest_apply", "taxonomy", "build", "export", "polish", "restore"}:
         steps = [job_type]
     else:
         raise ValueError(f"Unknown production job type: {job_type}")
-    invalid = [step for step in steps if step not in {"doctor", "copy", "ingest", "ingest_plan", "ingest_apply", "build", "export", "polish", "restore"}]
+    invalid = [step for step in steps if step not in {"doctor", "copy", "ingest", "ingest_plan", "ingest_apply", "taxonomy", "build", "export", "polish", "restore"}]
     if invalid:
         raise ValueError(f"Unknown production step: {invalid[0]}")
     return steps
@@ -2579,7 +2683,7 @@ def _job_lock_scopes(
     deliverables: list[str],
 ) -> list[str]:
     scopes: set[str] = set()
-    if any(step in {"copy", "ingest", "ingest_apply", "restore"} for step in steps):
+    if any(step in {"copy", "ingest", "ingest_apply", "taxonomy", "restore"} for step in steps):
         scopes.add("workspace-write")
     if "build" in steps:
         if templates:
