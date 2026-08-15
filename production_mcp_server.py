@@ -266,10 +266,14 @@ def _agent_start_job_args(args: dict[str, Any], workspace: dict[str, Any]) -> di
             job_args[target_key] = arguments[source_key]
     if args.get("taskId") and not job_args.get("callerLabel"):
         job_args["callerLabel"] = str(args["taskId"])
+    # Confirmation must be EXPLICIT: the review decision is to harden this
+    # path (B3). A caller that omits confirm must NOT silently get one —
+    # otherwise a misbehaving orchestrator (one that never asks the user)
+    # would sail through the _REQUIRE_CONFIRMATION gate that _tool_start_job
+    # enforces. Only an approved task (Donna passes confirm=true after the
+    # run-scope approval) may run a mutating operation.
     if "confirm" in arguments:
         job_args["confirm"] = bool(arguments["confirm"])
-    else:
-        job_args["confirm"] = True
     if args.get("idempotencyKey"):
         job_args["idempotencyKey"] = str(args["idempotencyKey"])
     if args.get("runId"):
@@ -1354,12 +1358,21 @@ def _agent_capability_status(args: dict[str, Any]) -> dict[str, Any]:
     if capability != "knowledge.update" or operation != "ingest":
         raise ValueError(f"Input discovery is not supported for {capability or 'missing capability'}/{operation or 'missing operation'}.")
     files = _resolve_plan_files(None, "raw/untracked", default_scan=True)
+    # D3 : un lot VIDE est un état explicite, jamais un succès sans plan.
+    # Les deux autorités de scan (`_resolve_plan_files` ici, le scan du moteur
+    # dans raw/untracked) sont équivalentes, et l'agent passe explicitement
+    # ses inputs au moteur — mais une divergence passerait sinon pour « rien à
+    # planifier » sans que personne ne le dise. `noPending` rend cet état
+    # lisible par l'orchestrateur, qui ne peut plus le confondre avec un plan
+    # réussi. Le schéma manager du capability-status accepte ce champ
+    # supplémentaire (additionalProperties: true).
     return {
         "contractVersion": "1",
         "agentInstanceId": _AGENT_INSTANCE_ID,
         "capability": capability,
         "operation": operation,
         "available": _WORKSPACE_PATH.exists(),
+        "noPending": len(files) == 0,
         "pendingInputs": [
             {
                 "type": "file",
@@ -1520,7 +1533,13 @@ async def _tool_start_job(args: dict[str, Any], workspace_name_override: str | N
                 dry_run=True,
             ),
         })
-    if _REQUIRE_CONFIRMATION and not confirm and any(step in _MUTATING_STEPS for step in steps):
+    # The confirmation gate guards REAL writes. A dry-run (executeDryRun)
+    # validates an operation without writing anything, so it does not need the
+    # user's approval — the preview/dry-run path is already exempt, and this
+    # keeps agent-side restore validation (used pre-approval by the runtime)
+    # usable while still refusing every actual mutating write that reaches us
+    # without an explicit confirm (B3).
+    if _REQUIRE_CONFIRMATION and not confirm and not execute_dry_run and any(step in _MUTATING_STEPS for step in steps):
         raise ValueError("Production jobs require confirm=true after explicit user approval.")
 
     active = _conflicting_lock(lock_scopes)
@@ -2452,8 +2471,15 @@ def _file_refs(paths: list[str]) -> list[dict[str, Any]]:
 
 
 def _ingest_plan_ref(paths: list[str]) -> dict[str, Any]:
-    digest = hashlib.sha256("\n".join(paths).encode("utf-8")).hexdigest()[:16]
-    return {"type": "file", "ref": f".wiki/ingest-plans/{digest}.json", "label": "ingest plan"}
+    # Deterministic plan ref that the engine (writeIngestPlan in
+    # llm-wiki/src/commands/ingest.ts) reproduces exactly:
+    # ingest-{sha256(sorted paths \n-joined)[:16]}.json. The paths are sorted
+    # on BOTH sides so a given input set always maps to the same plan file
+    # (D1/D2), and the ingest- prefix is part of the shared name. A retried
+    # ingest_plan for the same inputs reuses the stable artifact instead of
+    # paying for a fresh timestamped extraction (B1).
+    digest = hashlib.sha256("\n".join(sorted(paths)).encode("utf-8")).hexdigest()[:16]
+    return {"type": "file", "ref": f".wiki/ingest-plans/ingest-{digest}.json", "label": "ingest plan"}
 
 
 def _idempotency_key(

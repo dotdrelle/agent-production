@@ -96,6 +96,13 @@ def load_module(workspace, env=None):
 
 
 class ProductionMcpServerTest(unittest.TestCase):
+    # A minimal pending-task stand-in. _active_lock_for_path() only inspects
+    # .done(); a real asyncio.Future would need a current event loop in the
+    # threaded test runner, so this fake keeps lock holders "active" without
+    # messing with loops (D4 verification).
+    class _FakePendingTask:
+        def done(self):
+            return False
     def test_ingest_progress_advances_between_source_start_and_completion(self):
         progress = self.server._parse_trace_progress
         trace = self.workspace / "trace.log"
@@ -474,6 +481,31 @@ class ProductionMcpServerTest(unittest.TestCase):
             ["raw/untracked/b.md", "raw/untracked/nested/a.md"],
         )
         self.assertEqual(status["pendingInputs"][0]["mediaType"], "text/markdown")
+
+    def test_agent_status_no_pending_is_an_explicit_state_when_scan_is_empty(self):
+        # D3 : un lot VIDE ne doit jamais passer pour un succès sans plan.
+        # L'orchestrateur lit `noPending` pour distinguer « rien à faire »
+        # d'un plan réellement produit.
+        status = self.payload(self.server._tool_agent_status({
+            "capability": "knowledge.update",
+            "operation": "ingest",
+        }))
+
+        self.assertTrue(status["noPending"])
+        self.assertEqual(status["pendingInputs"], [])
+        self.assertTrue(status["available"])
+
+    def test_agent_status_no_pending_is_false_when_files_exist(self):
+        (self.workspace / "raw" / "untracked").mkdir(parents=True)
+        (self.workspace / "raw" / "untracked" / "a.md").write_text("# A\n", encoding="utf-8")
+
+        status = self.payload(self.server._tool_agent_status({
+            "capability": "knowledge.update",
+            "operation": "ingest",
+        }))
+
+        self.assertFalse(status["noPending"])
+        self.assertEqual([item["ref"] for item in status["pendingInputs"]], ["raw/untracked/a.md"])
 
     def test_agent_status_keeps_job_status_schema_and_rejects_unknown_discovery(self):
         schema = self.server._agent_status_input_schema()
@@ -1243,6 +1275,81 @@ class ProductionMcpServerTest(unittest.TestCase):
         self.assertNotIn("abc123", masked)
         self.assertNotIn("runtime", masked)
         self.assertNotIn("secret", masked)
+
+    def test_lock_model_conflicts_are_symmetric_between_read_and_workspace_write(self):
+        # D4 : le réseau de verrous est volontairement asymétrique en sévérité
+        # (workspace-write exclut TOUT, même la lecture), mais SYMÉTRIQUE dans
+        # la détection : qu'on soit le candidat read ou le candidat write, le
+        # croisement read/write est vu comme un conflit. C'est l'architecture
+        # voulue que l'industrialisation multi-utilisateur pose en fondation.
+        self._run_with_active_locks(
+            active_scopes={
+                # A write job first: both a write candidate and a read
+                # candidate must see it as a conflict.
+                "job-write-A": ["workspace-write"],
+            },
+            body=lambda: self._assert_lock_symmetry_scenario(),
+        )
+
+    def _assert_lock_symmetry_scenario(self):
+        write_lock = self.server._conflicting_lock(["workspace-write"])
+        self.assertIsNotNone(write_lock)
+        self.assertEqual(write_lock.get("jobId"), "job-write-A")
+
+        # Cross detection symmetric: a read candidate ALSO conflicts with the
+        # write holder, not just another write.
+        read_vs_write = self.server._conflicting_lock(["read"])
+        self.assertIsNotNone(read_vs_write)
+        self.assertEqual(read_vs_write.get("jobId"), "job-write-A")
+
+        # Writing job is done; drop its lock so only the read scope remains.
+        self.server._ACTIVE_TASKS.pop("job-write-A", None)
+        self.server._clear_locks("job-write-A")
+
+        # A read lock is per-holder: a second read does NOT conflict, but a
+        # write candidate still does.
+        self.server._create_locks("job-read-B", ["read"])
+        self.server._ACTIVE_TASKS["job-read-B"] = self._FakePendingTask()
+        self.assertIsNone(self.server._conflicting_lock(["read"]))
+        write_vs_read = self.server._conflicting_lock(["workspace-write"])
+        self.assertIsNotNone(write_vs_read)
+        self.assertEqual(write_vs_read.get("jobId"), "job-read-B")
+
+        self.server._ACTIVE_TASKS.pop("job-read-B", None)
+        self.server._clear_locks("job-read-B")
+
+    def test_lock_model_is_isolated_per_workspace(self):
+        # D4 : chaque agent scoped ses verrous par workspace (_WORKSPACE_NAME
+        # dans le répertoire de locks), donc un run d'un workspace ne peut pas
+        # voir ni bloquer le lock d'un autre workspace. Le multi-utilisateur
+        # repose là-dessus : l'isolation est structurelle, pas portée par un
+        # lock global.
+        other = load_module(
+            self.workspace,
+            {"WORKSPACE_NAME": "other-workspace", "WIKI_WORKSPACE_PATH": str(self.workspace)},
+        )
+
+        self._run_with_active_locks(
+            active_scopes={"job-W1": ["workspace-write"]},
+            body=lambda: self.assertIsNone(
+                other._conflicting_lock(["workspace-write"])
+            ),
+        )
+
+    def _run_with_active_locks(self, active_scopes, body):
+        # D4 verification needs locks whose holder looks "active" to
+        # _active_lock_for_path (a pending task whose .done() is False). Use
+        # the class-level fake so no real event loop is required in the main
+        # thread (Python 3.13 raises otherwise under the unittest runner).
+        for job_id, scopes in active_scopes.items():
+            self.server._create_locks(job_id, scopes)
+            self.server._ACTIVE_TASKS[job_id] = self._FakePendingTask()
+        try:
+            body()
+        finally:
+            for job_id, _scopes in active_scopes.items():
+                self.server._ACTIVE_TASKS.pop(job_id, None)
+                self.server._clear_locks(job_id)
 
     def test_read_scope_cannot_start_or_cancel_job(self):
         token = self.server._CURRENT_SCOPES.set({"read"})
