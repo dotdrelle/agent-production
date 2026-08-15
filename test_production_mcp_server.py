@@ -1202,6 +1202,24 @@ class ProductionMcpServerTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "confirm=true"):
             asyncio.run(self.server._tool_start_job({"type": "build"}))
 
+    def test_string_false_does_not_bypass_confirmation(self):
+        # bool("false") is True in Python; a caller that serializes the flag as
+        # a string must not be able to slip past the confirmation gate.
+        with self.assertRaisesRegex(ValueError, "confirm=true"):
+            asyncio.run(self.server._tool_start_job({"type": "build", "confirm": "false"}))
+
+    def test_parse_bool_maps_strings_and_rejects_garbage(self):
+        self.assertIs(self.server._parse_bool(True), True)
+        self.assertIs(self.server._parse_bool(False), False)
+        self.assertIs(self.server._parse_bool("true"), True)
+        self.assertIs(self.server._parse_bool("false"), False)
+        self.assertIs(self.server._parse_bool("1"), True)
+        self.assertIs(self.server._parse_bool("0"), False)
+        self.assertIs(self.server._parse_bool(None), False)
+        self.assertIs(self.server._parse_bool(None, default=True), True)
+        with self.assertRaises(ValueError):
+            self.server._parse_bool("yes please")
+
     def test_targeted_build_jobs_can_run_in_parallel_but_conflicting_export_waits(self):
         async def scenario():
             async def hold_job(_job_id):

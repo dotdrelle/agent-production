@@ -1419,8 +1419,24 @@ def _tool_status() -> list[TextContent]:
     )
 
 
+def _parse_bool(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and value in (0, 1):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "1", "yes", "on"}:
+            return True
+        if normalized in {"false", "0", "no", "off", ""}:
+            return False
+    raise ValueError(f"Expected a boolean, got: {value!r}")
+
+
 def _tool_list_templates(args: dict[str, Any]) -> list[TextContent]:
-    include_deliverables = bool(args.get("includeDeliverables", True))
+    include_deliverables = _parse_bool(args.get("includeDeliverables"), True)
     templates_dir = _WORKSPACE_PATH / "templates"
     deliverables_dir = _WORKSPACE_PATH / "deliverables"
     templates: list[dict[str, Any]] = []
@@ -1471,14 +1487,14 @@ def _tool_list_templates(args: dict[str, Any]) -> list[TextContent]:
 
 async def _tool_start_job(args: dict[str, Any], workspace_name_override: str | None = None) -> list[TextContent]:
     job_type = str(args.get("type", "")).strip()
-    preview_dry_run = bool(args.get("dryRun", False))
-    execute_dry_run = bool(args.get("executeDryRun", False))
-    confirm = bool(args.get("confirm", False))
+    preview_dry_run = _parse_bool(args.get("dryRun"), False)
+    execute_dry_run = _parse_bool(args.get("executeDryRun"), False)
+    confirm = _parse_bool(args.get("confirm"), False)
     steps = _resolve_steps(job_type, args.get("steps"))
     inputs = _expand_input_globs(_resolve_string_list(args.get("inputs"), "inputs"))
     templates = _resolve_string_list(args.get("templates"), "templates")
     deliverables = _resolve_string_list(args.get("deliverables"), "deliverables")
-    stabilize = bool(args.get("stabilize", False))
+    stabilize = _parse_bool(args.get("stabilize"), False)
     restore_file = str(args.get("restoreFile") or "").strip() or None
     restore_revision = str(args.get("restoreRevision") or "").strip() or None
     restore_run = str(args.get("restoreRun") or "").strip() or None
