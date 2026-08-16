@@ -2879,6 +2879,44 @@ def _run_copy_step(job_id: str) -> int:
     return copied
 
 
+async def _freeze_knowledge_fingerprint(job_id: str, env: dict[str, str]) -> str | None:
+    """Runs `wiki taxonomy --fingerprint` and returns the frozen fingerprint.
+
+    The taxonomy barrier freezes the knowledge corpus fingerprint right after the
+    last `ingest_apply` and the collection consolidation. The engine's
+    `--fingerprint` mode is read-only: it computes the knowledge etag without a
+    model call, so this is exactly the freeze point. Any failure here is a silent
+    skip — the apply then runs without `--expected-corpus` and the engine's
+    compare-and-swap still protects the publication.
+    """
+    command = ["node", _WIKI_BIN, "taxonomy", "--fingerprint"]
+    _append_log(job_id, f"[cmd] cwd={_WORKSPACE_PATH} {' '.join(command)}")
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *command,
+            cwd=str(_WORKSPACE_PATH),
+            env=env,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        _ACTIVE_PROCESSES[job_id] = proc
+        output, _ = await proc.communicate()
+        exit_code = await proc.wait()
+    finally:
+        _ACTIVE_PROCESSES.pop(job_id, None)
+    text = (output or b"").decode("utf-8", errors="replace").strip()
+    if exit_code != 0 or not text:
+        return None
+    # The last line carries the fingerprint; logs may precede it on a noisy run.
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    fingerprint = lines[-1] if lines else None
+    if not fingerprint or not re.fullmatch(r"[0-9a-f]{64}", fingerprint):
+        _append_log(job_id, "[taxonomy] frozen fingerprint unreadable; applying without --expected-corpus")
+        return None
+    _append_log(job_id, f"[taxonomy] frozen fingerprint={fingerprint}")
+    return fingerprint
+
+
 async def _run_cli_step(
     job_id: str,
     step: str,
@@ -2922,6 +2960,19 @@ async def _run_cli_step(
         restore_run=restore_run,
         dry_run=dry_run,
     )
+    # The taxonomy barrier freezes the knowledge fingerprint before synthesis.
+    #
+    # The engine refuses a synthesis whose frozen fingerprint no longer matches
+    # the corpus (see llm-wiki `wiki taxonomy --expected-corpus`): a concurrent
+    # write between the last apply and the taxonomy task would otherwise produce
+    # a map over a corpus the barrier never certified. We therefore read the
+    # fingerprint first — the barrier's own freeze point — and pass it back.
+    # If the freeze command fails, the apply still runs without the flag: the
+    # engine's own compare-and-swap remains the last line of defence.
+    if step == "taxonomy":
+        frozen = await _freeze_knowledge_fingerprint(job_id, env)
+        if frozen:
+            commands = [[*_STEP_COMMANDS[step], "--expected-corpus", frozen]]
     for command in commands:
         _append_log(job_id, f"[cmd] cwd={_WORKSPACE_PATH} {' '.join(command)}")
         proc = await asyncio.create_subprocess_exec(

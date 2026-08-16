@@ -432,6 +432,90 @@ class ProductionMcpServerTest(unittest.TestCase):
         self.assertEqual(captured["env"]["WIKI_CAPABILITY"], "workspace.restore")
         self.assertEqual(captured["env"]["WIKI_IDEMPOTENCY_KEY"], "restore-idem-42")
 
+    def test_taxonomy_step_freezes_fingerprint_then_applies_with_expected_corpus(self):
+        # The barrier freezes the knowledge fingerprint, then hands it back as
+        # --expected-corpus so the engine rejects a corpus that moved since.
+        captured = []
+
+        class FreezeStdout:
+            async def readline(self):
+                return b""
+            async def communicate(self):
+                return b"deadbeef" * 8 + b"\n", None
+
+        class ApplyStdout:
+            async def readline(self):
+                return b""
+            async def communicate(self):
+                return b"", None
+
+        calls = iter([
+            FreezeStdout(),   # taxonomy --fingerprint
+            ApplyStdout(),    # taxonomy --apply --expected-corpus ...
+        ])
+
+        class SuccessfulProcess:
+            stdout = None
+            def __init__(self):
+                self.stdout = next(calls)
+            async def wait(self):
+                return 0
+            async def communicate(self):
+                return await self.stdout.communicate()
+
+        async def create_subprocess_exec(*command, **kwargs):
+            captured.append(list(command))
+            return SuccessfulProcess()
+
+        self.server.asyncio.create_subprocess_exec = create_subprocess_exec
+        self.server._append_log = lambda *_args, **_kwargs: None
+
+        exit_code = asyncio.run(self.server._run_cli_step("job-1", "taxonomy", [], [], []))
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(captured[0], ["node", self.server._WIKI_BIN, "taxonomy", "--fingerprint"])
+        self.assertEqual(
+            captured[1],
+            ["node", self.server._WIKI_BIN, "taxonomy", "--apply", "--expected-corpus", "deadbeef" * 8],
+        )
+
+    def test_taxonomy_step_applies_without_flag_when_freeze_fails(self):
+        captured = []
+
+        class EmptyStdout:
+            async def readline(self):
+                return b""
+            async def communicate(self):
+                return b"", None
+
+        calls = iter([EmptyStdout(), EmptyStdout()])
+
+        class SuccessfulProcess:
+            stdout = None
+            def __init__(self):
+                self.stdout = next(calls)
+            async def wait(self):
+                return 0
+            async def communicate(self):
+                return await self.stdout.communicate()
+
+        async def create_subprocess_exec(*command, **kwargs):
+            captured.append(list(command))
+            return SuccessfulProcess()
+
+        self.server.asyncio.create_subprocess_exec = create_subprocess_exec
+        self.server._append_log = lambda *_args, **_kwargs: None
+
+        exit_code = asyncio.run(self.server._run_cli_step("job-1", "taxonomy", [], [], []))
+
+        self.assertEqual(exit_code, 0)
+        # The freeze produced no usable fingerprint: the apply runs without the
+        # flag, leaving the engine's compare-and-swap as the last defence.
+        self.assertEqual(captured, [
+            ["node", self.server._WIKI_BIN, "taxonomy", "--fingerprint"],
+            ["node", self.server._WIKI_BIN, "taxonomy", "--apply"],
+        ])
+
     def test_ingest_plan_falls_back_to_one_executable_task_when_parallel_helpers_are_disabled(self):
         server = load_module(
             self.workspace,
