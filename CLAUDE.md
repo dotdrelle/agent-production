@@ -38,6 +38,17 @@ job/result instead of starting a new one.
 
 - Never accept arbitrary shell commands. Only execute allowlisted production
   steps and the fixed command mappings in the server.
+- **`PRODUCTION_ALLOWED_STEPS` fails silently, and that is its danger.** A
+  capability is published only if at least one of its steps survives the filter
+  (`_agent_capabilities`), and `agent_plan` merely omits a disallowed task rather
+  than refusing (`"taxonomy" in _ALLOWED_STEPS`). Two consequences seen in
+  production: `taxonomy` was absent from every shipped compose default, so
+  ingests ran without the Lot 4 barrier and left the published map stale; and a
+  capability with a single step — `workspace.restore` → `restore` — disappears
+  from `agent_describe` entirely, which the orchestrator can only report much
+  later as `No agent provides capability …`. A compose always SETS the variable,
+  so the in-code default never applies under Docker: keep the two in step, and a
+  test in this repo compares them.
 - Preserve scoped production locks when changing job execution: workspace-write
   for ingest/copy/ingest_apply/pipeline, read for ingest_plan, deliverable locks
   for targeted build/export/polish.
