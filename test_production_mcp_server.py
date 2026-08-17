@@ -6,6 +6,7 @@ import sys
 import tempfile
 import time
 import types
+import re
 import unittest
 from dataclasses import dataclass
 from pathlib import Path
@@ -1468,3 +1469,37 @@ class ProductionMcpServerTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class AllowedStepDefaultsTest(unittest.TestCase):
+    """Les valeurs par defaut livrees doivent couvrir la barriere du Lot 4.
+
+    Une etape absente de PRODUCTION_ALLOWED_STEPS est ecartee du plan SANS
+    erreur : `agent_plan` teste `"taxonomy" in _ALLOWED_STEPS` et se contente de
+    ne pas ajouter la tache. Un compose qui l'oublie produit donc des
+    ingestions sans publication taxonomique, en silence.
+    """
+
+    def _allowed(self, text: str) -> set[str]:
+        match = re.search(r"PRODUCTION_ALLOWED_STEPS=\$\{PRODUCTION_ALLOWED_STEPS:-([^}]+)\}", text)
+        if match is None:
+            match = re.search(r"^PRODUCTION_ALLOWED_STEPS=(.+)$", text, re.MULTILINE)
+        self.assertIsNotNone(match, "PRODUCTION_ALLOWED_STEPS introuvable")
+        return {item.strip() for item in match.group(1).split(",") if item.strip()}
+
+    def test_compose_and_env_example_allow_taxonomy(self):
+        root = Path(__file__).resolve().parent
+        for name in ("docker-compose.yml", ".env.example"):
+            with self.subTest(file=name):
+                steps = self._allowed((root / name).read_text(encoding="utf-8"))
+                self.assertIn("taxonomy", steps)
+
+    def test_in_code_default_stays_the_reference(self):
+        # Le defaut Python est la reference : tout ce qu'il autorise doit l'etre
+        # dans le compose du depot, sinon les deux se contredisent en silence.
+        root = Path(__file__).resolve().parent
+        source = (root / "production_mcp_server.py").read_text(encoding="utf-8")
+        match = re.search(r'os\.environ\.get\(\s*"PRODUCTION_ALLOWED_STEPS",\s*"([^"]+)"', source)
+        self.assertIsNotNone(match)
+        reference = {item.strip() for item in match.group(1).split(",")}
+        compose = self._allowed((root / "docker-compose.yml").read_text(encoding="utf-8"))
+        self.assertEqual(reference - compose, set())

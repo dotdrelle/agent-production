@@ -10,7 +10,11 @@ services:
       - WIKI_CONFIG_PATH=${WIKI_CONFIG_PATH:-}
       - WIKI_IMPORTS=${WIKI_IMPORTS:-}
       - PRODUCTION_IMPORT_PATH_MAPPINGS=${PRODUCTION_IMPORT_PATH_MAPPINGS:-}
-      - PRODUCTION_ALLOWED_STEPS=${PRODUCTION_ALLOWED_STEPS:-doctor,copy,ingest,ingest_plan,ingest_apply,build,export,polish,restore,pipeline}
+      # Keep in step with the in-code default of production_mcp_server.py: a
+      # compose always SETS this variable, so the Python fallback never applies
+      # here. Omitting `taxonomy` silently dropped the taxonomy task from every
+      # ingest plan instead of failing.
+      - PRODUCTION_ALLOWED_STEPS=${PRODUCTION_ALLOWED_STEPS:-doctor,copy,ingest,ingest_plan,ingest_apply,taxonomy,build,export,polish,restore,pipeline}
       - PRODUCTION_REQUIRE_CONFIRMATION=${PRODUCTION_REQUIRE_CONFIRMATION:-true}
       # Parallelism: effective concurrency ≈ recommendedConcurrency. Intermediate
       # defaults (4/8); low profile 2/4, high profile 8/16. The LLM backend must
