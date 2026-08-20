@@ -160,6 +160,40 @@ class ProductionMcpServerTest(unittest.TestCase):
     def payload(self, result):
         return json.loads(result[0].text)
 
+    def test_plan_file_resolution_matches_bare_and_nested_template_names(self):
+        (self.workspace / "templates" / "overview").mkdir(parents=True)
+        (self.workspace / "templates" / "overview" / "proposition-presentation.md").write_text("---\n---\n")
+        (self.workspace / "templates" / "notes").mkdir(parents=True)
+        (self.workspace / "templates" / "notes" / "basic-note.md").write_text("---\n---\n")
+
+        # Bare file name reaches the nested file.
+        self.assertEqual(
+            self.server._resolve_plan_files(["proposition-presentation"], "templates"),
+            ["templates/overview/proposition-presentation.md"],
+        )
+        # A directory-qualified name without extension gets `.md` appended.
+        self.assertEqual(
+            self.server._resolve_plan_files(["overview/proposition-presentation"], "templates"),
+            ["templates/overview/proposition-presentation.md"],
+        )
+        # An exact relative path still resolves unchanged.
+        self.assertEqual(
+            self.server._resolve_plan_files(["templates/notes/basic-note.md"], "templates"),
+            ["templates/notes/basic-note.md"],
+        )
+
+    def test_plan_file_resolution_rejects_unknown_and_ambiguous_names(self):
+        (self.workspace / "templates" / "a").mkdir(parents=True)
+        (self.workspace / "templates" / "a" / "shared.md").write_text("---\n---\n")
+        (self.workspace / "templates" / "b").mkdir(parents=True)
+        (self.workspace / "templates" / "b" / "shared.md").write_text("---\n---\n")
+        with self.assertRaises(ValueError) as ctx:
+            self.server._resolve_plan_files(["missing"], "templates")
+        self.assertIn("does not exist", str(ctx.exception))
+        with self.assertRaises(ValueError) as ctx:
+            self.server._resolve_plan_files(["shared"], "templates")
+        self.assertIn("Ambiguous", str(ctx.exception))
+
     def test_shipped_allowed_step_defaults_include_restore(self):
         root = Path(__file__).parent
         for relative in ["Dockerfile", "docker-compose.yml", ".env.example", "README.md"]:

@@ -498,6 +498,12 @@ def _agent_capabilities() -> list[dict[str, Any]]:
                 "id": capability_id,
                 "version": "1",
                 "description": _capability_description(capability_id),
+                # Authoritative trigger vocabulary for the orchestrator's
+                # deterministic resolver: aliases disambiguate overloaded verbs
+                # (e.g. "export" means publish here, never a Confluence export).
+                # A new capability registers by declaring its own aliases; the
+                # manager never hardcodes this mapping.
+                "aliases": _CAPABILITY_ALIASES.get(capability_id, []),
                 "inputSchema": _capability_input_schema(capability_id, supported),
                 "outputSchema": {"type": "object", "additionalProperties": True},
                 "supportedOperations": supported,
@@ -505,6 +511,16 @@ def _agent_capabilities() -> list[dict[str, Any]]:
             }
         )
     return capabilities
+
+
+_CAPABILITY_ALIASES: dict[str, list[str]] = {
+    "knowledge.update": ["ingest", "ingestion", "ingest files", "ingest documents"],
+    "document.build": ["build", "rebuild", "generate deliverable"],
+    "document.publish": ["publish", "publish deliverable", "export deliverable"],
+    "workspace.diagnose": ["diagnose", "diagnostic", "doctor", "check config"],
+    "knowledge.pipeline": ["pipeline", "full pipeline"],
+    "workspace.restore": ["restore", "revert", "rollback"],
+}
 
 
 def _capability_description(capability_id: str) -> str:
@@ -2426,16 +2442,48 @@ def _resolve_plan_files(raw_values: Any, root: str, default_scan: bool = False) 
         if _has_glob_pattern(value):
             resolved.extend(_expand_plan_glob(value, root))
             continue
-        rel = _normalize_plan_path(value, root)
-        path = (_WORKSPACE_PATH / rel).resolve()
+        matches = _matching_plan_paths(value, root)
+        if len(matches) == 1:
+            resolved.append(matches[0])
+            continue
+        if len(matches) > 1:
+            raise ValueError(f"Ambiguous {root} target: {value} matches {len(matches)} files")
+        raise ValueError(f"{root} file does not exist: {value}")
+    return _unique_strings(resolved)
+
+
+def _matching_plan_paths(value: str, root: str) -> list[str]:
+    """Workspace-relative paths that `value` can resolve to under `root`.
+
+    All candidates are collected so an ambiguous name is reported rather than
+    silently picking one:
+    1. the exact normalized path (relative to the workspace root or `root`);
+    2. the same path with a missing `.md` extension appended;
+    3. for a bare file name (no directory separators), every file under `root`
+       whose basename matches, with or without `.md` — this is what lets a
+       skill pass `presentation` and reach `templates/overview/presentation.md`.
+    """
+    rel = _normalize_plan_path(value, root)
+    candidates = [rel]
+    if not rel.lower().endswith(".md"):
+        candidates.append(f"{rel}.md")
+    if "/" not in value and "\\" not in value:
+        name = value if value.lower().endswith(".md") else f"{value}.md"
+        base = (_WORKSPACE_PATH / root).resolve()
+        if base.is_dir():
+            candidates.extend(
+                _relative_workspace_path(p) for p in sorted(base.rglob(name)) if p.is_file()
+            )
+    matches: list[str] = []
+    for candidate in candidates:
+        path = (_WORKSPACE_PATH / candidate).resolve()
         try:
             path.relative_to(_WORKSPACE_PATH)
         except ValueError:
             raise ValueError(f"Invalid {root} path: {value}") from None
-        if not path.is_file():
-            raise ValueError(f"{root} file does not exist: {value}")
-        resolved.append(rel)
-    return _unique_strings(resolved)
+        if path.is_file():
+            matches.append(candidate)
+    return _unique_strings(matches)
 
 
 def _scan_markdown_files(root: str) -> list[str]:
