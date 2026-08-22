@@ -2480,7 +2480,27 @@ def _resolve_plan_files(raw_values: Any, root: str, default_scan: bool = False) 
     return _unique_strings(resolved)
 
 
-def _matching_plan_paths(value: str, root: str) -> list[str]:
+def _build_basename_index(root: str) -> dict[str, list[str]]:
+    """Every file under `root`, indexed by exact basename.
+
+    Built once by a caller that expects to look up several bare file names
+    against the same `root` (e.g. one token per name mentioned in an
+    objective) — a fresh index per candidate would `rglob` the same directory
+    tree once per name for no new information.
+    """
+    base = (_WORKSPACE_PATH / root).resolve()
+    index: dict[str, list[str]] = {}
+    if not base.is_dir():
+        return index
+    for path in sorted(base.rglob("*")):
+        if path.is_file():
+            index.setdefault(path.name, []).append(_relative_workspace_path(path))
+    return index
+
+
+def _matching_plan_paths(
+    value: str, root: str, basename_index: dict[str, list[str]] | None = None
+) -> list[str]:
     """Workspace-relative paths that `value` can resolve to under `root`.
 
     All candidates are collected so an ambiguous name is reported rather than
@@ -2490,6 +2510,9 @@ def _matching_plan_paths(value: str, root: str) -> list[str]:
     3. for a bare file name (no directory separators), every file under `root`
        whose basename matches, with or without `.md` — this is what lets a
        skill pass `presentation` and reach `templates/overview/presentation.md`.
+       `basename_index` (see `_build_basename_index`) serves this lookup from
+       memory when the caller already built one; otherwise it is computed here,
+       scoped to this one call, exactly as before.
     """
     rel = _normalize_plan_path(value, root)
     candidates = [rel]
@@ -2497,11 +2520,14 @@ def _matching_plan_paths(value: str, root: str) -> list[str]:
         candidates.append(f"{rel}.md")
     if "/" not in value and "\\" not in value:
         name = value if value.lower().endswith(".md") else f"{value}.md"
-        base = (_WORKSPACE_PATH / root).resolve()
-        if base.is_dir():
-            candidates.extend(
-                _relative_workspace_path(p) for p in sorted(base.rglob(name)) if p.is_file()
-            )
+        if basename_index is not None:
+            candidates.extend(basename_index.get(name, []))
+        else:
+            base = (_WORKSPACE_PATH / root).resolve()
+            if base.is_dir():
+                candidates.extend(
+                    _relative_workspace_path(p) for p in sorted(base.rglob(name)) if p.is_file()
+                )
     matches: list[str] = []
     for candidate in candidates:
         path = (_WORKSPACE_PATH / candidate).resolve()
@@ -2530,12 +2556,17 @@ def _resolve_targets_from_objective(objective: str, root: str) -> list[str]:
         return []
     resolved: list[str] = []
     seen: set[str] = set()
+    basename_index: dict[str, list[str]] | None = None
     for token in re.findall(r"[^\s,;:\"'()\[\]{}]+", text):
         candidate = token.strip(".,;:")
         if not candidate or (not candidate.endswith(".md") and "/" not in candidate):
             continue
+        if "/" not in candidate and "\\" not in candidate and basename_index is None:
+            # Built lazily, once: an objective naming no bare file (every
+            # mention is a full path) never pays for the walk at all.
+            basename_index = _build_basename_index(root)
         try:
-            for path in _matching_plan_paths(candidate, root):
+            for path in _matching_plan_paths(candidate, root, basename_index):
                 if path not in seen:
                     seen.add(path)
                     resolved.append(path)
