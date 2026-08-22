@@ -907,6 +907,20 @@ class ProductionMcpServerTest(unittest.TestCase):
         self.assert_task_graph_fragment(fragment)
         self.assertEqual([task["inputRefs"][0]["ref"] for task in fragment["tasks"]], ["templates/a.md"])
 
+    def test_matching_plan_paths_falls_back_to_rglob_for_a_glob_name_even_with_an_index(self):
+        # basename_index is an exact-string dict, not a glob: a bare name
+        # carrying *, ? or [ must still be wildcard-matched by rglob (as it was
+        # before the index existed), not silently miss because it isn't a
+        # literal key in the index.
+        (self.workspace / "templates" / "overview-a.md").write_text("# A\n", encoding="utf-8")
+        (self.workspace / "templates" / "overview-b.md").write_text("# B\n", encoding="utf-8")
+        index = self.server._build_basename_index("templates")
+        matches = self.server._matching_plan_paths("overview-*.md", "templates", index)
+        self.assertEqual(
+            sorted(matches),
+            ["templates/overview-a.md", "templates/overview-b.md"],
+        )
+
     def test_agent_plan_publish_creates_one_task_per_deliverable(self):
         (self.workspace / "deliverables" / "a.md").write_text("# A\n", encoding="utf-8")
         (self.workspace / "deliverables" / "b.md").write_text("# B\n", encoding="utf-8")

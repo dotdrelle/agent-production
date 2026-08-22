@@ -2520,7 +2520,11 @@ def _matching_plan_paths(
         candidates.append(f"{rel}.md")
     if "/" not in value and "\\" not in value:
         name = value if value.lower().endswith(".md") else f"{value}.md"
-        if basename_index is not None:
+        # basename_index is an exact-string lookup, not a glob: a name carrying
+        # `*`/`?`/`[` (rglob(name) would wildcard-match it) falls back to the
+        # direct walk below so that behavior stays identical whether or not a
+        # caller supplied an index.
+        if basename_index is not None and not _has_glob_pattern(name):
             candidates.extend(basename_index.get(name, []))
         else:
             base = (_WORKSPACE_PATH / root).resolve()
