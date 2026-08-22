@@ -1687,13 +1687,14 @@ def _agent_plan(args: dict[str, Any]) -> dict[str, Any]:
     constraints = _planning_constraints(args.get("constraints"))
     capability, operation = _plan_capability_operation(args)
     workspace_revision = _workspace_revision_from_request(args)
+    objective = str(args.get("objective") or "")
 
     if capability == "knowledge.update":
         return _plan_knowledge_update(operation, request_args, constraints, workspace_revision)
     if capability == "document.build":
-        return _plan_document_build(request_args, constraints, workspace_revision, depends_on=[])
+        return _plan_document_build(request_args, constraints, workspace_revision, depends_on=[], objective=objective)
     if capability == "document.publish":
-        return _plan_document_publish(operation, request_args, constraints, workspace_revision, depends_on=[])
+        return _plan_document_publish(operation, request_args, constraints, workspace_revision, depends_on=[], objective=objective)
     if capability == "knowledge.pipeline":
         return _plan_pipeline(request_args, constraints, workspace_revision)
     if capability == "workspace.diagnose":
@@ -1932,6 +1933,7 @@ def _plan_knowledge_update(
         "recommendedConcurrency": constraints["maxConcurrency"],
         "progressWeight": len(files),
     }
+    groups: list[dict[str, Any]] = [ingest_group]
     plan_refs: list[dict[str, Any]] = []
     tasks: list[dict[str, Any]] = []
     if aggregate_ingest:
@@ -1986,6 +1988,19 @@ def _plan_knowledge_update(
     # when the apply phase is not allowlisted at all.
     taxonomy_planned = False
     if apply_allowed:
+        # The apply phase is its own group so the taxonomy barrier can wait on
+        # the WRITES as a whole instead of on each write. A hard dependsOn on
+        # every apply meant one failed apply (whose plan failed) skipped the
+        # taxonomy, leaving the published map stale for the files that DID
+        # ingest. A group barrier waits for the group to be terminal — done OR
+        # failed OR skipped — so the taxonomy still runs on the partial corpus.
+        apply_group = {
+            "id": "apply",
+            "label": "Write to wiki",
+            "recommendedConcurrency": 1,
+            "progressWeight": len(files),
+        }
+        groups.append(apply_group)
         plan_tasks = list(tasks)
         if aggregate_ingest:
             apply_specs = [("ingest-apply", plan_tasks[0], plan_refs[0], f"{len(files)} source files", len(files), None)]
@@ -2029,6 +2044,7 @@ def _plan_knowledge_update(
                     _job_lock_scopes(["ingest_apply"], [plan_ref["ref"]], [], []),
                     constraints,
                     workspace_revision,
+                    group_id="apply",
                     depends_on_group=ingest_group["id"],
                     barrier=True,
                     progress_weight=progress_weight,
@@ -2038,9 +2054,11 @@ def _plan_knowledge_update(
 
         # Une seule synthèse globale, après TOUTES les écritures. Elle classe
         # des familles condensées ; elle ne déclenche jamais un appel par page.
-        # Dépendre de chaque apply garantit qu'un corpus partiel n'est pas
-        # présenté comme la taxonomie finale et qu'un apply en échec bloque la
-        # synthèse au lieu de publier par-dessus un wiki incomplet.
+        # Elle attend le groupe d'écriture via la barrière de groupe — donc
+        # « toutes les écritures sont terminales » — et non via une dépendance
+        # dure sur chaque apply : un apply dont le plan a échoué est skipped, et
+        # une dépendance dure aurait fait sauter la synthèse, laissant la carte
+        # publiée périmée pour les fichiers qui, eux, ont bien été ingérés.
         # The budget must be honoured on THIS path too.
         #
         # The sequential branch above refuses the taxonomy task when the caller's
@@ -2055,7 +2073,6 @@ def _plan_knowledge_update(
         )
         taxonomy_planned = "taxonomy" in _ALLOWED_STEPS and taxonomy_fits
         if taxonomy_planned:
-            apply_ids = [spec[0] for spec in apply_specs]
             tasks.append(
                 _planned_task(
                     "taxonomy-synthesis",
@@ -2063,13 +2080,14 @@ def _plan_knowledge_update(
                     "knowledge.update",
                     "taxonomy",
                     {},
-                    apply_ids,
+                    [],
                     False,
                     [{"type": "directory", "ref": "wiki"}],
                     [{"type": "directory", "ref": ".wiki/graph"}],
                     _job_lock_scopes(["taxonomy"], [], [], []),
                     constraints,
                     workspace_revision,
+                    depends_on_group="apply",
                     barrier=True,
                     progress_weight=max(1, len(files) / 4),
                 )
@@ -2090,7 +2108,7 @@ def _plan_knowledge_update(
     expected = ([{"type": "directory", "ref": "wiki"}, {"type": "directory", "ref": ".wiki/graph"}]
                 if apply_allowed and taxonomy_planned
                 else [{"type": "directory", "ref": "wiki"}] if apply_allowed else plan_refs)
-    return _fragment("knowledge.update", "Update knowledge", synthesis, [ingest_group], tasks, expected)
+    return _fragment("knowledge.update", "Update knowledge", synthesis, groups, tasks, expected)
 
 
 def _plan_document_build(
@@ -2098,10 +2116,15 @@ def _plan_document_build(
     constraints: dict[str, Any],
     workspace_revision: str,
     depends_on: list[str],
+    objective: str = "",
 ) -> dict[str, Any]:
     if "build" not in _ALLOWED_STEPS:
         raise ValueError("build is not allowed by PRODUCTION_ALLOWED_STEPS.")
-    templates = _resolve_plan_files(request_args.get("templates"), "templates", default_scan=True)
+    templates = _resolve_plan_files(request_args.get("templates"), "templates", default_scan=False)
+    if not templates:
+        templates = _resolve_targets_from_objective(objective, "templates")
+    if not templates:
+        templates = _resolve_plan_files(None, "templates", default_scan=True)
     if not templates:
         return _empty_plan(
             "document.build",
@@ -2125,12 +2148,17 @@ def _plan_document_publish(
     constraints: dict[str, Any],
     workspace_revision: str,
     depends_on: list[str],
+    objective: str = "",
 ) -> dict[str, Any]:
     if operation not in {"export", "polish"}:
         raise ValueError(f"document.publish cannot plan operation: {operation}")
     if operation not in _ALLOWED_STEPS:
         raise ValueError(f"{operation} is not allowed by PRODUCTION_ALLOWED_STEPS.")
-    deliverables = _resolve_plan_files(request_args.get("deliverables"), "deliverables", default_scan=True)
+    deliverables = _resolve_plan_files(request_args.get("deliverables"), "deliverables", default_scan=False)
+    if not deliverables:
+        deliverables = _resolve_targets_from_objective(objective, "deliverables")
+    if not deliverables:
+        deliverables = _resolve_plan_files(None, "deliverables", default_scan=True)
     if not deliverables:
         return _empty_plan(
             "document.publish",
@@ -2484,6 +2512,36 @@ def _matching_plan_paths(value: str, root: str) -> list[str]:
         if path.is_file():
             matches.append(candidate)
     return _unique_strings(matches)
+
+
+def _resolve_targets_from_objective(objective: str, root: str) -> list[str]:
+    """Recover an explicit target from the objective when `arguments` is empty.
+
+    The orchestrator extracts `arguments` from the objective with an LLM; a
+    mis-extraction hands this planner an empty `templates`/`deliverables`, and
+    the default scan would widen to every file. The objective itself still names
+    the target ("build template templates/overview/x.md"), so recover it here,
+    deterministically, before falling back to a full scan. Only paths that
+    resolve to an existing file under `root` are kept, so unrelated `.md`
+    mentions in the objective are ignored.
+    """
+    text = str(objective or "")
+    if not text:
+        return []
+    resolved: list[str] = []
+    seen: set[str] = set()
+    for token in re.findall(r"[^\s,;:\"'()\[\]{}]+", text):
+        candidate = token.strip(".,;:")
+        if not candidate or (not candidate.endswith(".md") and "/" not in candidate):
+            continue
+        try:
+            for path in _matching_plan_paths(candidate, root):
+                if path not in seen:
+                    seen.add(path)
+                    resolved.append(path)
+        except ValueError:
+            continue
+    return resolved
 
 
 def _scan_markdown_files(root: str) -> list[str]:

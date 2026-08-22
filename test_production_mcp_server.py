@@ -660,13 +660,21 @@ class ProductionMcpServerTest(unittest.TestCase):
         apply_tasks = [task for task in fragment["tasks"] if task["operation"] == "ingest_apply"]
         taxonomy_tasks = [task for task in fragment["tasks"] if task["operation"] == "taxonomy"]
         self.assertEqual(len(taxonomy_tasks), 1)
-        self.assertEqual(taxonomy_tasks[0]["dependsOn"], [task["id"] for task in apply_tasks])
+        # The taxonomy waits on the apply GROUP barrier, not a hard dependency
+        # on each apply: a failed apply (whose plan failed) is skipped, and a
+        # hard dependency would skip the synthesis too, leaving the published
+        # map stale for the files that did ingest.
+        self.assertEqual(taxonomy_tasks[0]["dependsOn"], [])
+        self.assertEqual(taxonomy_tasks[0]["dependsOnGroup"], "apply")
         self.assertTrue(all(task["barrier"] for task in apply_tasks))
+        self.assertEqual([group["id"] for group in fragment["groups"]], ["ingest", "apply"])
+        self.assertEqual(fragment["groups"][1]["label"], "Write to wiki")
         # The write lock conflicts with both applies and still-running planning
         # read locks: wait for the whole ingest group, and let the lock — not a
         # dependency chain — serialize the writes. Chaining applies to each
         # other made one unreadable source file skip every apply behind it.
         self.assertTrue(all(task["dependsOnGroup"] == "ingest" for task in apply_tasks))
+        self.assertTrue(all(task["groupId"] == "apply" for task in apply_tasks))
         self.assertEqual(apply_tasks[0]["dependsOn"], [fragment["tasks"][0]["id"]])
         self.assertEqual(apply_tasks[1]["dependsOn"], [fragment["tasks"][1]["id"]])
         self.assertTrue(all("workspace-write" in task["locks"] for task in apply_tasks))
@@ -844,6 +852,60 @@ class ProductionMcpServerTest(unittest.TestCase):
         )
         self.assertTrue(all(task["requiresApproval"] for task in fragment["tasks"]))
         self.assertNotIn("export", [task["operation"] for task in fragment["tasks"]])
+
+    def test_agent_plan_build_recovers_target_from_objective_when_arguments_empty(self):
+        # The orchestrator extracts `arguments` from the objective with an LLM;
+        # when that extraction comes back empty, the objective itself still names
+        # the template. The planner must recover it deterministically instead of
+        # widening to every template.
+        (self.workspace / "templates" / "overview").mkdir(parents=True)
+        (self.workspace / "templates" / "overview" / "PresentationComArchi.md").write_text("# P\n", encoding="utf-8")
+        (self.workspace / "templates" / "notes").mkdir()
+        (self.workspace / "templates" / "notes" / "basic-note.md").write_text("# N\n", encoding="utf-8")
+
+        fragment = self.payload(
+            self.server._tool_agent_plan(
+                {
+                    "capability": "document.build",
+                    "operation": "build",
+                    "objective": "Build deliverables from the current wiki for template templates/overview/PresentationComArchi.md",
+                    "arguments": {},
+                    "workspace": {"revision": "rev-build"},
+                    "constraints": {"requireApprovalForMutations": True},
+                }
+            )
+        )
+
+        self.assert_task_graph_fragment(fragment)
+        self.assertEqual(len(fragment["tasks"]), 1)
+        self.assertEqual(
+            fragment["tasks"][0]["inputRefs"][0]["ref"],
+            "templates/overview/PresentationComArchi.md",
+        )
+
+    def test_agent_plan_build_ignores_unrelated_paths_in_the_objective(self):
+        # Only paths that resolve to an existing file under templates/ count;
+        # a wiki source or build-context path mentioned in passing must not
+        # leak into the build plan.
+        (self.workspace / "templates" / "a.md").write_text("# A\n", encoding="utf-8")
+        (self.workspace / "wiki" / "sources").mkdir(parents=True)
+        (self.workspace / "wiki" / "sources" / "note.md").write_text("# N\n", encoding="utf-8")
+
+        fragment = self.payload(
+            self.server._tool_agent_plan(
+                {
+                    "capability": "document.build",
+                    "operation": "build",
+                    "objective": "Build template templates/a.md grounded in wiki/sources/note.md",
+                    "arguments": {},
+                    "workspace": {"revision": "rev-build"},
+                    "constraints": {"requireApprovalForMutations": True},
+                }
+            )
+        )
+
+        self.assert_task_graph_fragment(fragment)
+        self.assertEqual([task["inputRefs"][0]["ref"] for task in fragment["tasks"]], ["templates/a.md"])
 
     def test_agent_plan_publish_creates_one_task_per_deliverable(self):
         (self.workspace / "deliverables" / "a.md").write_text("# A\n", encoding="utf-8")
