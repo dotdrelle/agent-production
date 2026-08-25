@@ -827,6 +827,80 @@ class ProductionMcpServerTest(unittest.TestCase):
         self.assertIn("workspace-write", task["locks"])
         self.assertEqual(fragment["expectedOutputs"], [{"type": "directory", "ref": ".wiki/graph"}])
 
+    def test_agent_plan_concepts_creates_one_workspace_barrier(self):
+        fragment = self.payload(
+            self.server._tool_agent_plan(
+                {
+                    "capability": "knowledge.concepts",
+                    "operation": "concepts",
+                    "workspace": {"revision": "rev-concepts"},
+                    "constraints": {"requireApprovalForMutations": True},
+                }
+            )
+        )
+
+        self.assert_task_graph_fragment(fragment)
+        self.assertEqual(len(fragment["tasks"]), 1)
+        task = fragment["tasks"][0]
+        self.assertEqual(task["operation"], "concepts")
+        self.assertEqual(task["dependsOn"], [])
+        self.assertTrue(task["barrier"])
+        self.assertTrue(task["requiresApproval"])
+        self.assertIn("workspace-write", task["locks"])
+        self.assertEqual(fragment["expectedOutputs"], [{"type": "file", "ref": "wiki/concepts-grid.md"}])
+
+    def test_agent_describe_advertises_knowledge_concepts(self):
+        description = self.server._agent_description()
+        capability_ids = {capability["id"] for capability in description["capabilities"]}
+        self.assertIn("knowledge.concepts", capability_ids)
+        concepts_capability = next(c for c in description["capabilities"] if c["id"] == "knowledge.concepts")
+        self.assertEqual(concepts_capability["supportedOperations"], ["concepts", "reclassify-concepts"])
+        self.assertTrue(concepts_capability["defaultRequiresApproval"])
+
+    def test_start_job_runs_wiki_concepts_apply(self):
+        commands = self.server._step_commands("concepts", [], [], [])
+        self.assertEqual(commands, [["node", self.server._WIKI_BIN, "concepts", "--apply"]])
+
+    def test_start_job_runs_wiki_reclassify_concepts_apply(self):
+        commands = self.server._step_commands("reclassify-concepts", [], [], [])
+        self.assertEqual(commands, [["node", self.server._WIKI_BIN, "reclassify-concepts", "--apply"]])
+
+    def test_agent_plan_reclassify_concepts_creates_one_workspace_barrier(self):
+        fragment = self.payload(
+            self.server._tool_agent_plan(
+                {
+                    "capability": "knowledge.concepts",
+                    "operation": "reclassify-concepts",
+                    "workspace": {"revision": "rev-reclassify"},
+                    "constraints": {"requireApprovalForMutations": True},
+                }
+            )
+        )
+
+        self.assert_task_graph_fragment(fragment)
+        self.assertEqual(len(fragment["tasks"]), 1)
+        task = fragment["tasks"][0]
+        self.assertEqual(task["operation"], "reclassify-concepts")
+        self.assertEqual(task["dependsOn"], [])
+        self.assertTrue(task["barrier"])
+        self.assertTrue(task["requiresApproval"])
+        self.assertIn("workspace-write", task["locks"])
+        self.assertEqual(fragment["expectedOutputs"], [{"type": "directory", "ref": "wiki/concepts"}])
+
+    def test_reclassify_concepts_is_never_inferred_from_the_objective_wording(self):
+        # Same explicit-only discipline as concepts/restore: mentioning the
+        # words in a routine objective must not silently select the
+        # capability without an explicit operation or capability — there is no
+        # keyword branch for it at all in _plan_capability_operation.
+        with self.assertRaises(ValueError):
+            self.server._tool_agent_plan(
+                {
+                    "objective": "please file the unclassified concept pages now",
+                    "workspace": {"revision": "rev-x"},
+                    "constraints": {},
+                }
+            )
+
     def test_agent_plan_build_creates_one_task_per_template(self):
         (self.workspace / "templates" / "a.md").write_text("---\noutput: alpha.md\n---\n# A\n", encoding="utf-8")
         (self.workspace / "templates" / "nested").mkdir()
@@ -960,7 +1034,12 @@ class ProductionMcpServerTest(unittest.TestCase):
 
         self.assert_task_graph_fragment(fragment)
         operations = [task["operation"] for task in fragment["tasks"]]
-        self.assertEqual(operations, ["ingest_plan", "ingest_apply", "taxonomy", "build", "export", "polish"])
+        # 2026-08-25: the default pipeline chain now also covers the concept
+        # grid, in between ingest and the taxonomy it feeds.
+        self.assertEqual(
+            operations,
+            ["ingest_plan", "ingest_apply", "concepts", "reclassify-concepts", "taxonomy", "build", "export", "polish"],
+        )
         build = next(task for task in fragment["tasks"] if task["operation"] == "build")
         export = next(task for task in fragment["tasks"] if task["operation"] == "export")
         polish = next(task for task in fragment["tasks"] if task["operation"] == "polish")
@@ -1026,6 +1105,123 @@ class ProductionMcpServerTest(unittest.TestCase):
         # deux apply ne peuvent pas détenir workspace-write en même temps.
         for task in apply_tasks:
             self.assertIn("workspace-write", task["locks"])
+
+    def test_pipeline_default_steps_include_the_full_concept_chain(self):
+        # 2026-08-25 decision: /wiki-sync and /pipeline both leave the
+        # workspace with an up-to-date grid, filing and taxonomy by default —
+        # the concept chain is no longer opt-in for the default pipeline.
+        pending = self.workspace / "raw" / "untracked"
+        pending.mkdir(parents=True)
+        (pending / "a.md").write_text("# A\n", encoding="utf-8")
+
+        fragment = self.payload(
+            self.server._tool_agent_plan(
+                {
+                    "capability": "knowledge.pipeline",
+                    "operation": "pipeline",
+                    "workspace": {"revision": "rev-pipeline-default"},
+                    "constraints": {"maxConcurrency": 2},
+                }
+            )
+        )
+        operations = [task["operation"] for task in fragment["tasks"] if task["operation"] in {"concepts", "reclassify-concepts", "taxonomy"}]
+        self.assertEqual(operations, ["concepts", "reclassify-concepts", "taxonomy"])
+        # Exactly one taxonomy task — ingest's own auto-chain must have been
+        # suppressed in favor of the pipeline's own, later one.
+        self.assertEqual(len([t for t in fragment["tasks"] if t["operation"] == "taxonomy"]), 1)
+
+    def test_resolve_steps_pipeline_default_matches_agent_plan_default(self):
+        # Regression: _resolve_steps (the direct production_start_job entry
+        # point) once kept its own hardcoded 4-step pipeline default even
+        # after _pipeline_requested_steps (the agent_plan entry point) was
+        # extended to the full 7-step chain — the same "pipeline, no steps"
+        # request silently produced two different outcomes depending on
+        # which tool was called. Both must now agree, from one shared source.
+        self.assertEqual(
+            self.server._resolve_steps("pipeline", None),
+            ["ingest", "concepts", "reclassify-concepts", "taxonomy", "build", "export", "polish"],
+        )
+        # An explicitly empty steps array is also "nothing requested", same
+        # as omitting the key entirely — preserves _resolve_steps' prior
+        # behavior for this input shape.
+        self.assertEqual(
+            self.server._resolve_steps("pipeline", []),
+            ["ingest", "concepts", "reclassify-concepts", "taxonomy", "build", "export", "polish"],
+        )
+
+    def test_resolve_steps_pipeline_explicit_steps_still_narrow(self):
+        self.assertEqual(
+            self.server._resolve_steps("pipeline", ["taxonomy"]),
+            ["taxonomy"],
+        )
+
+    def test_resolve_steps_pipeline_rejects_unknown_step(self):
+        with self.assertRaises(ValueError):
+            self.server._resolve_steps("pipeline", ["not-a-real-step"])
+
+    def test_pipeline_chains_concepts_reclassify_taxonomy_downstream_of_ingest(self):
+        pending = self.workspace / "raw" / "untracked"
+        pending.mkdir(parents=True)
+        (pending / "a.md").write_text("# A\n", encoding="utf-8")
+
+        fragment = self.payload(
+            self.server._tool_agent_plan(
+                {
+                    "capability": "knowledge.pipeline",
+                    "operation": "pipeline",
+                    "workspace": {"revision": "rev-pipeline-full-chain"},
+                    "arguments": {"steps": ["ingest", "concepts", "reclassify-concepts", "taxonomy"]},
+                    "constraints": {"maxConcurrency": 2},
+                }
+            )
+        )
+        by_operation = {task["operation"]: task for task in fragment["tasks"] if task["operation"] in {"concepts", "reclassify-concepts", "taxonomy", "ingest"}}
+        self.assertIn("concepts", by_operation)
+        self.assertIn("reclassify-concepts", by_operation)
+        self.assertIn("taxonomy", by_operation)
+        # Exactly one taxonomy task — ingest's own auto-chain must not also
+        # have appended a second one.
+        self.assertEqual(len([t for t in fragment["tasks"] if t["operation"] == "taxonomy"]), 1)
+        ingest_barrier_ids = [t["id"] for t in fragment["tasks"] if t["operation"] in {"ingest", "ingest_apply"} and t.get("barrier")]
+        self.assertEqual(by_operation["concepts"]["dependsOn"], ingest_barrier_ids)
+        self.assertEqual(by_operation["reclassify-concepts"]["dependsOn"], [by_operation["concepts"]["id"]])
+        self.assertEqual(by_operation["taxonomy"]["dependsOn"], [by_operation["reclassify-concepts"]["id"]])
+
+    def test_pipeline_taxonomy_alone_has_no_dependency_when_nothing_precedes_it(self):
+        # The narrowest tier: redo just the taxonomy, without touching the
+        # grid or re-filing anything.
+        fragment = self.payload(
+            self.server._tool_agent_plan(
+                {
+                    "capability": "knowledge.pipeline",
+                    "operation": "pipeline",
+                    "workspace": {"revision": "rev-pipeline-taxonomy-only"},
+                    "arguments": {"steps": ["taxonomy"]},
+                    "constraints": {"maxConcurrency": 2},
+                }
+            )
+        )
+        self.assertEqual([t["operation"] for t in fragment["tasks"]], ["taxonomy"])
+        self.assertEqual(fragment["tasks"][0]["dependsOn"], [])
+
+    def test_pipeline_reclassify_then_taxonomy_without_rebuilding_the_grid(self):
+        # The middle tier: refile unclassified pages against the EXISTING
+        # grid, then redo the taxonomy — no `concepts` step at all.
+        fragment = self.payload(
+            self.server._tool_agent_plan(
+                {
+                    "capability": "knowledge.pipeline",
+                    "operation": "pipeline",
+                    "workspace": {"revision": "rev-pipeline-reclassify-taxonomy"},
+                    "arguments": {"steps": ["reclassify-concepts", "taxonomy"]},
+                    "constraints": {"maxConcurrency": 2},
+                }
+            )
+        )
+        operations = [t["operation"] for t in fragment["tasks"]]
+        self.assertEqual(operations, ["reclassify-concepts", "taxonomy"])
+        self.assertEqual(fragment["tasks"][0]["dependsOn"], [])
+        self.assertEqual(fragment["tasks"][1]["dependsOn"], [fragment["tasks"][0]["id"]])
 
     def test_a_failed_analysis_does_not_strand_the_other_applies(self):
         """A skipped apply must not take its siblings down with it.
@@ -1602,6 +1798,28 @@ class AllowedStepDefaultsTest(unittest.TestCase):
             with self.subTest(file=name):
                 steps = self._allowed((root / name).read_text(encoding="utf-8"))
                 self.assertIn("taxonomy", steps)
+
+    def test_compose_and_env_example_allow_concepts(self):
+        # Without `concepts`, wiki/concepts-grid.md is never built by any
+        # orchestrated flow, so ingest always falls back to filing every
+        # concept page under the reserved `unclassified` class — silently,
+        # the same class of gap `taxonomy` had before it.
+        root = Path(__file__).resolve().parent
+        for name in ("docker-compose.yml", ".env.example"):
+            with self.subTest(file=name):
+                steps = self._allowed((root / name).read_text(encoding="utf-8"))
+                self.assertIn("concepts", steps)
+
+    def test_compose_and_env_example_allow_reclassify_concepts(self):
+        # Same risk one step further: without `reclassify-concepts`, a page
+        # already stuck under wiki/concepts/unclassified stays there forever
+        # even after a grid exists, because re-ingesting its source is not a
+        # reliable fix (the ingest prompt updates an existing leaf in place).
+        root = Path(__file__).resolve().parent
+        for name in ("docker-compose.yml", ".env.example"):
+            with self.subTest(file=name):
+                steps = self._allowed((root / name).read_text(encoding="utf-8"))
+                self.assertIn("reclassify-concepts", steps)
 
     def test_in_code_default_stays_the_reference(self):
         # Le defaut Python est la reference : tout ce qu'il autorise doit l'etre

@@ -4,7 +4,7 @@
 
 Workspace-scoped MCP server for running `llm-wiki` production jobs.
 
-Current coordinated release: **0.14.5**.
+Current coordinated release: **0.15.59**.
 
 This agent is intentionally separate from `llm-wiki` chat/search. It mounts one
 workspace at `/workspace`, exposes a small allowlisted set of production actions,
@@ -16,7 +16,7 @@ and runs long operations as background jobs.
 | --------------------------- | --------------------------------------------------------------------------------------- |
 | `production_status`         | Check workspace, allowlist, active lock, and recent jobs.                               |
 | `production_list_templates` | List templates, expected deliverables, and unmatched deliverables.                      |
-| `production_start_job`      | Start `doctor`, `copy`, `ingest`, `ingest_plan`, `ingest_apply`, `build`, `export`, `polish`, or a pipeline as a background job. |
+| `production_start_job`      | Start `doctor`, `copy`, `ingest`, `ingest_plan`, `ingest_apply`, `concepts`, `reclassify-concepts`, `taxonomy`, `build`, `export`, `polish`, `restore`, or a pipeline as a background job. |
 | `production_job_status`     | Read one job status.                                                                    |
 | `production_job_logs`       | Read the tail of one job log.                                                           |
 | `production_cancel_job`     | Cancel a running job.                                                                   |
@@ -26,7 +26,7 @@ Orchestration contract (used by `llm-wiki-manager`'s generic orchestrator):
 
 | Tool             | Purpose                                                                                    |
 | ---------------- | ------------------------------------------------------------------------------------------ |
-| `agent_describe` | Declare capabilities (`knowledge.update`, `document.build`, …), limits, and health.        |
+| `agent_describe` | Declare capabilities (`knowledge.update`, `knowledge.concepts`, `document.build`, …), limits, and health.        |
 | `agent_plan`     | Build a task-graph fragment for an objective (concrete input files, locks, idempotency keys). |
 | `agent_execute`  | Start one bounded task; idempotent — a retry with a known `idempotencyKey` returns the existing job. |
 | `agent_status`   | Report orchestrated task progress and its final `TaskResult`.                              |
@@ -48,7 +48,7 @@ export WIKI_WORKSPACE_PATH=<absolute-path-to-llm-wiki-workspace>
 Optional:
 
 ```bash
-export PRODUCTION_ALLOWED_STEPS=doctor,copy,ingest,ingest_plan,ingest_apply,build,export,polish,restore,pipeline
+export PRODUCTION_ALLOWED_STEPS=doctor,copy,ingest,ingest_plan,ingest_apply,concepts,reclassify-concepts,taxonomy,build,export,polish,restore,pipeline
 export PRODUCTION_REQUIRE_CONFIRMATION=true
 export MCP_AUTH_TOKEN=<generated-local-token>
 export WIKI_CONFIG_PATH=.wikirc.yaml.openai
@@ -91,7 +91,7 @@ Streamable HTTP requests to the same URL.
 ## Behavior
 
 - Jobs are asynchronous and return a `jobId` immediately.
-- Mutating jobs use scoped locks: ingest/copy/ingest_apply/pipeline take the
+- Mutating jobs use scoped locks: ingest/copy/ingest_apply/concepts/reclassify-concepts/pipeline take the
   workspace-write lock, ingest_plan uses a read lock, targeted build jobs lock
   their expected deliverables, and export/polish jobs lock the requested
   deliverables. Non-conflicting targeted jobs can run in parallel.
@@ -108,7 +108,9 @@ Streamable HTTP requests to the same URL.
   as `cancelled`, clears the workspace lock, and appends a cancellation log
   entry.
 - The server enforces the step allowlist. It never accepts arbitrary shell commands.
-- The default `pipeline` runs `ingest`, `build`, `export`, then `polish`.
+- The default `pipeline` runs `ingest`, `concepts`, `reclassify-concepts`,
+  `taxonomy`, `build`, `export`, then `polish`. A `steps` argument selects a
+  narrower slice (e.g. `["reclassify-concepts","taxonomy"]` or `["taxonomy"]`).
   The legacy `copy` step is available only when requested explicitly, for
   deployments that configure `WIKI_IMPORTS` and import path mappings.
 - Bearer authentication controls who can call the agent. `PRODUCTION_REQUIRE_CONFIRMATION`
