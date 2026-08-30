@@ -5,7 +5,7 @@ the manager, engine, and external agents.
 
 ## Goal
 
-`agent-wiki-production` exposes workspace-scoped `llm-wiki` production actions
+`agent-production` exposes workspace-scoped `llm-wiki` production actions
 over MCP. It runs allowlisted long-running jobs such as `doctor`, `ingest`,
 `ingest_plan`, `ingest_apply`, `concepts`, `reclassify-concepts`, `taxonomy`,
 `build`, `export`, `polish`, and the default pipeline as background tasks.

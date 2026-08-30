@@ -1,4 +1,4 @@
-# agent-wiki-production
+# agent-production
 
 [![License: PolyForm Noncommercial 1.0.0](https://img.shields.io/badge/license-PolyForm%20Noncommercial%201.0.0-blue)](LICENSE)
 
@@ -66,7 +66,7 @@ export PRODUCTION_MAX_CONCURRENCY=8
 
 `MCP_AUTH_TOKEN`, `WIKI_CONFIG_PATH`, and `WIKI_IMPORTS` default to empty strings in the standalone Docker Compose file. Leave `WIKI_IMPORTS` empty unless you explicitly use the legacy `copy` step.
 
-`agent-wiki-production` runs the `llm-wiki` CLI inside the mounted workspace.
+`agent-production` runs the `llm-wiki` CLI inside the mounted workspace.
 Configure LLM and vector provider keys in that workspace's `.wikirc.yaml`
 (`llm.apiKey` and, when needed, `retrieval.vector.apiKey`). `production_start_job`
 also accepts `configPath` to select a workspace-local profile such as

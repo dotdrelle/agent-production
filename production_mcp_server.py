@@ -32,7 +32,7 @@ from starlette.types import Receive, Scope, Send
 import uvicorn
 
 
-app = Server("agent-wiki-production")
+app = Server("agent-production")
 
 _AGENT_VERSION = "0.15.66"
 _MCP_TOKEN = os.environ.get("MCP_AUTH_TOKEN", "")
@@ -1075,7 +1075,7 @@ def _render_landing_page(endpoint_url: str, scheme: str) -> str:
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>agent-wiki-production MCP connector</title>
+  <title>agent-production MCP connector</title>
   <style>
     :root {{ color-scheme: light dark; --bg:#f8fafc; --panel:#fff; --text:#111827; --muted:#64748b; --line:#d8dee8; --accent:#2563eb; --code:#eef2ff; }}
     @media (prefers-color-scheme: dark) {{ :root {{ --bg:#0f172a; --panel:#111827; --text:#f8fafc; --muted:#94a3b8; --line:#253044; --accent:#60a5fa; --code:#1e293b; }} }}
@@ -1101,7 +1101,7 @@ def _render_landing_page(endpoint_url: str, scheme: str) -> str:
 <body>
   <main>
     <div class="eyebrow">MCP Streamable HTTP</div>
-    <h1>agent-wiki-production MCP connector</h1>
+    <h1>agent-production MCP connector</h1>
     <p class="lead">Workspace-scoped production jobs for llm-wiki. Commands are allowlisted and run asynchronously.</p>
     <section class="panel">
       <dl>
@@ -1183,7 +1183,7 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="production_status",
-            description="Check agent-wiki-production configuration, active lock, allowed steps, and recent jobs.",
+            description="Check agent-production configuration, active lock, allowed steps, and recent jobs.",
             inputSchema={"type": "object", "properties": {}, "additionalProperties": False},
         ),
         Tool(
@@ -1469,7 +1469,7 @@ def _tool_status() -> list[TextContent]:
     return _json_text(
         {
             "ok": True,
-            "service": "agent-wiki-production",
+            "service": "agent-production",
             "version": _AGENT_VERSION,
             "workspace": {"name": _WORKSPACE_NAME, "path": str(_WORKSPACE_PATH), "exists": _WORKSPACE_PATH.exists()},
             "allowedSteps": sorted(_ALLOWED_STEPS),
