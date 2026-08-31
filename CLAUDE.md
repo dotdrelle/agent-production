@@ -1,14 +1,18 @@
 # Repository Guide
 
-Current coordinated release: **0.15.59**. Keep `_AGENT_VERSION` aligned with
+Current coordinated release: **0.15.66**. Keep `_AGENT_VERSION` aligned with
 the manager, engine, and external agents.
 
 ## Goal
 
 `agent-production` exposes workspace-scoped `llm-wiki` production actions
 over MCP. It runs allowlisted long-running jobs such as `doctor`, `ingest`,
-`ingest_plan`, `ingest_apply`, `concepts`, `reclassify-concepts`, `taxonomy`,
-`build`, `export`, `polish`, and the default pipeline as background tasks.
+`ingest_plan`, `ingest_apply`, `build`, `export`, `polish`, and the default
+pipeline as background tasks. (0.15.66 removed the retired concept steps —
+`concepts`, `reclassify-concepts`, `taxonomy` — with the engine's
+simplification: the concept IS the folder, ingest files each leaf under
+`wiki/concepts/<concept>/<subject>.md` directly, and the graph communities
+derive from the folders.)
 
 Since 0.12.0 it is also a full **orchestrable agent** (planner + executor) for
 the manager's agnostic orchestration: it implements `agent_describe`,
@@ -40,78 +44,40 @@ job/result instead of starting a new one.
   steps and the fixed command mappings in the server.
 - **`PRODUCTION_ALLOWED_STEPS` fails silently, and that is its danger.** A
   capability is published only if at least one of its steps survives the filter
-  (`_agent_capabilities`), and `agent_plan` merely omits a disallowed task rather
-  than refusing (`"taxonomy" in _ALLOWED_STEPS`). Two consequences seen in
-  production: `taxonomy` was absent from every shipped compose default, so
-  ingests ran without the Lot 4 barrier and left the published map stale; and a
-  capability with a single step — `workspace.restore` → `restore` — disappears
-  from `agent_describe` entirely, which the orchestrator can only report much
-  later as `No agent provides capability …`. A compose always SETS the variable,
-  so the in-code default never applies under Docker: keep the two in step, and a
-  test in this repo compares them. `concepts` (below) repeated exactly this
-  gap once already — it shipped in `llm-wiki` (`wiki concepts --apply`) with no
-  matching step here, so `wiki/concepts-grid.md` was never built by any
-  orchestrated flow and every ingested concept page silently filed under the
-  reserved `unclassified` class. Both `test_production_mcp_server.py`'s
-  `AllowedStepDefaultsTest` and `llm-wiki-manager`'s `dockerCompose.test.js`
-  now assert `concepts` the same way they already did `taxonomy` — extend both
-  together for the next step, not just one.
-- **`concepts`** (`knowledge.concepts` capability) runs `wiki concepts --apply`,
-  synthesizing the workspace's closed set of ranking classes into
-  `wiki/concepts-grid.md` from `raw/ingested`. Rebuilding the grid can remove a
-  class existing pages rely on, so it stays deliberately excluded from
-  objective-keyword inference in `_plan_capability_operation` (same treatment
-  as `workspace.restore`): it is only ever selected by an explicit
-  `operation`/`capability`, never inferred from an "ingest"/"concept" mention
-  in a routine request — including through the manager's alias fast-path
-  (`objectiveResolver.js`), where `aliasOperations` pins each `knowledge.concepts`
-  alias to the operation it actually names, so an alias meant for
-  `reclassify-concepts` can never silently resolve to this one instead. It IS,
-  however, part of the pipeline's default step list since 2026-08-25 — see
-  `knowledge.pipeline` below.
-- **`reclassify-concepts`** (same `knowledge.concepts` capability, second
-  operation) runs `wiki reclassify-concepts --apply`, filing pages already
-  stuck under `wiki/concepts/unclassified/` into the CURRENT grid. Re-ingesting
-  a page's source is not a reliable fix once it exists there: the ingest
-  consolidation prompt tells the model to update an existing leaf AT ITS
-  EXISTING PATH, so a forced re-ingest can just keep refreshing the
-  unclassified copy instead of moving it. This operation is the deterministic
-  alternative — one closed question per page against the grid's membership
-  criteria, then a mechanical move (no re-synthesis of the leaf's own
-  content). Same explicit-only selection discipline as `concepts`.
-- **`knowledge.pipeline` chains `concepts → reclassify-concepts → taxonomy`
-  downstream of `ingest`** when any of the three appear in the requested
-  `steps` (`_pipeline_requested_steps`/`_plan_pipeline`) — each depends on the
-  barrier task before it, so the grid exists before pages are filed into it,
-  and filing is settled before the taxonomy reads the tree. `ingest`'s own
-  standalone taxonomy auto-chain (`_plan_knowledge_update`'s `chain_taxonomy`
-  parameter) is suppressed whenever the pipeline plans the chain itself —
-  otherwise taxonomy would run twice, once too early (right after ingest, no
-  grid yet) and once at the end. **2026-08-25 decision: the full chain IS the
-  pipeline's silent default** — `_pipeline_requested_steps` returns
-  `["ingest","concepts","reclassify-concepts","taxonomy","build","export","polish"]`
-  when `steps` is omitted, so a bare `/wiki-sync` or `/pipeline` leaves the
-  workspace with an up-to-date grid, filing and taxonomy, not just ingested
-  pages. `_resolve_steps` (the direct `production_start_job` entry point)
-  shares this exact default with `_pipeline_requested_steps` — do not let the
-  two diverge again, as they once silently did. A caller wanting a narrower
-  slice (just `reclassify-concepts`+`taxonomy`, or `taxonomy` alone) requests
-  it explicitly via `arguments.steps`/`steps`.
+  (`_agent_capabilities`), and `agent_plan` merely omits a disallowed task
+  rather than refusing. One consequence seen in production: a capability with a
+  single step — `workspace.restore` → `restore` — disappears from
+  `agent_describe` entirely, which the orchestrator can only report much later
+  as `No agent provides capability …`. A compose always SETS the variable, so
+  the in-code default never applies under Docker: keep the two in step, and a
+  test in this repo compares them. `test_production_mcp_server.py`'s
+  `AllowedStepDefaultsTest` asserts the shipped defaults carry no step the
+  engine retired (0.15.66 removed `concepts`/`reclassify-concepts`/`taxonomy`
+  from `llm-wiki` — any shipped default still allowing them would make the
+  pipeline fail with "unknown command" at the first such step).
+- **`knowledge.pipeline` chains `ingest → build → export → polish`**, and the
+  four-step chain IS the pipeline's silent default: `_pipeline_requested_steps`
+  returns `["ingest","build","export","polish"]` when `steps` is omitted, so a
+  bare `/wiki-sync` or `/pipeline` leaves the workspace ingested and rebuilt.
+  `_resolve_steps` (the direct `production_start_job` entry point) shares this
+  exact default with `_pipeline_requested_steps` — do not let the two diverge
+  again, as they once silently did. A caller wanting a narrower slice
+  (`["build","export"]`, or `["ingest"]` alone) requests it explicitly via
+  `arguments.steps`/`steps`.
 - Preserve scoped production locks when changing job execution: workspace-write
-  for ingest/copy/ingest_apply/concepts/reclassify-concepts/pipeline, read for
+  for ingest/copy/ingest_apply/pipeline, read for
   ingest_plan, deliverable locks for targeted build/export/polish.
 - Jobs are asynchronous. Tool calls should return a `jobId` quickly, then expose
   status and logs through follow-up tools.
 - `production_start_job` and `production_job_status` must preserve their native
   payloads and include additive `_activity` metadata for manager/orchestrator
   polling. `_activity.poll` should point to `production.production_job_status`.
-- Keep the default pipeline as `ingest`, `concepts`, `reclassify-concepts`,
-  `taxonomy`, `build`, `export`, then `polish` (the full chain — see
-  `knowledge.pipeline` above). The legacy `copy` step is available only when
-  explicitly requested and configured.
+- Keep the default pipeline as `ingest`, `build`, `export`, then `polish`
+  (see `knowledge.pipeline` above). The legacy `copy` step is available only
+  when explicitly requested and configured.
 - `production_start_job` supports targeted `inputs` for ingest/ingest_plan,
   plan-file `inputs` for ingest_apply, `templates` for build, and `deliverables`
-  for export/polish. Ingest/copy/ingest_apply/concepts/reclassify-concepts/pipeline
+  for export/polish. Ingest/copy/ingest_apply/pipeline
   hold a workspace-write
   lock; ingest_plan is read-only; targeted build/export/polish jobs hold
   deliverable locks so non-conflicting runtime tasks can execute in parallel.
@@ -143,7 +109,7 @@ job/result instead of starting a new one.
   trace files can link back to the production job that launched them.
 - Keep `_AGENT_VERSION` aligned with the coordinated `llm-wiki-manager`
   release version so status responses identify the deployed agent bundle.
-  Current release line: `0.15.59`. Alignment is checked by
+  Current release line: `0.15.66`. Alignment is checked by
   `llm-wiki-manager/scripts/check-versions.js` and synced by the root
   `build-and-push.sh`.
 - **Auth, scopes, rate limiting** (0.10.3): `MCP_AUTH_TOKEN` remains a legacy

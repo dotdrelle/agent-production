@@ -34,7 +34,7 @@ import uvicorn
 
 app = Server("agent-production")
 
-_AGENT_VERSION = "0.15.66"
+_AGENT_VERSION = "0.15.70"
 _MCP_TOKEN = os.environ.get("MCP_AUTH_TOKEN", "")
 _MCP_READ_TOKEN = os.environ.get("MCP_READ_TOKEN", "")
 _MCP_WRITE_TOKEN = os.environ.get("MCP_WRITE_TOKEN", "")
@@ -73,7 +73,7 @@ _IMPORTS = os.environ.get("WIKI_IMPORTS", "")
 _IMPORT_PATH_MAPPINGS = os.environ.get("PRODUCTION_IMPORT_PATH_MAPPINGS", "")
 _ALLOWED_STEPS = {
     item.strip()
-    for item in os.environ.get("PRODUCTION_ALLOWED_STEPS", "doctor,copy,ingest,ingest_plan,ingest_apply,concepts,reclassify-concepts,taxonomy,build,export,polish,restore,pipeline").split(",")
+    for item in os.environ.get("PRODUCTION_ALLOWED_STEPS", "doctor,copy,ingest,ingest_plan,ingest_apply,build,export,polish,restore,pipeline").split(",")
     if item.strip()
 }
 _REQUIRE_CONFIRMATION = os.environ.get("PRODUCTION_REQUIRE_CONFIRMATION", "true").lower() not in {"0", "false", "no"}
@@ -88,18 +88,14 @@ _STEP_COMMANDS: dict[str, list[str]] = {
     "ingest": ["node", _WIKI_BIN, "ingest"],
     "ingest_plan": ["node", _WIKI_BIN, "ingest", "--plan-only"],
     "ingest_apply": ["node", _WIKI_BIN, "ingest", "--apply"],
-    "concepts": ["node", _WIKI_BIN, "concepts", "--apply"],
-    "reclassify-concepts": ["node", _WIKI_BIN, "reclassify-concepts", "--apply"],
-    "taxonomy": ["node", _WIKI_BIN, "taxonomy", "--apply"],
     "build": ["node", _WIKI_BIN, "build"],
     "export": ["node", _WIKI_BIN, "export"],
     "polish": ["node", _WIKI_BIN, "export", "--polish"],
     "restore": ["node", _WIKI_BIN, "restore"],
 }
-_MUTATING_STEPS = {"copy", "ingest", "ingest_plan", "ingest_apply", "concepts", "reclassify-concepts", "taxonomy", "build", "export", "polish", "restore", "pipeline"}
+_MUTATING_STEPS = {"copy", "ingest", "ingest_plan", "ingest_apply", "build", "export", "polish", "restore", "pipeline"}
 _CAPABILITY_STEP_MAP: dict[str, list[str]] = {
-    "knowledge.update": ["ingest", "ingest_plan", "ingest_apply", "taxonomy"],
-    "knowledge.concepts": ["concepts", "reclassify-concepts"],
+    "knowledge.update": ["ingest", "ingest_plan", "ingest_apply"],
     "document.build": ["build"],
     "document.publish": ["export", "polish"],
     "workspace.diagnose": ["doctor"],
@@ -111,9 +107,6 @@ _AGENT_OPERATION_TRANSLATION: dict[str, dict[str, Any]] = {
     "ingest": {"type": "ingest"},
     "ingest_plan": {"type": "ingest_plan"},
     "ingest_apply": {"type": "ingest_apply"},
-    "concepts": {"type": "concepts"},
-    "reclassify-concepts": {"type": "reclassify-concepts"},
-    "taxonomy": {"type": "taxonomy"},
     "build": {"type": "build"},
     "export": {"type": "export"},
     "polish": {"type": "polish"},
@@ -513,9 +506,7 @@ def _agent_capabilities() -> list[dict[str, Any]]:
                 # one operation where the flat alias list alone can't say
                 # which one a given phrase means (see manager's
                 # objectiveResolver.js — an alias hit with no per-alias
-                # mapping falls back to operations[0], alphabetical, which is
-                # wrong here: "reclassify concepts" must never resolve to the
-                # destructive grid rebuild).
+                # mapping falls back to operations[0]).
                 "aliasOperations": _CAPABILITY_ALIAS_OPERATIONS.get(capability_id, {}),
                 "inputSchema": _capability_input_schema(capability_id, supported),
                 "outputSchema": {"type": "object", "additionalProperties": True},
@@ -528,7 +519,6 @@ def _agent_capabilities() -> list[dict[str, Any]]:
 
 _CAPABILITY_ALIASES: dict[str, list[str]] = {
     "knowledge.update": ["ingest", "ingestion", "ingest files", "ingest documents"],
-    "knowledge.concepts": ["concepts", "concept grid", "conceptual grid", "build concept grid", "reclassify concepts", "file unclassified concepts"],
     "document.build": ["build", "rebuild", "generate deliverable"],
     "document.publish": ["publish", "publish deliverable", "export deliverable"],
     "workspace.diagnose": ["diagnose", "diagnostic", "doctor", "check config"],
@@ -536,20 +526,13 @@ _CAPABILITY_ALIASES: dict[str, list[str]] = {
     "workspace.restore": ["restore", "revert", "rollback"],
 }
 
-# knowledge.concepts is the only capability with more than one operation, so
-# it is the only one that needs per-alias disambiguation — every other
-# capability's aliases are safely covered by operations[0] since there is
-# only one operation to pick.
-_CAPABILITY_ALIAS_OPERATIONS: dict[str, dict[str, str]] = {
-    "knowledge.concepts": {
-        "concepts": "concepts",
-        "concept grid": "concepts",
-        "conceptual grid": "concepts",
-        "build concept grid": "concepts",
-        "reclassify concepts": "reclassify-concepts",
-        "file unclassified concepts": "reclassify-concepts",
-    },
-}
+# Per-alias operation hints, for a capability with more than one operation
+# where the flat alias list alone can't say which one a given phrase means
+# (see manager's objectiveResolver.js — an alias hit with no per-alias
+# mapping falls back to operations[0]). Currently every capability's aliases
+# are safely covered by operations[0]; add a mapping here the day a
+# capability needs disambiguation again.
+_CAPABILITY_ALIAS_OPERATIONS: dict[str, dict[str, str]] = {}
 
 
 def _capability_description(capability_id: str) -> str:
@@ -563,18 +546,6 @@ def _capability_description(capability_id: str) -> str:
             "into the llm-wiki knowledge base. Reads local Markdown only — it never fetches from Confluence or any remote source. "
             "Files are processed per source file; the runtime decides ordering and how many run in parallel (callers do not set a batch size). "
             "Use knowledge.update to build or refresh wiki knowledge from documents that are already on disk."
-        ),
-        "knowledge.concepts": (
-            "Two related operations on the workspace's conceptual grid (operation=\"concepts\" or "
-            "\"reclassify-concepts\"). \"concepts\" synthesizes the grid itself: a small, closed set of ranking "
-            "classes built once over the whole raw/ingested corpus, written to wiki/concepts-grid.md. Run this "
-            "BEFORE ingesting new sources into a workspace that has none yet — without a grid, every concept page "
-            "files under the reserved 'unclassified' class. Run rarely and deliberately: re-ingesting a document "
-            "does not rebuild the grid, and rebuilding it can remove classes that existing pages rely on. "
-            "\"reclassify-concepts\" files pages already stuck under wiki/concepts/unclassified into the CURRENT "
-            "grid: re-ingesting their source is not a reliable fix once a page already exists there (the ingest "
-            "prompt updates an existing leaf at its existing path instead of moving it), so use this operation "
-            "instead, after a grid exists."
         ),
         "document.build": (
             "Build llm-wiki deliverables from templates in templates/, writing the results under deliverables/. "
@@ -590,11 +561,10 @@ def _capability_description(capability_id: str) -> str:
             "This is a mutating operation, always workspace-scoped, and requires explicit approval."
         ),
         "knowledge.pipeline": (
-            "Run the full production pipeline over the workspace in one ordered sequence: ingest, then the concept "
-            "grid, then filing unclassified concept pages into it, then the graph taxonomy, then build, export and "
-            "polish. Pass arguments.steps to run a narrower slice — for example [\"reclassify-concepts\",\"taxonomy\"] "
-            "to re-file existing pages and republish the taxonomy without rebuilding the grid, or [\"taxonomy\"] alone "
-            "to just resynthesize the taxonomy."
+            "Run the production pipeline over the workspace in one ordered sequence: ingest (each source is "
+            "filed as a concept leaf under wiki/concepts/<concept>/<subject>.md — the concept IS the folder), "
+            "then build, export and polish. Pass arguments.steps to run a narrower slice — for example "
+            "[\"build\",\"export\"] to rebuild and republish without touching the sources, or [\"ingest\"] alone."
         ),
     }
     return descriptions.get(capability_id, capability_id)
@@ -614,7 +584,7 @@ def _capability_input_schema(capability_id: str, supported: list[str]) -> dict[s
     if capability_id == "document.publish":
         properties["deliverables"] = {"type": "array", "items": {"type": "string"}, "description": "Deliverable files (relative to the workspace root or deliverables/) to export or polish. These must already exist under deliverables/."}
     if capability_id == "knowledge.pipeline":
-        properties["steps"] = {"type": "array", "items": {"type": "string"}, "description": "Ordered pipeline steps to run, from: ingest, concepts, reclassify-concepts, taxonomy, build, export, polish. If omitted, the default full order is used (all seven, in that order). Pass a narrower ordered subset for a partial run — e.g. [\"reclassify-concepts\",\"taxonomy\"] or [\"taxonomy\"]."}
+        properties["steps"] = {"type": "array", "items": {"type": "string"}, "description": "Ordered pipeline steps to run, from: ingest, build, export, polish. If omitted, the default full order is used (all four, in that order). Pass a narrower ordered subset for a partial run — e.g. [\"build\",\"export\"] or [\"ingest\"]."}
     if capability_id == "workspace.restore":
         properties["file"] = {"type": "string", "description": "Workspace-relative file to restore (use with to)."}
         properties["to"] = {"type": "string", "description": "Git revision for file restore."}
@@ -1215,11 +1185,11 @@ async def list_tools() -> list[Tool]:
                 "properties": {
                     "type": {
                         "type": "string",
-                        "enum": ["doctor", "copy", "ingest", "ingest_plan", "ingest_apply", "concepts", "reclassify-concepts", "taxonomy", "build", "export", "polish", "restore", "pipeline"],
+                        "enum": ["doctor", "copy", "ingest", "ingest_plan", "ingest_apply", "build", "export", "polish", "restore", "pipeline"],
                     },
                     "steps": {
                         "type": "array",
-                        "items": {"type": "string", "enum": ["doctor", "copy", "ingest", "ingest_plan", "ingest_apply", "concepts", "reclassify-concepts", "taxonomy", "build", "export", "polish", "restore"]},
+                        "items": {"type": "string", "enum": ["doctor", "copy", "ingest", "ingest_plan", "ingest_apply", "build", "export", "polish", "restore"]},
                         "description": "Required for type=pipeline. Ordered steps to run.",
                     },
                     "templates": {
@@ -1738,8 +1708,6 @@ def _agent_plan(args: dict[str, Any]) -> dict[str, Any]:
 
     if capability == "knowledge.update":
         return _plan_knowledge_update(operation, request_args, constraints, workspace_revision)
-    if capability == "knowledge.concepts":
-        return _plan_knowledge_concepts(operation, constraints, workspace_revision)
     if capability == "document.build":
         return _plan_document_build(request_args, constraints, workspace_revision, depends_on=[], objective=objective)
     if capability == "document.publish":
@@ -1818,7 +1786,7 @@ def _plan_capability_operation(args: dict[str, Any]) -> tuple[str, str]:
         operation = legacy_type
 
     if not capability:
-        if operation in {"ingest", "ingest_plan", "ingest_apply", "taxonomy"} or "ingest" in objective or "taxonomy" in objective:
+        if operation in {"ingest", "ingest_plan", "ingest_apply"} or "ingest" in objective:
             capability = "knowledge.update"
         elif operation == "build" or "build" in objective or "document" in objective:
             capability = "document.build"
@@ -1834,17 +1802,10 @@ def _plan_capability_operation(args: dict[str, Any]) -> tuple[str, str]:
         # operation or an explicit capability.
         elif operation == "restore":
             capability = "workspace.restore"
-        # Also explicit-only: rebuilding the concept grid can remove a class
-        # existing pages rely on (see the capability description), and it must
-        # never be inferred from an "ingest"/"concept" mention in a routine
-        # ingest request. reclassify-concepts moves files — same treatment.
-        elif operation in {"concepts", "reclassify-concepts"}:
-            capability = "knowledge.concepts"
 
     if not operation:
         defaults = {
             "knowledge.update": "ingest",
-            "knowledge.concepts": "concepts",
             "document.build": "build",
             "document.publish": "export",
             "knowledge.pipeline": "pipeline",
@@ -1854,7 +1815,7 @@ def _plan_capability_operation(args: dict[str, Any]) -> tuple[str, str]:
 
     if capability not in _CAPABILITY_STEP_MAP:
         raise ValueError("agent_plan requires a supported capability.")
-    if operation and operation not in {"ingest", "ingest_plan", "ingest_apply", "concepts", "reclassify-concepts", "taxonomy", "build", "export", "polish", "restore", "pipeline"}:
+    if operation and operation not in {"ingest", "ingest_plan", "ingest_apply", "build", "export", "polish", "restore", "pipeline"}:
         raise ValueError(f"Unsupported planning operation: {operation}")
     if operation == "ingest_plan":
         operation = "ingest"
@@ -1888,43 +1849,9 @@ def _plan_knowledge_update(
     request_args: dict[str, Any],
     constraints: dict[str, Any],
     workspace_revision: str,
-    chain_taxonomy: bool = True,
 ) -> dict[str, Any]:
-    # `_plan_pipeline` plans concepts -> reclassify-concepts -> taxonomy itself
-    # (in that order, downstream of ingest) whenever any of those steps were
-    # requested — chain_taxonomy=False stops this function from ALSO
-    # appending its own standalone taxonomy task right after ingest, which
-    # would both duplicate the synthesis and run it too early (before the
-    # grid it should read even exists).
-    if operation not in {"ingest", "ingest_apply", "taxonomy"}:
+    if operation not in {"ingest", "ingest_apply"}:
         raise ValueError(f"knowledge.update cannot plan operation: {operation}")
-    if operation == "taxonomy":
-        if "taxonomy" not in _ALLOWED_STEPS:
-            raise ValueError("taxonomy is not allowed by PRODUCTION_ALLOWED_STEPS.")
-        task = _planned_task(
-            "taxonomy-synthesis",
-            "Synthesize graph taxonomy",
-            "knowledge.update",
-            "taxonomy",
-            {},
-            [],
-            False,
-            [{"type": "directory", "ref": "wiki"}],
-            [{"type": "directory", "ref": ".wiki/graph"}],
-            _job_lock_scopes(["taxonomy"], [], [], []),
-            constraints,
-            workspace_revision,
-            barrier=True,
-            progress_weight=1,
-        )
-        return _fragment(
-            "knowledge.update",
-            "Synthesize graph taxonomy",
-            ["The current wiki corpus will be synthesized into semantic domains."],
-            [],
-            [task],
-            task["expectedOutputRefs"],
-        )
     if "ingest" not in _ALLOWED_STEPS:
         raise ValueError("ingest is not allowed by PRODUCTION_ALLOWED_STEPS.")
     files = _resolve_plan_files(request_args.get("inputs"), "raw/untracked", default_scan=True)
@@ -1962,27 +1889,6 @@ def _plan_knowledge_update(
         tasks = [task]
         expected = task["expectedOutputRefs"]
         synthesis = [f"{len(files)} source file(s) will be ingested as one aggregated task."]
-        if chain_taxonomy and "taxonomy" in _ALLOWED_STEPS and (max_depth is None or max_depth >= 2) and (max_tasks is None or max_tasks >= 2):
-            taxonomy = _planned_task(
-                "taxonomy-synthesis",
-                "Synthesize graph taxonomy",
-                "knowledge.update",
-                "taxonomy",
-                {},
-                [task["id"]],
-                False,
-                [{"type": "directory", "ref": "wiki"}],
-                [{"type": "directory", "ref": ".wiki/graph"}],
-                _job_lock_scopes(["taxonomy"], [], [], []),
-                constraints,
-                workspace_revision,
-                barrier=True,
-                progress_weight=max(1, len(files) / 4),
-            )
-            tasks.append(taxonomy)
-            expected = [{"type": "directory", "ref": "wiki"}, {"type": "directory", "ref": ".wiki/graph"}]
-        elif chain_taxonomy and "taxonomy" in _ALLOWED_STEPS:
-            synthesis.append("Taxonomy synthesis was omitted because the requested plan depth or task limit cannot represent it safely.")
         return _fragment("knowledge.update", "Update knowledge", synthesis, [], tasks, expected)
 
     aggregate_ingest = max_tasks is not None and len(files) + 1 > max_tasks
@@ -2049,14 +1955,12 @@ def _plan_knowledge_update(
     apply_allowed = "ingest_apply" in _ALLOWED_STEPS
     # Declared before the branch: the expected-output list below reads it even
     # when the apply phase is not allowlisted at all.
-    taxonomy_planned = False
     if apply_allowed:
-        # The apply phase is its own group so the taxonomy barrier can wait on
+        # The apply phase is its own group so downstream steps can wait on
         # the WRITES as a whole instead of on each write. A hard dependsOn on
-        # every apply meant one failed apply (whose plan failed) skipped the
-        # taxonomy, leaving the published map stale for the files that DID
-        # ingest. A group barrier waits for the group to be terminal — done OR
-        # failed OR skipped — so the taxonomy still runs on the partial corpus.
+        # every apply would couple them to individual write outcomes; a group
+        # barrier waits for the group to be terminal — done OR failed OR
+        # skipped — so a partial corpus still lets the plan settle.
         apply_group = {
             "id": "apply",
             "label": "Write to wiki",
@@ -2115,125 +2019,19 @@ def _plan_knowledge_update(
                 )
             )
 
-        # Une seule synthèse globale, après TOUTES les écritures. Elle classe
-        # des familles condensées ; elle ne déclenche jamais un appel par page.
-        # Elle attend le groupe d'écriture via la barrière de groupe — donc
-        # « toutes les écritures sont terminales » — et non via une dépendance
-        # dure sur chaque apply : un apply dont le plan a échoué est skipped, et
-        # une dépendance dure aurait fait sauter la synthèse, laissant la carte
-        # publiée périmée pour les fichiers qui, eux, ont bien été ingérés.
-        # The budget must be honoured on THIS path too.
-        #
-        # The sequential branch above refuses the taxonomy task when the caller's
-        # maxTasks/maxDepth cannot represent it, and says so. This branch simply
-        # appended it, and — unlike the pipeline path — never passes through
-        # `_aggregate_if_needed`, so nothing downstream caught the overflow. A
-        # caller asking for a two-level plan received a three-level one:
-        # ingest_plan -> ingest_apply -> taxonomy.
-        taxonomy_fits = (
-            (max_depth is None or max_depth >= 3)
-            and (max_tasks is None or len(tasks) + 1 <= max_tasks)
-        )
-        taxonomy_planned = chain_taxonomy and "taxonomy" in _ALLOWED_STEPS and taxonomy_fits
-        if taxonomy_planned:
-            tasks.append(
-                _planned_task(
-                    "taxonomy-synthesis",
-                    "Synthesize graph taxonomy",
-                    "knowledge.update",
-                    "taxonomy",
-                    {},
-                    [],
-                    False,
-                    [{"type": "directory", "ref": "wiki"}],
-                    [{"type": "directory", "ref": ".wiki/graph"}],
-                    _job_lock_scopes(["taxonomy"], [], [], []),
-                    constraints,
-                    workspace_revision,
-                    depends_on_group="apply",
-                    barrier=True,
-                    progress_weight=max(1, len(files) / 4),
-                )
-            )
+        # A single apply barrier group serializes every write: the workspace
+        # lock scopes already enforce that only one writer holds the wiki at a
+        # time, and the group barrier is what makes the "all writes terminal"
+        # condition observable by the rest of the plan.
 
     synthesis = [f"{len(files)} source file(s) resolved from raw/untracked."]
     if aggregate_ingest:
         synthesis.append("Source analysis was aggregated into one task to satisfy maxTasks.")
     if not apply_allowed:
         synthesis.append("ingest_apply is not allowlisted; the apply barrier was omitted.")
-    if chain_taxonomy and apply_allowed and "taxonomy" in _ALLOWED_STEPS and not taxonomy_planned:
-        synthesis.append(
-            "Taxonomy synthesis was omitted because the requested plan depth or task limit cannot represent it safely."
-        )
-    # The promise must match the plan: announcing `.wiki/graph` while the
-    # taxonomy task was dropped would have the orchestrator wait on an output
-    # nothing produces.
-    expected = ([{"type": "directory", "ref": "wiki"}, {"type": "directory", "ref": ".wiki/graph"}]
-                if apply_allowed and taxonomy_planned
-                else [{"type": "directory", "ref": "wiki"}] if apply_allowed else plan_refs)
+    # The promise must match the plan.
+    expected = [{"type": "directory", "ref": "wiki"}] if apply_allowed else plan_refs
     return _fragment("knowledge.update", "Update knowledge", synthesis, groups, tasks, expected)
-
-
-def _plan_knowledge_concepts(
-    operation: str,
-    constraints: dict[str, Any],
-    workspace_revision: str,
-    depends_on: list[str] | None = None,
-) -> dict[str, Any]:
-    if operation not in {"concepts", "reclassify-concepts"}:
-        raise ValueError(f"knowledge.concepts cannot plan operation: {operation}")
-    if operation not in _ALLOWED_STEPS:
-        raise ValueError(f"{operation} is not allowed by PRODUCTION_ALLOWED_STEPS.")
-    depends_on = depends_on or []
-    if operation == "reclassify-concepts":
-        task = _planned_task(
-            "concepts-reclassify",
-            "File unclassified concept pages",
-            "knowledge.concepts",
-            "reclassify-concepts",
-            {},
-            depends_on,
-            False,
-            [{"type": "directory", "ref": "wiki/concepts/unclassified"}, {"type": "file", "ref": "wiki/concepts-grid.md"}],
-            [{"type": "directory", "ref": "wiki/concepts"}],
-            _job_lock_scopes(["reclassify-concepts"], [], [], []),
-            constraints,
-            workspace_revision,
-            barrier=True,
-            progress_weight=1,
-        )
-        return _fragment(
-            "knowledge.concepts",
-            "File unclassified concept pages",
-            ["Pages under wiki/concepts/unclassified will be filed into the current grid, or left unclassified when no class fits."],
-            [],
-            [task],
-            task["expectedOutputRefs"],
-        )
-    task = _planned_task(
-        "concepts-grid",
-        "Synthesize concept grid",
-        "knowledge.concepts",
-        "concepts",
-        {},
-        depends_on,
-        False,
-        [{"type": "directory", "ref": "raw/ingested"}],
-        [{"type": "file", "ref": "wiki/concepts-grid.md"}],
-        _job_lock_scopes(["concepts"], [], [], []),
-        constraints,
-        workspace_revision,
-        barrier=True,
-        progress_weight=1,
-    )
-    return _fragment(
-        "knowledge.concepts",
-        "Synthesize concept grid",
-        ["The raw/ingested corpus will be synthesized into a closed set of ranking classes."],
-        [],
-        [task],
-        task["expectedOutputRefs"],
-    )
 
 
 def _plan_document_build(
@@ -2335,55 +2133,13 @@ def _plan_pipeline(request_args: dict[str, Any], constraints: dict[str, Any], wo
     groups: list[dict[str, Any]] = []
     expected_outputs: list[dict[str, Any]] = []
 
-    # concepts/reclassify-concepts/taxonomy are chained downstream of ingest,
-    # in that order: the grid must exist before pages can be filed into it,
-    # and filing must happen before the taxonomy reads a settled wiki/concepts
-    # tree. ingest's OWN standalone taxonomy auto-chain is suppressed whenever
-    # any of the three were requested — otherwise taxonomy would run twice,
-    # once too early (right after ingest, no grid yet) and once here.
-    concepts_chain_requested = bool(
-        {"concepts", "reclassify-concepts", "taxonomy"} & set(requested_steps),
-    )
-
     input_files = _resolve_plan_files(request_args.get("inputs"), "raw/untracked", default_scan=True)
     if "ingest" in requested_steps and input_files and "ingest" in _ALLOWED_STEPS:
-        ingest_fragment = _plan_knowledge_update(
-            "ingest", request_args, constraints, workspace_revision,
-            chain_taxonomy=not concepts_chain_requested,
-        )
+        ingest_fragment = _plan_knowledge_update("ingest", request_args, constraints, workspace_revision)
         tasks.extend(ingest_fragment["tasks"])
         groups.extend(ingest_fragment["groups"])
         expected_outputs.extend(ingest_fragment.get("expectedOutputs") or [])
     previous_ids = [task["id"] for task in tasks if task.get("barrier")] or [task["id"] for task in tasks]
-
-    for step in ("concepts", "reclassify-concepts", "taxonomy"):
-        if step not in requested_steps or step not in _ALLOWED_STEPS:
-            continue
-        if step == "taxonomy":
-            taxonomy_task = _planned_task(
-                "taxonomy-synthesis",
-                "Synthesize graph taxonomy",
-                "knowledge.update",
-                "taxonomy",
-                {},
-                previous_ids,
-                False,
-                [{"type": "directory", "ref": "wiki"}],
-                [{"type": "directory", "ref": ".wiki/graph"}],
-                _job_lock_scopes(["taxonomy"], [], [], []),
-                constraints,
-                workspace_revision,
-                barrier=True,
-                progress_weight=1,
-            )
-            tasks.append(taxonomy_task)
-            expected_outputs.append({"type": "directory", "ref": ".wiki/graph"})
-            previous_ids = [taxonomy_task["id"]]
-            continue
-        step_fragment = _plan_knowledge_concepts(step, constraints, workspace_revision, depends_on=previous_ids)
-        tasks.extend(step_fragment["tasks"])
-        expected_outputs.extend(step_fragment.get("expectedOutputs") or [])
-        previous_ids = [task["id"] for task in step_fragment["tasks"] if task.get("barrier")] or previous_ids
 
     templates = _resolve_plan_files(request_args.get("templates"), "templates", default_scan=True)
     if "build" in requested_steps and templates and "build" in _ALLOWED_STEPS:
@@ -2911,20 +2667,19 @@ def _pipeline_arguments(request_args: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in request_args.items() if key in allowed}
 
 
-_PIPELINE_PLANNABLE_STEPS = {"ingest", "concepts", "reclassify-concepts", "taxonomy", "build", "export", "polish"}
+_PIPELINE_PLANNABLE_STEPS = {"ingest", "build", "export", "polish"}
 
 
 def _pipeline_requested_steps(request_args: dict[str, Any]) -> list[str]:
     raw_steps = request_args.get("steps")
     if raw_steps is None:
-        # 2026-08-25 decision: the default now covers the full production
-        # chain, concept grid included — /wiki-sync and /pipeline are both
-        # meant to leave the workspace with an up-to-date grid, filing and
-        # taxonomy by default, not just ingested pages. A caller that only
-        # wants a narrower slice (e.g. "just redo the taxonomy") requests it
-        # explicitly via `steps`; see the three narrower tiers documented in
-        # this repo's CLAUDE.md.
-        return ["ingest", "concepts", "reclassify-concepts", "taxonomy", "build", "export", "polish"]
+        # Default full production chain (0.15.66 simplification: the concept
+        # grid, the reclassify pass and the LLM taxonomy synthesis were
+        # retired from the engine — the concept IS the folder, and the graph
+        # communities are derived from it). /wiki-sync and /pipeline both
+        # leave the workspace ingested and rebuilt; a caller that wants a
+        # narrower slice requests it explicitly via `steps`.
+        return ["ingest", "build", "export", "polish"]
     if not isinstance(raw_steps, list):
         raise ValueError("pipeline steps must be an array of strings.")
     steps = [str(step).strip() for step in raw_steps if str(step).strip()]
@@ -2973,19 +2728,14 @@ def _resolve_steps(job_type: str, raw_steps: Any) -> list[str]:
     if job_type == "pipeline":
         # Single source of truth for what "pipeline, no steps requested"
         # means, shared with the agent_plan path (_pipeline_requested_steps,
-        # used by _plan_pipeline). These two entry points once disagreed: the
-        # 2026-08-25 decision to default the pipeline to the full
-        # ingest->concepts->reclassify-concepts->taxonomy->build->export->polish
-        # chain only reached _plan_pipeline, so the same "pipeline, no steps"
-        # request silently produced a narrower 4-step run when launched
-        # directly through production_start_job.
+        # used by _plan_pipeline).
         effective_steps = raw_steps if isinstance(raw_steps, list) and raw_steps else None
         steps = _pipeline_requested_steps({"steps": effective_steps})
-    elif job_type in {"doctor", "copy", "ingest", "ingest_plan", "ingest_apply", "concepts", "reclassify-concepts", "taxonomy", "build", "export", "polish", "restore"}:
+    elif job_type in {"doctor", "copy", "ingest", "ingest_plan", "ingest_apply", "build", "export", "polish", "restore"}:
         steps = [job_type]
     else:
         raise ValueError(f"Unknown production job type: {job_type}")
-    invalid = [step for step in steps if step not in {"doctor", "copy", "ingest", "ingest_plan", "ingest_apply", "concepts", "reclassify-concepts", "taxonomy", "build", "export", "polish", "restore"}]
+    invalid = [step for step in steps if step not in {"doctor", "copy", "ingest", "ingest_plan", "ingest_apply", "build", "export", "polish", "restore"}]
     if invalid:
         raise ValueError(f"Unknown production step: {invalid[0]}")
     return steps
@@ -3050,7 +2800,7 @@ def _job_lock_scopes(
     deliverables: list[str],
 ) -> list[str]:
     scopes: set[str] = set()
-    if any(step in {"copy", "ingest", "ingest_apply", "concepts", "reclassify-concepts", "taxonomy", "restore"} for step in steps):
+    if any(step in {"copy", "ingest", "ingest_apply", "restore"} for step in steps):
         scopes.add("workspace-write")
     if "build" in steps:
         if templates:
@@ -3204,44 +2954,6 @@ def _run_copy_step(job_id: str) -> int:
     return copied
 
 
-async def _freeze_knowledge_fingerprint(job_id: str, env: dict[str, str]) -> str | None:
-    """Runs `wiki taxonomy --fingerprint` and returns the frozen fingerprint.
-
-    The taxonomy barrier freezes the knowledge corpus fingerprint right after the
-    last `ingest_apply` and the collection consolidation. The engine's
-    `--fingerprint` mode is read-only: it computes the knowledge etag without a
-    model call, so this is exactly the freeze point. Any failure here is a silent
-    skip — the apply then runs without `--expected-corpus` and the engine's
-    compare-and-swap still protects the publication.
-    """
-    command = ["node", _WIKI_BIN, "taxonomy", "--fingerprint"]
-    _append_log(job_id, f"[cmd] cwd={_WORKSPACE_PATH} {' '.join(command)}")
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *command,
-            cwd=str(_WORKSPACE_PATH),
-            env=env,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-        )
-        _ACTIVE_PROCESSES[job_id] = proc
-        output, _ = await proc.communicate()
-        exit_code = await proc.wait()
-    finally:
-        _ACTIVE_PROCESSES.pop(job_id, None)
-    text = (output or b"").decode("utf-8", errors="replace").strip()
-    if exit_code != 0 or not text:
-        return None
-    # The last line carries the fingerprint; logs may precede it on a noisy run.
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
-    fingerprint = lines[-1] if lines else None
-    if not fingerprint or not re.fullmatch(r"[0-9a-f]{64}", fingerprint):
-        _append_log(job_id, "[taxonomy] frozen fingerprint unreadable; applying without --expected-corpus")
-        return None
-    _append_log(job_id, f"[taxonomy] frozen fingerprint={fingerprint}")
-    return fingerprint
-
-
 async def _run_cli_step(
     job_id: str,
     step: str,
@@ -3285,19 +2997,6 @@ async def _run_cli_step(
         restore_run=restore_run,
         dry_run=dry_run,
     )
-    # The taxonomy barrier freezes the knowledge fingerprint before synthesis.
-    #
-    # The engine refuses a synthesis whose frozen fingerprint no longer matches
-    # the corpus (see llm-wiki `wiki taxonomy --expected-corpus`): a concurrent
-    # write between the last apply and the taxonomy task would otherwise produce
-    # a map over a corpus the barrier never certified. We therefore read the
-    # fingerprint first — the barrier's own freeze point — and pass it back.
-    # If the freeze command fails, the apply still runs without the flag: the
-    # engine's own compare-and-swap remains the last line of defence.
-    if step == "taxonomy":
-        frozen = await _freeze_knowledge_fingerprint(job_id, env)
-        if frozen:
-            commands = [[*_STEP_COMMANDS[step], "--expected-corpus", frozen]]
     for command in commands:
         _append_log(job_id, f"[cmd] cwd={_WORKSPACE_PATH} {' '.join(command)}")
         proc = await asyncio.create_subprocess_exec(
