@@ -4,8 +4,6 @@
 
 Workspace-scoped MCP server for running `llm-wiki` production jobs.
 
-Current coordinated release: **0.15.66**.
-
 This agent is intentionally separate from `llm-wiki` chat/search. It mounts one
 workspace at `/workspace`, exposes a small allowlisted set of production actions,
 and runs long operations as background jobs.
@@ -111,9 +109,9 @@ Streamable HTTP requests to the same URL.
 - The default `pipeline` runs `ingest`, `build`, `export`, then `polish`.
   A `steps` argument selects a narrower slice (e.g. `["build","export"]` or
   `["ingest"]`). The retired concept steps (`concepts`,
-  `reclassify-concepts`, `taxonomy`) were removed in 0.15.66 with the
-  engine's simplification: the concept IS the folder, so ingest files each
-  leaf under `wiki/concepts/<concept>/<subject>.md` directly. The legacy
+  `reclassify-concepts`, `taxonomy`) were removed with the engine's
+  simplification: the concept IS the folder, so ingest files each leaf under
+  `wiki/concepts/<concept>/<subject>.md` directly. The legacy
   `copy` step is available only when requested explicitly, for deployments
   that configure `WIKI_IMPORTS` and import path mappings.
 - Bearer authentication controls who can call the agent. `PRODUCTION_REQUIRE_CONFIRMATION`
@@ -133,7 +131,7 @@ Streamable HTTP requests to the same URL.
 - `ingest_plan` accepts the same source `inputs` and writes a planned operation
   file under `.wiki/ingest-plans/`. `ingest_apply` accepts those plan file paths
   in `inputs` and applies them in the single workspace-write phase.
-  This is the 0.11.4 orchestration contract for parallel ingest: users still ask
+  This is the orchestration contract for parallel ingest: users still ask
   for an ingest once, while the runtime can schedule planning tasks in parallel
   and converge on a single apply/review task.
 - `build` and `pipeline` jobs accept `stabilize: true` to pass
