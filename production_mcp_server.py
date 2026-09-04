@@ -34,7 +34,7 @@ import uvicorn
 
 app = Server("agent-production")
 
-_AGENT_VERSION = "0.15.76"
+_AGENT_VERSION = "0.15.77"
 _MCP_TOKEN = os.environ.get("MCP_AUTH_TOKEN", "")
 _MCP_READ_TOKEN = os.environ.get("MCP_READ_TOKEN", "")
 _MCP_WRITE_TOKEN = os.environ.get("MCP_WRITE_TOKEN", "")
