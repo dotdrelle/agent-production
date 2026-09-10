@@ -207,6 +207,83 @@ class ProductionMcpServerTest(unittest.TestCase):
                 all("restore" in line.split("PRODUCTION_ALLOWED_STEPS", 1)[1] for line in declarations),
                 f"{relative} must allow restore in every shipped default",
             )
+            self.assertTrue(
+                all("doctor_apply" in line.split("PRODUCTION_ALLOWED_STEPS", 1)[1] for line in declarations),
+                f"{relative} must allow doctor_apply in every shipped default",
+            )
+
+    def test_agent_plan_okf_apply_creates_one_approved_task(self):
+        fragment = self.payload(self.server._tool_agent_plan({
+            "capability": "workspace.okf",
+            "operation": "doctor_apply",
+            "workspace": {"revision": "rev-okf"},
+            "arguments": {},
+            "constraints": {"requireApprovalForMutations": True},
+        }))
+
+        self.assert_task_graph_fragment(fragment)
+        self.assertEqual(fragment["capability"], "workspace.okf")
+        self.assertEqual(len(fragment["tasks"]), 1)
+        task = fragment["tasks"][0]
+        self.assertEqual(task["operation"], "doctor_apply")
+        self.assertEqual(task["requiredCapability"], "workspace.okf")
+        self.assertEqual(task["locks"], ["workspace-write"])
+        self.assertTrue(task["requiresApproval"])
+        self.assertTrue(task["idempotencyKey"])
+
+    def test_agent_plan_doctor_apply_is_never_inferred_from_the_objective(self):
+        # The OKF pass WRITES the wiki: like restore, it must only be selected
+        # from an explicit operation or an explicit capability — an objective
+        # mentioning "okf" alone must not route a mutating task.
+        capability, _ = self.server._plan_capability_operation(
+            {"objective": "check the okf frontmatter fields before the ingest"}
+        )
+        self.assertEqual(capability, "knowledge.update")
+
+        # An explicit operation, or an explicit capability, still selects it.
+        self.assertEqual(
+            self.server._plan_capability_operation({"operation": "doctor_apply"})[0],
+            "workspace.okf",
+        )
+        self.assertEqual(
+            self.server._plan_capability_operation({"capability": "workspace.okf"})[1],
+            "doctor_apply",
+        )
+
+    def test_agent_execute_routes_doctor_apply_to_a_job(self):
+        async def scenario():
+            async def successful_cli_step(
+                _job_id,
+                _step,
+                _inputs,
+                _templates,
+                _deliverables,
+                stabilize=False,
+                config_path=None,
+                job_metadata=None,
+            ):
+                return 0
+
+            self.server._run_cli_step = successful_cli_step
+            accepted = self.payload(
+                await self.server._tool_agent_execute(
+                    {
+                        "operation": "doctor_apply",
+                        "capability": "workspace.okf",
+                        "arguments": {"confirm": True},
+                        "workspace": {"name": "requested-workspace"},
+                    }
+                )
+            )
+
+            self.assertTrue(accepted["accepted"])
+            await self.server._ACTIVE_TASKS[accepted["jobId"]]
+            status = self.payload(self.server._tool_agent_status({"jobId": accepted["jobId"]}))
+
+            self.assertEqual(status["status"], "done")
+            self.assertEqual(status["result"]["status"], "succeeded")
+
+        asyncio.run(scenario())
 
     def assert_task_graph_fragment(self, fragment):
         self.assertEqual(fragment["contractVersion"], "1")
@@ -260,10 +337,13 @@ class ProductionMcpServerTest(unittest.TestCase):
         self.assertEqual(capabilities["document.build"]["supportedOperations"], ["build"])
         self.assertEqual(capabilities["document.publish"]["supportedOperations"], ["export", "polish"])
         self.assertEqual(capabilities["workspace.diagnose"]["supportedOperations"], ["doctor"])
+        self.assertEqual(capabilities["workspace.okf"]["supportedOperations"], ["doctor_apply"])
         self.assertEqual(capabilities["knowledge.pipeline"]["supportedOperations"], ["pipeline"])
         self.assertTrue(capabilities["knowledge.update"]["defaultRequiresApproval"])
         self.assertEqual(capabilities["knowledge.update"]["mutationClass"], "workspace")
         self.assertNotIn("defaultRequiresApproval", capabilities["workspace.diagnose"])
+        self.assertTrue(capabilities["workspace.okf"]["defaultRequiresApproval"])
+        self.assertEqual(capabilities["workspace.okf"]["mutationClass"], "workspace")
 
     def test_agent_describe_uses_env_instance_and_limits(self):
         server = load_module(

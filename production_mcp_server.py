@@ -34,7 +34,7 @@ import uvicorn
 
 app = Server("agent-production")
 
-_AGENT_VERSION = "0.15.86"
+_AGENT_VERSION = "0.15.87"
 _MCP_TOKEN = os.environ.get("MCP_AUTH_TOKEN", "")
 _MCP_READ_TOKEN = os.environ.get("MCP_READ_TOKEN", "")
 _MCP_WRITE_TOKEN = os.environ.get("MCP_WRITE_TOKEN", "")
@@ -73,7 +73,7 @@ _IMPORTS = os.environ.get("WIKI_IMPORTS", "")
 _IMPORT_PATH_MAPPINGS = os.environ.get("PRODUCTION_IMPORT_PATH_MAPPINGS", "")
 _ALLOWED_STEPS = {
     item.strip()
-    for item in os.environ.get("PRODUCTION_ALLOWED_STEPS", "doctor,copy,ingest,ingest_plan,ingest_apply,build,export,polish,restore,pipeline").split(",")
+    for item in os.environ.get("PRODUCTION_ALLOWED_STEPS", "doctor,doctor_apply,copy,ingest,ingest_plan,ingest_apply,build,export,polish,restore,pipeline").split(",")
     if item.strip()
 }
 _REQUIRE_CONFIRMATION = os.environ.get("PRODUCTION_REQUIRE_CONFIRMATION", "true").lower() not in {"0", "false", "no"}
@@ -85,6 +85,7 @@ _ACTIVE_PROCESSES: dict[str, asyncio.subprocess.Process] = {}
 
 _STEP_COMMANDS: dict[str, list[str]] = {
     "doctor": ["node", _WIKI_BIN, "doctor"],
+    "doctor_apply": ["node", _WIKI_BIN, "doctor", "--apply"],
     "ingest": ["node", _WIKI_BIN, "ingest"],
     "ingest_plan": ["node", _WIKI_BIN, "ingest", "--plan-only"],
     "ingest_apply": ["node", _WIKI_BIN, "ingest", "--apply"],
@@ -93,17 +94,19 @@ _STEP_COMMANDS: dict[str, list[str]] = {
     "polish": ["node", _WIKI_BIN, "export", "--polish"],
     "restore": ["node", _WIKI_BIN, "restore"],
 }
-_MUTATING_STEPS = {"copy", "ingest", "ingest_plan", "ingest_apply", "build", "export", "polish", "restore", "pipeline"}
+_MUTATING_STEPS = {"copy", "ingest", "ingest_plan", "ingest_apply", "build", "export", "polish", "restore", "pipeline", "doctor_apply"}
 _CAPABILITY_STEP_MAP: dict[str, list[str]] = {
     "knowledge.update": ["ingest", "ingest_plan", "ingest_apply"],
     "document.build": ["build"],
     "document.publish": ["export", "polish"],
     "workspace.diagnose": ["doctor"],
+    "workspace.okf": ["doctor_apply"],
     "knowledge.pipeline": ["pipeline"],
     "workspace.restore": ["restore"],
 }
 _AGENT_OPERATION_TRANSLATION: dict[str, dict[str, Any]] = {
     "doctor": {"type": "doctor"},
+    "doctor_apply": {"type": "doctor_apply"},
     "ingest": {"type": "ingest"},
     "ingest_plan": {"type": "ingest_plan"},
     "ingest_apply": {"type": "ingest_apply"},
@@ -522,6 +525,7 @@ _CAPABILITY_ALIASES: dict[str, list[str]] = {
     "document.build": ["build", "rebuild", "generate deliverable"],
     "document.publish": ["publish", "publish deliverable", "export deliverable"],
     "workspace.diagnose": ["diagnose", "diagnostic", "doctor", "check config"],
+    "workspace.okf": ["okf", "frontmatter", "normalize frontmatter", "fix frontmatter", "okf apply"],
     "knowledge.pipeline": ["pipeline", "full pipeline"],
     "workspace.restore": ["restore", "revert", "rollback"],
 }
@@ -556,6 +560,12 @@ def _capability_description(capability_id: str) -> str:
             "This is not a source/Confluence export: to pull external source content, use the source-export agent instead."
         ),
         "workspace.diagnose": "Diagnose workspace configuration and runtime readiness (read-only doctor checks); it creates no jobs.",
+        "workspace.okf": (
+            "Apply the OKF frontmatter catch-up across the workspace wiki: run `wiki doctor --apply`, which fills every "
+            "bundle page missing an OKF `type`, adds the v0.2 keys (`generated`, `status: draft`, `sources`) and migrates "
+            "legacy frontmatter, one idempotent pass. This is the mutating counterpart of workspace.diagnose's read-only "
+            "doctor, always workspace-scoped, and requires explicit approval."
+        ),
         "workspace.restore": (
             "Restore a workspace file to a Git revision or revert one production run to its parent. "
             "This is a mutating operation, always workspace-scoped, and requires explicit approval."
@@ -1185,7 +1195,7 @@ async def list_tools() -> list[Tool]:
                 "properties": {
                     "type": {
                         "type": "string",
-                        "enum": ["doctor", "copy", "ingest", "ingest_plan", "ingest_apply", "build", "export", "polish", "restore", "pipeline"],
+                        "enum": ["doctor", "doctor_apply", "copy", "ingest", "ingest_plan", "ingest_apply", "build", "export", "polish", "restore", "pipeline"],
                     },
                     "steps": {
                         "type": "array",
@@ -1716,6 +1726,8 @@ def _agent_plan(args: dict[str, Any]) -> dict[str, Any]:
         return _plan_pipeline(request_args, constraints, workspace_revision)
     if capability == "workspace.diagnose":
         return _empty_plan("workspace.diagnose", "Diagnose workspace", ["Production planning does not create diagnose tasks."])
+    if capability == "workspace.okf":
+        return _plan_okf_apply(constraints, workspace_revision)
     if capability == "workspace.restore":
         restore_file = str(request_args.get("file") or "").strip()
         restore_revision = str(request_args.get("to") or request_args.get("revision") or "").strip()
@@ -1751,6 +1763,33 @@ def _agent_plan(args: dict[str, Any]) -> dict[str, Any]:
             task["expectedOutputRefs"],
         )
     raise ValueError(f"Unsupported planning capability: {capability}")
+
+
+def _plan_okf_apply(constraints: dict[str, Any], workspace_revision: str) -> dict[str, Any]:
+    if "doctor_apply" not in _ALLOWED_STEPS:
+        raise ValueError("doctor_apply is not allowed by PRODUCTION_ALLOWED_STEPS.")
+    task = _planned_task(
+        "okf-apply",
+        "Apply the OKF frontmatter catch-up (doctor --apply)",
+        "workspace.okf",
+        "doctor_apply",
+        {},
+        [],
+        False,
+        [],
+        [{"type": "directory", "ref": "wiki"}],
+        ["workspace-write"],
+        constraints,
+        workspace_revision,
+    )
+    return _fragment(
+        "workspace.okf",
+        "Apply OKF frontmatter",
+        ["One idempotent doctor --apply pass writes the missing OKF keys across the wiki bundle."],
+        [],
+        [task],
+        task["expectedOutputRefs"],
+    )
 
 
 def _planning_constraints(raw_constraints: Any) -> dict[str, Any]:
@@ -1802,6 +1841,11 @@ def _plan_capability_operation(args: dict[str, Any]) -> tuple[str, str]:
         # operation or an explicit capability.
         elif operation == "restore":
             capability = "workspace.restore"
+        # Same rule as restore: doctor_apply WRITES the wiki, so it is only
+        # ever selected from an explicit operation or an explicit capability,
+        # never from an objective keyword.
+        elif operation == "doctor_apply":
+            capability = "workspace.okf"
 
     if not operation:
         defaults = {
@@ -1810,12 +1854,13 @@ def _plan_capability_operation(args: dict[str, Any]) -> tuple[str, str]:
             "document.publish": "export",
             "knowledge.pipeline": "pipeline",
             "workspace.restore": "restore",
+            "workspace.okf": "doctor_apply",
         }
         operation = defaults.get(capability, "")
 
     if capability not in _CAPABILITY_STEP_MAP:
         raise ValueError("agent_plan requires a supported capability.")
-    if operation and operation not in {"ingest", "ingest_plan", "ingest_apply", "build", "export", "polish", "restore", "pipeline"}:
+    if operation and operation not in {"ingest", "ingest_plan", "ingest_apply", "build", "export", "polish", "restore", "pipeline", "doctor_apply"}:
         raise ValueError(f"Unsupported planning operation: {operation}")
     if operation == "ingest_plan":
         operation = "ingest"
@@ -2731,11 +2776,11 @@ def _resolve_steps(job_type: str, raw_steps: Any) -> list[str]:
         # used by _plan_pipeline).
         effective_steps = raw_steps if isinstance(raw_steps, list) and raw_steps else None
         steps = _pipeline_requested_steps({"steps": effective_steps})
-    elif job_type in {"doctor", "copy", "ingest", "ingest_plan", "ingest_apply", "build", "export", "polish", "restore"}:
+    elif job_type in {"doctor", "doctor_apply", "copy", "ingest", "ingest_plan", "ingest_apply", "build", "export", "polish", "restore"}:
         steps = [job_type]
     else:
         raise ValueError(f"Unknown production job type: {job_type}")
-    invalid = [step for step in steps if step not in {"doctor", "copy", "ingest", "ingest_plan", "ingest_apply", "build", "export", "polish", "restore"}]
+    invalid = [step for step in steps if step not in {"doctor", "doctor_apply", "copy", "ingest", "ingest_plan", "ingest_apply", "build", "export", "polish", "restore"}]
     if invalid:
         raise ValueError(f"Unknown production step: {invalid[0]}")
     return steps
@@ -2800,7 +2845,7 @@ def _job_lock_scopes(
     deliverables: list[str],
 ) -> list[str]:
     scopes: set[str] = set()
-    if any(step in {"copy", "ingest", "ingest_apply", "restore"} for step in steps):
+    if any(step in {"copy", "ingest", "ingest_apply", "restore", "doctor_apply"} for step in steps):
         scopes.add("workspace-write")
     if "build" in steps:
         if templates:
