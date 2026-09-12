@@ -34,7 +34,7 @@ import uvicorn
 
 app = Server("agent-production")
 
-_AGENT_VERSION = "0.15.93"
+_AGENT_VERSION = "0.15.94"
 _MCP_TOKEN = os.environ.get("MCP_AUTH_TOKEN", "")
 _MCP_READ_TOKEN = os.environ.get("MCP_READ_TOKEN", "")
 _MCP_WRITE_TOKEN = os.environ.get("MCP_WRITE_TOKEN", "")
@@ -73,7 +73,7 @@ _IMPORTS = os.environ.get("WIKI_IMPORTS", "")
 _IMPORT_PATH_MAPPINGS = os.environ.get("PRODUCTION_IMPORT_PATH_MAPPINGS", "")
 _ALLOWED_STEPS = {
     item.strip()
-    for item in os.environ.get("PRODUCTION_ALLOWED_STEPS", "doctor,doctor_apply,copy,ingest,ingest_plan,ingest_apply,build,export,polish,restore,pipeline").split(",")
+    for item in os.environ.get("PRODUCTION_ALLOWED_STEPS", "doctor,doctor_apply,copy,ingest,ingest_plan,ingest_apply,ingest_rebuild,build,export,polish,restore,pipeline,lint").split(",")
     if item.strip()
 }
 _REQUIRE_CONFIRMATION = os.environ.get("PRODUCTION_REQUIRE_CONFIRMATION", "true").lower() not in {"0", "false", "no"}
@@ -89,14 +89,18 @@ _STEP_COMMANDS: dict[str, list[str]] = {
     "ingest": ["node", _WIKI_BIN, "ingest"],
     "ingest_plan": ["node", _WIKI_BIN, "ingest", "--plan-only"],
     "ingest_apply": ["node", _WIKI_BIN, "ingest", "--apply"],
+    "ingest_rebuild": ["node", _WIKI_BIN, "ingest", "--from-ingested"],
+    "lint": ["node", _WIKI_BIN, "lint"],
     "build": ["node", _WIKI_BIN, "build"],
     "export": ["node", _WIKI_BIN, "export"],
     "polish": ["node", _WIKI_BIN, "export", "--polish"],
     "restore": ["node", _WIKI_BIN, "restore"],
 }
-_MUTATING_STEPS = {"copy", "ingest", "ingest_plan", "ingest_apply", "build", "export", "polish", "restore", "pipeline", "doctor_apply"}
+_MUTATING_STEPS = {"copy", "ingest", "ingest_plan", "ingest_apply", "ingest_rebuild", "build", "export", "polish", "restore", "pipeline", "doctor_apply"}
 _CAPABILITY_STEP_MAP: dict[str, list[str]] = {
     "knowledge.update": ["ingest", "ingest_plan", "ingest_apply"],
+    "knowledge.rebuild": ["ingest_rebuild"],
+    "knowledge.check": ["lint"],
     "document.build": ["build"],
     "document.publish": ["export", "polish"],
     "workspace.diagnose": ["doctor"],
@@ -110,6 +114,8 @@ _AGENT_OPERATION_TRANSLATION: dict[str, dict[str, Any]] = {
     "ingest": {"type": "ingest"},
     "ingest_plan": {"type": "ingest_plan"},
     "ingest_apply": {"type": "ingest_apply"},
+    "ingest_rebuild": {"type": "ingest_rebuild"},
+    "lint": {"type": "lint"},
     "build": {"type": "build"},
     "export": {"type": "export"},
     "polish": {"type": "polish"},
@@ -522,7 +528,9 @@ def _agent_capabilities() -> list[dict[str, Any]]:
 
 _CAPABILITY_ALIASES: dict[str, list[str]] = {
     "knowledge.update": ["ingest", "ingestion", "ingest files", "ingest documents"],
-    "document.build": ["build", "rebuild", "generate deliverable"],
+    "knowledge.rebuild": ["file the archived sources", "archived sources into the wiki", "concept pages from the archive", "rebuild", "rebuild the concepts", "rebuild concepts", "re-file the archive", "rebuild from the archive"],
+    "knowledge.check": ["dead links", "orphan pages", "missing citations", "content checks", "page type metadata"],
+    "document.build": ["build", "generate deliverable"],
     "document.publish": ["publish", "publish deliverable", "export deliverable"],
     "workspace.diagnose": ["diagnose", "diagnostic", "doctor", "check config"],
     "workspace.okf": ["okf", "frontmatter", "normalize frontmatter", "fix frontmatter", "okf apply"],
@@ -550,6 +558,17 @@ def _capability_description(capability_id: str) -> str:
             "into the llm-wiki knowledge base. Reads local Markdown only — it never fetches from Confluence or any remote source. "
             "Files are processed per source file; the runtime decides ordering and how many run in parallel (callers do not set a batch size). "
             "Use knowledge.update to build or refresh wiki knowledge from documents that are already on disk."
+        ),
+        "knowledge.rebuild": (
+            "Re-file the ARCHIVED sources (raw/ingested/) into the wiki: every archived source is put back into its concept "
+            "folder as a leaf (wiki/concepts/<concept>/<subject>.md) without touching the archive, rebuilding the concept "
+            "pages from the kept history. Mutating, workspace-scoped, requires explicit approval. Use it when the user asks "
+            "to rebuild the wiki's concept pages from what was already ingested."
+        ),
+        "knowledge.check": (
+            "Check the workspace content health (read-only): dead wiki links, orphan pages, missing citations, stale "
+            "deliverables and bundle pages missing their OKF page type. Creates no writes and needs no approval. Use it "
+            "after a rebuild or an ingest to verify links and OKF metadata."
         ),
         "document.build": (
             "Build llm-wiki deliverables from templates in templates/, writing the results under deliverables/. "
@@ -1186,6 +1205,7 @@ async def list_tools() -> list[Tool]:
                 "Start an llm-wiki production job asynchronously. Use only after explicit user request. "
                 "For type=\"ingest\" or type=\"ingest_plan\", this reads Markdown files already present in the workspace, including files exported by agent-cme; it does not fetch from Confluence directly. "
                 "Use type=\"ingest_apply\" only to apply ingest plan files produced by type=\"ingest_plan\". "
+                "type=\"ingest_rebuild\" re-files every ARCHIVED source (raw/ingested/) into its concept folder as a leaf — the rebuild, not a fresh ingest; type=\"lint\" is the read-only content check (dead links, orphans, missing citations, missing OKF page types). "
                 "type=\"export\" (and type=\"polish\") means publishing an existing llm-wiki DELIVERABLE from deliverables/ — it is NOT a source/Confluence export. To export Confluence or other external source content into Markdown, use the source-export agent's export tool (e.g. agent-cme's cme_export_run), not this job. "
                 "Bearer authentication and the step allowlist are the primary controls. "
                 "If PRODUCTION_REQUIRE_CONFIRMATION=true, mutating jobs also require confirm=true."
@@ -1195,11 +1215,11 @@ async def list_tools() -> list[Tool]:
                 "properties": {
                     "type": {
                         "type": "string",
-                        "enum": ["doctor", "doctor_apply", "copy", "ingest", "ingest_plan", "ingest_apply", "build", "export", "polish", "restore", "pipeline"],
+                        "enum": ["doctor", "doctor_apply", "copy", "ingest", "ingest_plan", "ingest_apply", "ingest_rebuild", "lint", "build", "export", "polish", "restore", "pipeline"],
                     },
                     "steps": {
                         "type": "array",
-                        "items": {"type": "string", "enum": ["doctor", "copy", "ingest", "ingest_plan", "ingest_apply", "build", "export", "polish", "restore"]},
+                        "items": {"type": "string", "enum": ["doctor", "copy", "ingest", "ingest_plan", "ingest_apply", "ingest_rebuild", "lint", "build", "export", "polish", "restore"]},
                         "description": "Required for type=pipeline. Ordered steps to run.",
                     },
                     "templates": {
@@ -1559,8 +1579,8 @@ async def _tool_start_job(args: dict[str, Any], workspace_name_override: str | N
         raise ValueError("export and polish jobs require at least one deliverable.")
     if "restore" in steps and not ((restore_file and restore_revision) or restore_run):
         raise ValueError("restore jobs require restoreFile+restoreRevision or restoreRun.")
-    if inputs and not any(step in {"ingest", "ingest_plan", "ingest_apply"} for step in steps):
-        raise ValueError("inputs can only be used with ingest, ingest_plan, ingest_apply, or pipeline jobs.")
+    if inputs and not any(step in {"ingest", "ingest_plan", "ingest_apply", "ingest_rebuild"} for step in steps):
+        raise ValueError("inputs can only be used with ingest, ingest_plan, ingest_apply, ingest_rebuild, or pipeline jobs.")
     lock_scopes = _job_lock_scopes(steps, inputs, templates, deliverables)
 
     plan = {
@@ -1718,6 +1738,10 @@ def _agent_plan(args: dict[str, Any]) -> dict[str, Any]:
 
     if capability == "knowledge.update":
         return _plan_knowledge_update(operation, request_args, constraints, workspace_revision)
+    if capability == "knowledge.rebuild":
+        return _plan_knowledge_rebuild(constraints, workspace_revision)
+    if capability == "knowledge.check":
+        return _plan_knowledge_check(constraints, workspace_revision)
     if capability == "document.build":
         return _plan_document_build(request_args, constraints, workspace_revision, depends_on=[], objective=objective)
     if capability == "document.publish":
@@ -1725,7 +1749,7 @@ def _agent_plan(args: dict[str, Any]) -> dict[str, Any]:
     if capability == "knowledge.pipeline":
         return _plan_pipeline(request_args, constraints, workspace_revision)
     if capability == "workspace.diagnose":
-        return _empty_plan("workspace.diagnose", "Diagnose workspace", ["Production planning does not create diagnose tasks."])
+        return _plan_workspace_diagnose(constraints, workspace_revision)
     if capability == "workspace.okf":
         return _plan_okf_apply(constraints, workspace_revision)
     if capability == "workspace.restore":
@@ -1792,6 +1816,93 @@ def _plan_okf_apply(constraints: dict[str, Any], workspace_revision: str) -> dic
     )
 
 
+def _plan_knowledge_rebuild(constraints: dict[str, Any], workspace_revision: str) -> dict[str, Any]:
+    if "ingest_rebuild" not in _ALLOWED_STEPS:
+        raise ValueError("ingest_rebuild is not allowed by PRODUCTION_ALLOWED_STEPS.")
+    task = _planned_task(
+        "rebuild-from-ingested",
+        "Rebuild the concept pages from the archived sources",
+        "knowledge.rebuild",
+        "ingest_rebuild",
+        {},
+        [],
+        False,
+        [{"type": "directory", "ref": "raw/ingested"}],
+        [{"type": "directory", "ref": "wiki"}],
+        _job_lock_scopes(["ingest_rebuild"], [], [], []),
+        constraints,
+        workspace_revision,
+    )
+    return _fragment(
+        "knowledge.rebuild",
+        "Rebuild concept pages from the archive",
+        ["One job re-files every archived source into its concept folder, then runs the workspace content verification (dead links, orphan pages, missing citations, missing OKF page types) as its second step."],
+        [],
+        [task],
+        task["expectedOutputRefs"],
+    )
+
+
+def _plan_knowledge_check(constraints: dict[str, Any], workspace_revision: str) -> dict[str, Any]:
+    if "lint" not in _ALLOWED_STEPS:
+        raise ValueError("lint is not allowed by PRODUCTION_ALLOWED_STEPS.")
+    task = _planned_task(
+        "content-checks",
+        "Check workspace links and OKF page types",
+        "knowledge.check",
+        "lint",
+        {},
+        [],
+        False,
+        [{"type": "directory", "ref": "wiki"}],
+        [],
+        _job_lock_scopes(["lint"], [], [], []),
+        constraints,
+        workspace_revision,
+    )
+    return _fragment(
+        "knowledge.check",
+        "Check links and OKF metadata",
+        ["One read-only lint pass reports dead links, orphan pages, missing citations and pages missing their OKF page type."],
+        [],
+        [task],
+        [],
+    )
+
+
+def _plan_workspace_diagnose(constraints: dict[str, Any], workspace_revision: str) -> dict[str, Any]:
+    if "doctor" not in _ALLOWED_STEPS:
+        raise ValueError("doctor is not allowed by PRODUCTION_ALLOWED_STEPS.")
+    # The capability was advertised (and alias-matched by the resolver) but the
+    # planner returned an empty fragment, so every delegation to
+    # workspace.diagnose was refused with "No task was planned". Planning the
+    # read-only doctor run as one task is what makes agent_describe and
+    # agent_plan agree: doctor is not in _MUTATING_STEPS, so no approval and a
+    # read lock.
+    task = _planned_task(
+        "workspace-diagnose",
+        "Run read-only workspace diagnostics",
+        "workspace.diagnose",
+        "doctor",
+        {},
+        [],
+        False,
+        [{"type": "directory", "ref": "wiki"}],
+        [],
+        _job_lock_scopes(["doctor"], [], [], []),
+        constraints,
+        workspace_revision,
+    )
+    return _fragment(
+        "workspace.diagnose",
+        "Diagnose workspace",
+        ["One read-only doctor pass reports provider connectivity, config, batch sizing and index warnings, then the prioritized remedies."],
+        [],
+        [task],
+        [],
+    )
+
+
 def _planning_constraints(raw_constraints: Any) -> dict[str, Any]:
     constraints = raw_constraints if isinstance(raw_constraints, dict) else {}
     max_tasks = _positive_int(constraints.get("maxTasks"))
@@ -1850,17 +1961,20 @@ def _plan_capability_operation(args: dict[str, Any]) -> tuple[str, str]:
     if not operation:
         defaults = {
             "knowledge.update": "ingest",
+            "knowledge.rebuild": "ingest_rebuild",
+            "knowledge.check": "lint",
             "document.build": "build",
             "document.publish": "export",
             "knowledge.pipeline": "pipeline",
             "workspace.restore": "restore",
             "workspace.okf": "doctor_apply",
+            "workspace.diagnose": "doctor",
         }
         operation = defaults.get(capability, "")
 
     if capability not in _CAPABILITY_STEP_MAP:
         raise ValueError("agent_plan requires a supported capability.")
-    if operation and operation not in {"ingest", "ingest_plan", "ingest_apply", "build", "export", "polish", "restore", "pipeline", "doctor_apply"}:
+    if operation and operation not in {"ingest", "ingest_plan", "ingest_apply", "ingest_rebuild", "lint", "build", "export", "polish", "restore", "pipeline", "doctor", "doctor_apply"}:
         raise ValueError(f"Unsupported planning operation: {operation}")
     if operation == "ingest_plan":
         operation = "ingest"
@@ -2769,6 +2883,22 @@ def _unique_strings(values: list[str]) -> list[str]:
     return unique
 
 
+_KNOWN_JOB_TYPES = {
+    "doctor", "doctor_apply", "copy", "ingest", "ingest_plan", "ingest_apply",
+    "ingest_rebuild", "lint", "build", "export", "polish", "restore",
+}
+
+# A job type resolving to more than one step, in order. The archive rebuild
+# carries its own verification: re-file every archived source, then run the
+# read-only content check in the SAME job — one approval, two visible steps,
+# the check can never run without the rebuild it verifies. A future job type
+# bundling a step with its own verification step adds one entry here, not a
+# new elif branch.
+_COMPOSITE_JOB_STEPS: dict[str, list[str]] = {
+    "ingest_rebuild": ["ingest_rebuild", "lint"],
+}
+
+
 def _resolve_steps(job_type: str, raw_steps: Any) -> list[str]:
     if job_type == "pipeline":
         # Single source of truth for what "pipeline, no steps requested"
@@ -2776,11 +2906,13 @@ def _resolve_steps(job_type: str, raw_steps: Any) -> list[str]:
         # used by _plan_pipeline).
         effective_steps = raw_steps if isinstance(raw_steps, list) and raw_steps else None
         steps = _pipeline_requested_steps({"steps": effective_steps})
-    elif job_type in {"doctor", "doctor_apply", "copy", "ingest", "ingest_plan", "ingest_apply", "build", "export", "polish", "restore"}:
+    elif job_type in _COMPOSITE_JOB_STEPS:
+        steps = _COMPOSITE_JOB_STEPS[job_type]
+    elif job_type in _KNOWN_JOB_TYPES:
         steps = [job_type]
     else:
         raise ValueError(f"Unknown production job type: {job_type}")
-    invalid = [step for step in steps if step not in {"doctor", "doctor_apply", "copy", "ingest", "ingest_plan", "ingest_apply", "build", "export", "polish", "restore"}]
+    invalid = [step for step in steps if step not in _KNOWN_JOB_TYPES]
     if invalid:
         raise ValueError(f"Unknown production step: {invalid[0]}")
     return steps
@@ -2845,7 +2977,7 @@ def _job_lock_scopes(
     deliverables: list[str],
 ) -> list[str]:
     scopes: set[str] = set()
-    if any(step in {"copy", "ingest", "ingest_apply", "restore", "doctor_apply"} for step in steps):
+    if any(step in {"copy", "ingest", "ingest_apply", "ingest_rebuild", "restore", "doctor_apply"} for step in steps):
         scopes.add("workspace-write")
     if "build" in steps:
         if templates:
@@ -3595,7 +3727,7 @@ def _step_commands(
     if step == "copy":
         return []
     command = [*_STEP_COMMANDS[step]]
-    if step in {"ingest", "ingest_plan", "ingest_apply"}:
+    if step in {"ingest", "ingest_plan", "ingest_apply", "ingest_rebuild"}:
         command.extend(inputs)
         return [command]
     if step == "build":

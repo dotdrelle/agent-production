@@ -250,6 +250,88 @@ class ProductionMcpServerTest(unittest.TestCase):
             "doctor_apply",
         )
 
+    def test_agent_plan_rebuild_creates_one_approved_task(self):
+        fragment = self.payload(self.server._tool_agent_plan({
+            "capability": "knowledge.rebuild",
+            "workspace": {"revision": "rev-rebuild"},
+            "arguments": {},
+            "constraints": {"requireApprovalForMutations": True},
+        }))
+
+        self.assert_task_graph_fragment(fragment)
+        self.assertEqual(fragment["capability"], "knowledge.rebuild")
+        self.assertEqual(len(fragment["tasks"]), 1)
+        task = fragment["tasks"][0]
+        self.assertEqual(task["operation"], "ingest_rebuild")
+        self.assertEqual(task["requiredCapability"], "knowledge.rebuild")
+        self.assertEqual(task["locks"], ["workspace-write"])
+        self.assertTrue(task["requiresApproval"])
+
+    def test_agent_plan_check_creates_one_read_only_task(self):
+        fragment = self.payload(self.server._tool_agent_plan({
+            "capability": "knowledge.check",
+            "workspace": {"revision": "rev-check"},
+            "arguments": {},
+            "constraints": {"requireApprovalForMutations": True},
+        }))
+
+        self.assert_task_graph_fragment(fragment)
+        self.assertEqual(fragment["capability"], "knowledge.check")
+        self.assertEqual(len(fragment["tasks"]), 1)
+        task = fragment["tasks"][0]
+        self.assertEqual(task["operation"], "lint")
+        self.assertEqual(task["locks"], ["read"])
+        # The check is read-only: even under requireApprovalForMutations it
+        # must never ask for an approval.
+        self.assertFalse(task["requiresApproval"])
+
+    def test_agent_plan_diagnose_creates_one_read_only_doctor_task(self):
+        # The capability is advertised (and alias-matched by the resolver), so
+        # agent_plan must actually produce the doctor task: an empty fragment
+        # made every /diagnose delegation fail with "No task was planned".
+        fragment = self.payload(self.server._tool_agent_plan({
+            "capability": "workspace.diagnose",
+            "operation": "doctor",
+            "workspace": {"revision": "rev-diagnose"},
+            "arguments": {},
+            "constraints": {"requireApprovalForMutations": True},
+        }))
+
+        self.assert_task_graph_fragment(fragment)
+        self.assertEqual(fragment["capability"], "workspace.diagnose")
+        self.assertEqual(len(fragment["tasks"]), 1)
+        task = fragment["tasks"][0]
+        self.assertEqual(task["requiredCapability"], "workspace.diagnose")
+        self.assertEqual(task["operation"], "doctor")
+        self.assertEqual(task["locks"], ["read"])
+        # doctor is read-only: never an approval, even under
+        # requireApprovalForMutations.
+        self.assertFalse(task["requiresApproval"])
+
+    def test_agent_execute_routes_rebuild_to_the_from_ingested_job(self):
+        # One job, two steps: the rebuild re-files the archive, then the
+        # read-only verification runs inside the SAME job (one approval).
+        self.assertEqual(
+            self.server._resolve_steps("ingest_rebuild", None),
+            ["ingest_rebuild", "lint"],
+        )
+        self.assertEqual(
+            self.server._step_commands("ingest_rebuild", [], [], []),
+            [["node", self.server._WIKI_BIN, "ingest", "--from-ingested"]],
+        )
+        self.assertEqual(
+            self.server._step_commands("lint", [], [], []),
+            [["node", self.server._WIKI_BIN, "lint"]],
+        )
+        # The combined job still takes the workspace-write lock, and the
+        # mutating step still demands confirmation.
+        self.assertEqual(
+            self.server._job_lock_scopes(["ingest_rebuild", "lint"], [], [], []),
+            ["workspace-write"],
+        )
+        self.assertIn("ingest_rebuild", self.server._MUTATING_STEPS)
+        self.assertNotIn("lint", self.server._MUTATING_STEPS)
+
     def test_agent_execute_routes_doctor_apply_to_a_job(self):
         async def scenario():
             async def successful_cli_step(

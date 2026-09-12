@@ -7,7 +7,9 @@ the manager, engine, and external agents.
 
 `agent-production` exposes workspace-scoped `llm-wiki` production actions
 over MCP. It runs allowlisted long-running jobs such as `doctor`, `ingest`,
-`ingest_plan`, `ingest_apply`, `build`, `export`, `polish`, and the default
+`ingest_plan`, `ingest_apply`, `ingest_rebuild` (re-file the archive + `lint`
+verification in one job), `lint` (read-only content check), `build`, `export`,
+`polish`, and the default
 pipeline as background tasks. (0.15.66 removed the retired concept steps —
 `concepts`, `reclassify-concepts`, `taxonomy` — with the engine's
 simplification: the concept IS the folder, ingest files each leaf under
@@ -65,8 +67,11 @@ job/result instead of starting a new one.
   (`["build","export"]`, or `["ingest"]` alone) requests it explicitly via
   `arguments.steps`/`steps`.
 - Preserve scoped production locks when changing job execution: workspace-write
-  for ingest/copy/ingest_apply/pipeline, read for
-  ingest_plan, deliverable locks for targeted build/export/polish.
+  for ingest/copy/ingest_apply/ingest_rebuild/pipeline, read for
+  ingest_plan and lint, deliverable locks for targeted build/export/polish.
+  `ingest_rebuild` resolves to TWO steps (`ingest_rebuild`, `lint`) in
+  `_resolve_steps` — the verification rides inside the rebuild job, one
+  approval; `lint` alone stays read-only with no confirmation gate.
 - Jobs are asynchronous. Tool calls should return a `jobId` quickly, then expose
   status and logs through follow-up tools.
 - `production_start_job` and `production_job_status` must preserve their native
