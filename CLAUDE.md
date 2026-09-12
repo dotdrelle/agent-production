@@ -57,6 +57,14 @@ job/result instead of starting a new one.
   engine retired (0.15.66 removed `concepts`/`reclassify-concepts`/`taxonomy`
   from `llm-wiki` — any shipped default still allowing them would make the
   pipeline fail with "unknown command" at the first such step).
+- **`workspace.diagnose` is plannable.** `agent_describe` advertised the
+  capability while `agent_plan` returned an empty fragment, so every `/diagnose`
+  delegation was refused with `No task was planned`. `_plan_workspace_diagnose`
+  now plans ONE read-only `doctor` task — a read lock, never
+  `requiresApproval` — and `doctor` sits in both the allowed planning
+  operations (derived from `_AGENT_OPERATION_TRANSLATION ∩
+  PRODUCTION_ALLOWED_STEPS`) and the default operation map.
+  `test_production_mcp_server.py` covers it.
 - **`knowledge.pipeline` chains `ingest → build → export → polish`**, and the
   four-step chain IS the pipeline's silent default: `_pipeline_requested_steps`
   returns `["ingest","build","export","polish"]` when `steps` is omitted, so a
