@@ -1192,6 +1192,41 @@ class ProductionMcpServerTest(unittest.TestCase):
 
         asyncio.run(scenario())
 
+    def test_rebuild_job_survives_a_failing_lint_verification(self):
+        async def scenario():
+            async def cli_step(
+                _job_id,
+                step,
+                _inputs,
+                _templates,
+                _deliverables,
+                stabilize=False,
+                config_path=None,
+                job_metadata=None,
+            ):
+                return 1 if step == "lint" else 0
+
+            self.server._run_cli_step = cli_step
+            started = self.payload(
+                await self.server._tool_start_job({"type": "ingest_rebuild", "confirm": True})
+            )
+
+            await self.server._ACTIVE_TASKS[started["jobId"]]
+            job = self.server._load_job(started["jobId"])
+            status = self.payload(
+                self.server._tool_job_status({"jobId": started["jobId"]})
+            )
+
+            # The rebuild (step 1) succeeded; a crash in the read-only lint that
+            # verifies it must not fail the rebuild the user asked for.
+            self.assertEqual(job["status"], "done")
+            self.assertEqual(status["job"]["status"], "done")
+            steps = {step["name"]: step for step in job["steps"]}
+            self.assertEqual(steps["ingest_rebuild"]["status"], "done")
+            self.assertEqual(steps["lint"]["status"], "failed")
+
+        asyncio.run(scenario())
+
     def test_agent_cancel_cancels_one_job(self):
         async def scenario():
             async def hold_job(_job_id):

@@ -3075,6 +3075,24 @@ async def _run_job(job_id: str) -> None:
                 step["exitCode"] = exit_code
                 step["result"] = _step_result_from_logs(job_id, step["name"])
                 if exit_code != 0:
+                    # The verification step bundled into a rebuild is advisory:
+                    # the rebuild itself (the preceding step) already succeeded,
+                    # and a non-zero `lint` is a crash in a READ-ONLY pass, not
+                    # a reason to fail the rebuild the user asked for. Report it
+                    # loudly, mark only the step failed, and let the job end
+                    # `done` — otherwise a lint crash makes the whole rebuild
+                    # look failed and the human is asked to retry a job that
+                    # already rebuilt the wiki.
+                    if step["name"] == "lint" and len(job["steps"]) > 1:
+                        step["status"] = "failed"
+                        step["finishedAt"] = _now()
+                        _save_job(job)
+                        _append_log(
+                            job_id,
+                            f"[step:warning] {step['name']} failed after the rebuild "
+                            f"(exitCode={exit_code}); the rebuild itself succeeded.",
+                        )
+                        continue
                     raise RuntimeError(f"Step failed: {step['name']} exitCode={exit_code}")
             step["status"] = "done"
             step["finishedAt"] = _now()
