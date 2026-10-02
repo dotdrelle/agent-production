@@ -14,7 +14,7 @@ and runs long operations as background jobs.
 | --------------------------- | --------------------------------------------------------------------------------------- |
 | `production_status`         | Check workspace, allowlist, active lock, and recent jobs.                               |
 | `production_list_templates` | List templates, expected deliverables, and unmatched deliverables.                      |
-| `production_start_job`      | Start `doctor`, `copy`, the complete TAXO `ingest`, `ingest_rebuild`, `lint`, `build`, `export`, `polish`, `restore`, or a pipeline as a background job. |
+| `production_start_job`      | Start `doctor`, `doctor_apply`, `copy`, the complete TAXO `ingest`, `ingest_rebuild`, `lint`, `build`, `export`, `polish`, `restore`, or a pipeline as a background job. |
 | `production_job_status`     | Read one job status.                                                                    |
 | `production_job_logs`       | Read the tail of one job log.                                                           |
 | `production_cancel_job`     | Cancel a running job.                                                                   |
@@ -24,10 +24,10 @@ Orchestration contract (used by `llm-wiki-manager`'s generic orchestrator):
 
 | Tool             | Purpose                                                                                    |
 | ---------------- | ------------------------------------------------------------------------------------------ |
-| `agent_describe` | Declare capabilities (`knowledge.update`, `knowledge.rebuild`, `knowledge.check`, `document.build`, `document.publish`, `workspace.diagnose`, `knowledge.pipeline`, `workspace.restore`), limits, and health.        |
+| `agent_describe` | Declare capabilities (`knowledge.update`, `knowledge.rebuild`, `knowledge.check`, `document.build`, `document.publish`, `workspace.diagnose`, `workspace.okf`, `knowledge.pipeline`, `workspace.restore`), limits, and health.        |
 | `agent_plan`     | Build a task-graph fragment for an objective (concrete input files, locks, idempotency keys). |
 | `agent_execute`  | Start one bounded task; idempotent — a retry with a known `idempotencyKey` returns the existing job. |
-| `agent_status`   | Report orchestrated task progress and its final `TaskResult`.                              |
+| `agent_status`   | Report orchestrated task progress and its final `TaskResult` (for `ingest`/`ingest_rebuild`: `stats`, bounded `warnings` + `warningsTotal`, and `outputRefs` for the produced fiches and tag pages, all read from the engine trace). |
 | `agent_cancel`   | Cancel the job bound to one orchestrated task.                                             |
 
 ## Configuration
@@ -89,15 +89,20 @@ Streamable HTTP requests to the same URL.
 ## Behavior
 
 - Jobs are asynchronous and return a `jobId` immediately.
-- Mutating jobs use scoped locks: ingest/copy/pipeline take the workspace-write
-  lock, targeted build jobs lock
-  their expected deliverables, and export/polish jobs lock the requested
-  deliverables. Non-conflicting targeted jobs can run in parallel.
+- Mutating jobs use scoped locks: ingest/copy/ingest_rebuild/restore/
+  doctor_apply (`workspace-write`) and a pipeline that contains one of them take
+  the workspace-write lock; a targeted build locks its expected deliverables (a
+  build without templates also takes `workspace-write`), and export/polish jobs
+  lock the requested deliverables. `lint` is read-only. Non-conflicting
+  targeted jobs can run in parallel.
 - Job metadata and logs are written under `.wiki/production-jobs`.
 - `production_job_status` includes a structured `progress` object derived from
   the llm-wiki trace file when available: phase, label, detail, percent,
   current ingest source, template/deliverable, batch index/count, and last trace
-  event.
+  event. During a TAXO ingest the phases follow `ingest:sheet` (label
+  "Organize section sheets", detail `Section i/n`) and `ingest:regroup` /
+  `ingest:regroup-done` (label "Organize tags and families", family catalogue
+  and batch progress).
 - `production_start_job` and `production_job_status` include additive
   `_activity` metadata with `poll.server=production` and
   `poll.tool=production_job_status`, so manager shells can monitor jobs without
@@ -136,7 +141,10 @@ Streamable HTTP requests to the same URL.
   `lint` content check as the **second step of the same job** — one approval,
   two visible steps, the verification can never run without the rebuild it
   verifies. The standalone `lint` job type runs that same check alone, with no
-  approval and no write lock.
+  approval and no write lock. `agent_plan` advertises every archived Markdown
+  file as a display-only `inputRefs` entry (the task label carries the count):
+  they are never passed as `arguments.inputs`, which would make the rebuild
+  partial and skip the full-rebuild pruning.
 - `build` and `pipeline` jobs accept `stabilize: true` to pass
   `wiki build --stabilize`; existing deliverables keep unchanged sections
   verbatim while changed sections are merged from the fresh candidate.

@@ -1,14 +1,15 @@
 # Repository Guide
 
-Current coordinated release: **0.15.66**. Keep `_AGENT_VERSION` aligned with
+Current coordinated release: **0.16.01**. Keep `_AGENT_VERSION` aligned with
 the manager, engine, and external agents.
 
 ## Goal
 
 `agent-production` exposes workspace-scoped `llm-wiki` production actions
 over MCP. It runs allowlisted long-running jobs such as `doctor`, one-cycle TAXO
-`ingest`, `ingest_rebuild` (re-file the archive + `lint`
-verification in one job), `lint` (read-only content check), `build`, `export`,
+`ingest`, `ingest_rebuild` (re-runs TAXO over the
+archived sources — section fiches and tag-family pivots — plus the bundled
+advisory `lint` check in one job), `lint` (read-only content check), `build`, `export`,
 `polish`, and the default
 pipeline as background tasks. (0.15.66 removed the retired concept steps —
 `concepts`, `reclassify-concepts`, `taxonomy` — with the engine's
@@ -24,7 +25,11 @@ server — Donna must never learn it. `agent_plan` resolves concrete input files
 (never returns literal globs) and stamps mutating tasks with an
 `idempotencyKey`; `agent_execute` persists key→job mappings in
 `jobs/idempotency.json` so a retry with a known key returns the existing
-job/result instead of starting a new one.
+job/result instead of starting a new one. `knowledge.rebuild`'s aliases cover
+the TAXO vocabulary ("every archived source", "over archived sources", "re-run
+the single taxo operation", "rebuild taxo fiches", "tag-family pivots from
+archived sources") — keep them when the capability is renamed, the manager's
+deterministic resolver reads them from `agent_describe`.
 
 ## Architecture
 
@@ -67,7 +72,9 @@ job/result instead of starting a new one.
 - **`knowledge.pipeline` chains `ingest → build → export → polish`**, and the
   four-step chain IS the pipeline's silent default: `_pipeline_requested_steps`
   returns `["ingest","build","export","polish"]` when `steps` is omitted, so a
-  bare `/wiki-sync` or `/pipeline` leaves the workspace ingested and rebuilt.
+  bare `/pipeline` leaves the workspace ingested and rebuilt. `/wiki-sync` is
+  the export-only scaffold skill (it never ingests): its exported Markdown
+  waits in Pending for `/wiki-ingest`.
   `_resolve_steps` (the direct `production_start_job` entry point) shares this
   exact default with `_pipeline_requested_steps` — do not let the two diverge
   again, as they once silently did. A caller wanting a narrower slice
@@ -120,7 +127,7 @@ job/result instead of starting a new one.
   trace files can link back to the production job that launched them.
 - Keep `_AGENT_VERSION` aligned with the coordinated `llm-wiki-manager`
   release version so status responses identify the deployed agent bundle.
-  Current release line: `0.15.66`. Alignment is checked by
+  Current release line: `0.16.01`. Alignment is checked by
   `llm-wiki-manager/scripts/check-versions.js` and synced by the root
   `build-and-push.sh`.
 - **Auth, scopes, rate limiting** (0.10.3): `MCP_AUTH_TOKEN` remains a legacy
