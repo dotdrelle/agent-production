@@ -14,7 +14,7 @@ and runs long operations as background jobs.
 | --------------------------- | --------------------------------------------------------------------------------------- |
 | `production_status`         | Check workspace, allowlist, active lock, and recent jobs.                               |
 | `production_list_templates` | List templates, expected deliverables, and unmatched deliverables.                      |
-| `production_start_job`      | Start `doctor`, `copy`, `ingest`, `ingest_plan`, `ingest_apply`, `ingest_rebuild`, `lint`, `build`, `export`, `polish`, `restore`, or a pipeline as a background job. |
+| `production_start_job`      | Start `doctor`, `copy`, the complete TAXO `ingest`, `ingest_rebuild`, `lint`, `build`, `export`, `polish`, `restore`, or a pipeline as a background job. |
 | `production_job_status`     | Read one job status.                                                                    |
 | `production_job_logs`       | Read the tail of one job log.                                                           |
 | `production_cancel_job`     | Cancel a running job.                                                                   |
@@ -46,7 +46,7 @@ export WIKI_WORKSPACE_PATH=<absolute-path-to-llm-wiki-workspace>
 Optional:
 
 ```bash
-export PRODUCTION_ALLOWED_STEPS=doctor,doctor_apply,copy,ingest,ingest_plan,ingest_apply,ingest_rebuild,build,export,polish,restore,pipeline,lint
+export PRODUCTION_ALLOWED_STEPS=doctor,doctor_apply,copy,ingest,ingest_rebuild,build,export,polish,restore,pipeline,lint
 export PRODUCTION_REQUIRE_CONFIRMATION=true
 export MCP_AUTH_TOKEN=<generated-local-token>
 export WIKI_CONFIG_PATH=.wikirc.yaml.openai
@@ -56,7 +56,7 @@ export WIKI_IMPORTS=
 # takes the MIN of these and any manager ceiling, so recommendedConcurrency is
 # the effective number of tasks run in parallel. Defaults 4/8 (≈ 4 parallel).
 # Low profile 2/4, high profile 8/16. The wiki LLM backend must accept this many
-# concurrent requests; ingest_apply stays serialized (global workspace-write
+# concurrent requests; TAXO ingest stays serialized (global workspace-write
 # lock). See the manager docs/configuration.md § "Parallelism & throughput".
 export PRODUCTION_RECOMMENDED_CONCURRENCY=4
 export PRODUCTION_MAX_CONCURRENCY=8
@@ -89,8 +89,8 @@ Streamable HTTP requests to the same URL.
 ## Behavior
 
 - Jobs are asynchronous and return a `jobId` immediately.
-- Mutating jobs use scoped locks: ingest/copy/ingest_apply/pipeline take the
-  workspace-write lock, ingest_plan uses a read lock, targeted build jobs lock
+- Mutating jobs use scoped locks: ingest/copy/pipeline take the workspace-write
+  lock, targeted build jobs lock
   their expected deliverables, and export/polish jobs lock the requested
   deliverables. Non-conflicting targeted jobs can run in parallel.
 - Job metadata and logs are written under `.wiki/production-jobs`.
@@ -110,8 +110,9 @@ Streamable HTTP requests to the same URL.
   A `steps` argument selects a narrower slice (e.g. `["build","export"]` or
   `["ingest"]`). The retired concept steps (`concepts`,
   `reclassify-concepts`, `taxonomy`) were removed with the engine's
-  simplification: the concept IS the folder, so ingest files each leaf under
-  `wiki/concepts/<concept>/<subject>.md` directly. The legacy
+  simplification: ingest creates one evidence-bearing fiche per source section
+  under `wiki/sources/**`, then generates tag-family pivots. There is no
+  separate analyze/apply job. The legacy
   `copy` step is available only when requested explicitly, for deployments
   that configure `WIKI_IMPORTS` and import path mappings.
 - Bearer authentication controls who can call the agent. `PRODUCTION_REQUIRE_CONFIRMATION`
@@ -128,14 +129,10 @@ Streamable HTTP requests to the same URL.
 - `ingest` jobs accept an optional `inputs` array, for example
   `["raw/untracked/doc-a.md", "doc-b.md"]`, so one runtime task can ingest a
   restricted source subset.
-- `ingest_plan` accepts the same source `inputs` and writes a planned operation
-  file under `.wiki/ingest-plans/`. `ingest_apply` accepts those plan file paths
-  in `inputs` and applies them in the single workspace-write phase.
-  This is the orchestration contract for parallel ingest: users still ask
-  for an ingest once, while the runtime can schedule planning tasks in parallel
-  and converge on a single apply/review task.
-- `ingest_rebuild` re-files every **archived** source (`raw/ingested/`) into
-  its concept folder (`wiki ingest --from-ingested`), then runs the read-only
+- `ingest` accepts source `inputs` and runs section extraction, fiche writes,
+  tag grouping and pivot updates as one approved, workspace-locked task.
+- `ingest_rebuild` re-runs TAXO for every **archived** source (`raw/ingested/`)
+  to refresh its fiches and tag-family pivots (`wiki ingest --from-ingested`), then runs the read-only
   `lint` content check as the **second step of the same job** — one approval,
   two visible steps, the verification can never run without the rebuild it
   verifies. The standalone `lint` job type runs that same check alone, with no

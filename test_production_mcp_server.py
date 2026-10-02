@@ -125,6 +125,60 @@ class ProductionMcpServerTest(unittest.TestCase):
             stream.write("\n2026-07-21T10:00:04Z +4ms INFO ingest:plan source=raw/a.md")
         self.assertEqual(progress("trace.log")["percent"], 85)
 
+    def test_taxo_family_grouping_does_not_reuse_last_source_progress(self):
+        trace = self.workspace / "trace.log"
+        trace.write_text(
+            "\n".join(
+                [
+                    "2026-07-21T10:00:00Z +0ms INFO ingest:run-start inputCount=16",
+                    "2026-07-21T10:00:01Z +1ms INFO ingest:source-start sourcePath=raw/last.md",
+                    "2026-07-21T10:00:02Z +2ms INFO llm:start label=ingest_taxo_sheet source=raw/last.md",
+                    "2026-07-21T10:00:03Z +3ms INFO ingest:regroup-start",
+                    "2026-07-21T10:00:04Z +4ms INFO llm:start label=ingest_taxo_families tags=24 establishedFamilies=0",
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        progress = self.server._parse_trace_progress("trace.log")
+        self.assertEqual(progress["phase"], "regroup")
+        self.assertEqual(progress["label"], "Organize tags and families")
+        self.assertEqual(progress["detail"], "Grouping 24 tags · LLM running")
+        self.assertEqual(progress["percent"], 92)
+        self.assertNotIn("source", progress)
+        self.assertNotIn("sourceIndex", progress)
+
+        with trace.open("a", encoding="utf-8") as stream:
+            stream.write("\n2026-07-21T10:00:05Z +5ms INFO llm:end label=ingest_taxo_families tags=24 establishedFamilies=0")
+        progress = self.server._parse_trace_progress("trace.log")
+        self.assertEqual(progress["detail"], "Family grouping ready · 24 tags")
+        self.assertEqual(progress["percent"], 94)
+
+    def test_taxo_family_batches_report_progress_until_the_last_batch(self):
+        trace = self.workspace / "trace.log"
+        trace.write_text(
+            "\n".join(
+                [
+                    "2026-07-21T10:00:00Z +0ms INFO ingest:regroup-start",
+                    "2026-07-21T10:00:01Z +1ms INFO llm:start label=ingest_taxo_family_batch tags=40 batchIndex=1 batchCount=3",
+                    "2026-07-21T10:00:02Z +2ms INFO llm:start label=ingest_taxo_family_batch tags=40 batchIndex=2 batchCount=3",
+                    "2026-07-21T10:00:03Z +3ms INFO llm:end label=ingest_taxo_family_batch tags=40 batchIndex=1 batchCount=3",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        progress = self.server._parse_trace_progress("trace.log")
+        self.assertEqual(progress["phase"], "regroup")
+        self.assertEqual(progress["label"], "Organize tags and families")
+        self.assertEqual(progress["detail"], "Family batches 1/3 complete · 1 active")
+        self.assertEqual(progress["percent"], 92)
+
+        with trace.open("a", encoding="utf-8") as stream:
+            stream.write("\n2026-07-21T10:00:04Z +4ms INFO llm:end label=ingest_taxo_family_batch tags=40 batchIndex=2 batchCount=3")
+        progress = self.server._parse_trace_progress("trace.log")
+        self.assertEqual(progress["detail"], "Family batches 2/3 complete")
+        self.assertEqual(progress["percent"], 93)
+
     def test_trace_summary_exposes_llm_tokens_to_agent_result_metrics(self):
         trace = self.workspace / "trace.log"
         trace.write_text(
@@ -146,6 +200,36 @@ class ProductionMcpServerTest(unittest.TestCase):
         self.assertEqual(result["metrics"]["inputTokens"], 1203)
         self.assertEqual(result["metrics"]["outputTokens"], 456)
         self.assertEqual(result["metrics"]["totalTokens"], 1659)
+
+    def test_taxo_output_refs_from_trace_are_returned_by_agent_task_result(self):
+        trace = self.workspace / "trace.log"
+        trace.write_text(
+            "2026-07-21T10:00:04Z +4ms INFO ingest:output path=wiki/sources/doc/topic.md source=raw/doc.md\n"
+            "2026-07-21T10:00:05Z +5ms INFO ingest:output path=wiki/concepts/network/topic.md source=taxo-tags\n",
+            encoding="utf-8",
+        )
+        (self.workspace / ".wiki" / "production-jobs" / "logs").mkdir(parents=True)
+        (self.workspace / ".wiki" / "production-jobs" / "logs" / "job-taxo.log").write_text(
+            f"Trace file: {trace.relative_to(self.workspace)}\n", encoding="utf-8"
+        )
+        step_result = self.server._step_result_from_logs("job-taxo", "ingest")
+        self.assertEqual(step_result["outputRefs"], [
+            {"type": "file", "ref": "wiki/sources/doc/topic.md"},
+            {"type": "file", "ref": "wiki/concepts/network/topic.md"},
+        ])
+        result = self.server._agent_task_result({
+            "status": "done",
+            "steps": [{"name": "ingest", "result": {
+                **step_result,
+                "stats": {"sheetsWritten": 2},
+                "warnings": ["one warning"],
+                "warningsTotal": 3,
+            }}],
+        })
+        self.assertEqual(result["outputRefs"], step_result["outputRefs"])
+        self.assertEqual(result["stats"], {"sheetsWritten": 2})
+        self.assertEqual(result["warnings"], ["one warning"])
+        self.assertEqual(result["warningsTotal"], 3)
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -415,7 +499,7 @@ class ProductionMcpServerTest(unittest.TestCase):
         self.assertIn("maxConcurrency", description["limits"])
 
         capabilities = {item["id"]: item for item in description["capabilities"]}
-        self.assertEqual(capabilities["knowledge.update"]["supportedOperations"], ["ingest", "ingest_plan", "ingest_apply"])
+        self.assertEqual(capabilities["knowledge.update"]["supportedOperations"], ["ingest"])
         self.assertEqual(capabilities["document.build"]["supportedOperations"], ["build"])
         self.assertEqual(capabilities["document.publish"]["supportedOperations"], ["export", "polish"])
         self.assertEqual(capabilities["workspace.diagnose"]["supportedOperations"], ["doctor"])
@@ -728,47 +812,15 @@ class ProductionMcpServerTest(unittest.TestCase):
 
         self.assert_task_graph_fragment(fragment)
         self.assertEqual(fragment["capability"], "knowledge.update")
-        self.assertEqual(
-            [task["operation"] for task in fragment["tasks"]],
-            ["ingest_plan", "ingest_plan", "ingest_apply", "ingest_apply"],
-        )
+        self.assertEqual([task["operation"] for task in fragment["tasks"]], ["ingest"])
         self.assertNotIn("export", [task["operation"] for task in fragment["tasks"]])
-        self.assertEqual(fragment["groups"][0]["id"], "ingest")
-        self.assertEqual(fragment["groups"][0]["recommendedConcurrency"], 2)
-        apply_tasks = [task for task in fragment["tasks"] if task["operation"] == "ingest_apply"]
-        self.assertTrue(all(task["barrier"] for task in apply_tasks))
-        self.assertEqual([group["id"] for group in fragment["groups"]], ["ingest", "apply"])
-        self.assertEqual(fragment["groups"][1]["label"], "Write to wiki")
-        # The write lock conflicts with both applies and still-running planning
-        # read locks: wait for the whole ingest group, and let the lock — not a
-        # dependency chain — serialize the writes. Chaining applies to each
-        # other made one unreadable source file skip every apply behind it.
-        self.assertTrue(all(task["dependsOnGroup"] == "ingest" for task in apply_tasks))
-        self.assertTrue(all(task["groupId"] == "apply" for task in apply_tasks))
-        self.assertEqual(apply_tasks[0]["dependsOn"], [fragment["tasks"][0]["id"]])
-        self.assertEqual(apply_tasks[1]["dependsOn"], [fragment["tasks"][1]["id"]])
-        self.assertTrue(all("workspace-write" in task["locks"] for task in apply_tasks))
-        self.assertEqual(apply_tasks[0]["arguments"]["inputs"], [fragment["tasks"][0]["expectedOutputRefs"][0]["ref"]])
-        self.assertEqual(apply_tasks[1]["arguments"]["inputs"], [fragment["tasks"][1]["expectedOutputRefs"][0]["ref"]])
-        # Labels name the effect, not the CLI flag: the two tasks a user sees
-        # per file must read as "analyzed" then "written".
-        self.assertEqual(
-            [task["label"] for task in fragment["tasks"][:2]],
-            ["Analyze a.md", "Analyze b.md"],
-        )
-        self.assertEqual(
-            [task["label"] for task in apply_tasks],
-            ["Write a.md to the wiki", "Write b.md to the wiki"],
-        )
-        self.assertEqual(fragment["groups"][0]["label"], "Analyze sources")
-        self.assertTrue(all(task["locks"] == ["workspace-write"] for task in apply_tasks))
-        self.assertEqual([task["priority"] for task in apply_tasks], [1, 2])
+        task = fragment["tasks"][0]
+        self.assertEqual(task["arguments"]["inputs"], ["raw/untracked/a.md", "raw/untracked/b.md"])
+        self.assertEqual(task["label"], "Ingest and organize 2 source file(s)")
+        self.assertEqual(task["locks"], ["workspace-write"])
         self.assertTrue(all(task["requiresApproval"] for task in fragment["tasks"]))
         self.assertTrue(all(len(task["idempotencyKey"]) == 64 for task in fragment["tasks"]))
-        self.assertEqual(fragment["tasks"][0]["inputRefs"][0]["ref"], "raw/untracked/a.md")
-        self.assertEqual(fragment["tasks"][1]["inputRefs"][0]["ref"], "raw/untracked/b.md")
-        self.assertEqual(fragment["tasks"][0]["locks"], ["ingest-plan:raw/untracked/a.md"])
-        self.assertEqual(fragment["tasks"][1]["locks"], ["ingest-plan:raw/untracked/b.md"])
+        self.assertEqual([ref["ref"] for ref in task["inputRefs"]], ["raw/untracked/a.md", "raw/untracked/b.md"])
         self.assertTrue(all(task["retryPolicy"]["maxAttempts"] == 3 for task in fragment["tasks"]))
         self.assertTrue(all("execution_failed" in task["retryPolicy"]["retryableErrors"] for task in fragment["tasks"]))
 
@@ -958,7 +1010,7 @@ class ProductionMcpServerTest(unittest.TestCase):
         # production chain is the four remaining steps.
         self.assertEqual(
             operations,
-            ["ingest_plan", "ingest_apply", "build", "export", "polish"],
+            ["ingest", "build", "export", "polish"],
         )
         build = next(task for task in fragment["tasks"] if task["operation"] == "build")
         export = next(task for task in fragment["tasks"] if task["operation"] == "export")
@@ -985,11 +1037,11 @@ class ProductionMcpServerTest(unittest.TestCase):
 
         self.assert_task_graph_fragment(fragment)
         operations = [task["operation"] for task in fragment["tasks"]]
-        self.assertEqual(operations, ["ingest_plan", "ingest_apply"])
+        self.assertEqual(operations, ["ingest"])
         self.assertNotIn("build", operations)
         self.assertNotIn("export", operations)
 
-    def test_pipeline_keeps_each_ingest_apply_independent(self):
+    def test_pipeline_uses_one_atomic_taxo_ingest_task(self):
         pending = self.workspace / "raw" / "untracked"
         pending.mkdir(parents=True)
         (pending / "a.md").write_text("# A\n", encoding="utf-8")
@@ -1007,23 +1059,10 @@ class ProductionMcpServerTest(unittest.TestCase):
             )
         )
 
-        plan_tasks = [task for task in fragment["tasks"] if task["operation"] == "ingest_plan"]
-        apply_tasks = [task for task in fragment["tasks"] if task["operation"] == "ingest_apply"]
-        self.assertEqual(len(plan_tasks), 2)
-        self.assertEqual(len(apply_tasks), 2)
-        # La barrière de groupe attend la fin de TOUTE l'analyse parallèle.
-        self.assertTrue(all(task["dependsOnGroup"] == "ingest" for task in apply_tasks))
-        # Chaque apply ne dépend que de son propre plan. Les enchaîner les uns
-        # aux autres était une ceinture par-dessus des bretelles : un apply
-        # ignoré parce que son plan a échoué faisait hériter la même
-        # impossibilité à tous les suivants, et un seul fichier illisible
-        # laissait neuf fichiers valides non écrits.
-        self.assertEqual(apply_tasks[0]["dependsOn"], [plan_tasks[0]["id"]])
-        self.assertEqual(apply_tasks[1]["dependsOn"], [plan_tasks[1]["id"]])
-        # La sérialisation des écritures reste garantie, mais par le verrou :
-        # deux apply ne peuvent pas détenir workspace-write en même temps.
-        for task in apply_tasks:
-            self.assertIn("workspace-write", task["locks"])
+        self.assertEqual([task["operation"] for task in fragment["tasks"]], ["ingest"])
+        self.assertEqual(fragment["tasks"][0]["arguments"]["inputs"], ["raw/untracked/a.md", "raw/untracked/b.md"])
+        self.assertFalse(fragment["tasks"][0]["parallelizable"])
+        self.assertIn("workspace-write", fragment["tasks"][0]["locks"])
 
     def test_pipeline_default_steps_are_the_four_production_steps(self):
         # 0.15.66 simplification: the concept chain is retired from the
@@ -1044,7 +1083,7 @@ class ProductionMcpServerTest(unittest.TestCase):
             )
         )
         operations = [task["operation"] for task in fragment["tasks"]]
-        self.assertEqual(operations, ["ingest_plan", "ingest_apply"])
+        self.assertEqual(operations, ["ingest"])
         self.assertEqual(
             [t for t in fragment["tasks"] if t["operation"] in {"concepts", "reclassify-concepts", "taxonomy"}],
             [],
@@ -1076,14 +1115,7 @@ class ProductionMcpServerTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.server._resolve_steps("pipeline", ["not-a-real-step"])
 
-    def test_a_failed_analysis_does_not_strand_the_other_applies(self):
-        """A skipped apply must not take its siblings down with it.
-
-        Observed 2026-08-04: ten sources, nine analyzed, one producing
-        malformed JSON. The applies were chained, so the apply of the failed
-        source blocked every apply behind it and nine valid files were never
-        written. Each apply now depends on its own analysis only.
-        """
+    def test_taxo_ingest_is_one_task_for_the_complete_source_batch(self):
         pending = self.workspace / "raw" / "untracked"
         pending.mkdir(parents=True)
         for name in ("a.md", "b.md", "c.md"):
@@ -1100,23 +1132,12 @@ class ProductionMcpServerTest(unittest.TestCase):
                 }
             )
         )
-        plan_tasks = [task for task in fragment["tasks"] if task["operation"] == "ingest_plan"]
-        apply_tasks = [task for task in fragment["tasks"] if task["operation"] == "ingest_apply"]
-        self.assertEqual(len(plan_tasks), 3)
-        self.assertEqual(len(apply_tasks), 3)
-
-        apply_ids = {task["id"] for task in apply_tasks}
-        for apply_task, plan_task in zip(apply_tasks, plan_tasks, strict=True):
-            # No apply references another apply: whichever analysis fails, only
-            # its own apply becomes impossible.
-            self.assertEqual(apply_task["dependsOn"], [plan_task["id"]])
-            self.assertFalse(apply_ids.intersection(apply_task["dependsOn"]))
-
-        # Writes stay strictly serialized, by the lock rather than by the DAG.
-        self.assertTrue(all("workspace-write" in task["locks"] for task in apply_tasks))
-        # And every apply still waits for the whole analysis group, so no write
-        # starts while a read lock is still held.
-        self.assertTrue(all(task["dependsOnGroup"] == "ingest" for task in apply_tasks))
+        self.assertEqual([task["operation"] for task in fragment["tasks"]], ["ingest"])
+        self.assertEqual(fragment["tasks"][0]["arguments"]["inputs"], [
+            "raw/untracked/a.md", "raw/untracked/b.md", "raw/untracked/c.md",
+        ])
+        self.assertFalse(fragment["tasks"][0]["parallelizable"])
+        self.assertIn("workspace-write", fragment["tasks"][0]["locks"])
 
     def test_agent_plan_aggregates_when_max_tasks_is_exceeded(self):
         (self.workspace / "templates" / "a.md").write_text("# A\n", encoding="utf-8")
@@ -1445,11 +1466,16 @@ class ProductionMcpServerTest(unittest.TestCase):
                 )
             )
 
-    def test_ingest_plan_dry_run_accepts_target_inputs_without_workspace_write_lock(self):
+    def test_obsolete_ingest_plan_and_apply_jobs_are_rejected(self):
+        for job_type in ("ingest_plan", "ingest_apply"):
+            with self.subTest(job_type=job_type), self.assertRaisesRegex(ValueError, "Unknown production job type"):
+                asyncio.run(self.server._tool_start_job({"type": job_type, "dryRun": True}))
+
+    def test_ingest_dry_run_covers_the_complete_taxo_operation_under_workspace_lock(self):
         result = asyncio.run(
             self.server._tool_start_job(
                 {
-                    "type": "ingest_plan",
+                    "type": "ingest",
                     "inputs": ["raw/untracked/doc-a.md", "doc-b.md"],
                     "dryRun": True,
                 }
@@ -1457,25 +1483,9 @@ class ProductionMcpServerTest(unittest.TestCase):
         )
         payload = self.payload(result)
         self.assertTrue(payload["ok"])
-        self.assertEqual(payload["plan"]["steps"], ["ingest_plan"])
-        self.assertEqual(payload["plan"]["lockScopes"], ["read"])
-        self.assertIn("node /app/bin/wiki.js ingest --plan-only raw/untracked/doc-a.md doc-b.md", payload["commands"])
-
-    def test_ingest_apply_dry_run_accepts_plan_files_with_workspace_write_lock(self):
-        result = asyncio.run(
-            self.server._tool_start_job(
-                {
-                    "type": "ingest_apply",
-                    "inputs": [".wiki/ingest-plans/plan-a.json"],
-                    "dryRun": True,
-                }
-            )
-        )
-        payload = self.payload(result)
-        self.assertTrue(payload["ok"])
-        self.assertEqual(payload["plan"]["steps"], ["ingest_apply"])
+        self.assertEqual(payload["plan"]["steps"], ["ingest"])
         self.assertEqual(payload["plan"]["lockScopes"], ["workspace-write"])
-        self.assertIn("node /app/bin/wiki.js ingest --apply .wiki/ingest-plans/plan-a.json", payload["commands"])
+        self.assertIn("node /app/bin/wiki.js ingest raw/untracked/doc-a.md doc-b.md", payload["commands"])
 
     def test_mutating_job_requires_confirmation(self):
         with self.assertRaisesRegex(ValueError, "confirm=true"):

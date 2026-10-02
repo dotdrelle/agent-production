@@ -6,15 +6,14 @@ the manager, engine, and external agents.
 ## Goal
 
 `agent-production` exposes workspace-scoped `llm-wiki` production actions
-over MCP. It runs allowlisted long-running jobs such as `doctor`, `ingest`,
-`ingest_plan`, `ingest_apply`, `ingest_rebuild` (re-file the archive + `lint`
+over MCP. It runs allowlisted long-running jobs such as `doctor`, one-cycle TAXO
+`ingest`, `ingest_rebuild` (re-file the archive + `lint`
 verification in one job), `lint` (read-only content check), `build`, `export`,
 `polish`, and the default
 pipeline as background tasks. (0.15.66 removed the retired concept steps —
 `concepts`, `reclassify-concepts`, `taxonomy` — with the engine's
-simplification: the concept IS the folder, ingest files each leaf under
-`wiki/concepts/<concept>/<subject>.md` directly, and the graph communities
-derive from the folders.)
+simplification: ingest writes section fiches under `wiki/sources/**` and
+generated tag-family pages; graph communities derive from those families.)
 
 Since 0.12.0 it is also a full **orchestrable agent** (planner + executor) for
 the manager's agnostic orchestration: it implements `agent_describe`,
@@ -75,8 +74,8 @@ job/result instead of starting a new one.
   (`["build","export"]`, or `["ingest"]` alone) requests it explicitly via
   `arguments.steps`/`steps`.
 - Preserve scoped production locks when changing job execution: workspace-write
-  for ingest/copy/ingest_apply/ingest_rebuild/pipeline, read for
-  ingest_plan and lint, deliverable locks for targeted build/export/polish.
+  for ingest/copy/ingest_rebuild/pipeline, read for lint, deliverable locks for
+  targeted build/export/polish.
   `ingest_rebuild` resolves to TWO steps (`ingest_rebuild`, `lint`) in
   `_resolve_steps` — the verification rides inside the rebuild job, one
   approval; `lint` alone stays read-only with no confirmation gate.
@@ -88,11 +87,9 @@ job/result instead of starting a new one.
 - Keep the default pipeline as `ingest`, `build`, `export`, then `polish`
   (see `knowledge.pipeline` above). The legacy `copy` step is available only
   when explicitly requested and configured.
-- `production_start_job` supports targeted `inputs` for ingest/ingest_plan,
-  plan-file `inputs` for ingest_apply, `templates` for build, and `deliverables`
-  for export/polish. Ingest/copy/ingest_apply/pipeline
-  hold a workspace-write
-  lock; ingest_plan is read-only; targeted build/export/polish jobs hold
+- `production_start_job` supports targeted source `inputs` for ingest,
+  `templates` for build, and `deliverables` for export/polish. Ingest/copy/
+  ingest_rebuild/pipeline hold a workspace-write lock; targeted build/export/polish jobs hold
   deliverable locks so non-conflicting runtime tasks can execute in parallel.
 - The `stabilize` flag on `production_start_job` applies only to `build` steps.
   It passes `--stabilize` to `wiki build`, which preserves unchanged sections
@@ -109,7 +106,8 @@ job/result instead of starting a new one.
   run in parallel — raising only `MAX` does nothing. `agent_plan` sizes its
   groups' `recommendedConcurrency` from the passed constraint capped by
   `_MAX_CONCURRENCY`. Real parallelism is then bounded by the locks above
-  (`ingest_apply` is serialized). Profiles: low `2/4`, default `4/8`, high
+  (the complete TAXO ingestion is one workspace-locked task; section extraction
+  is bounded inside the engine). Profiles: low `2/4`, default `4/8`, high
   `8/16`; the wiki LLM backend must accept that many concurrent requests. Full
   guide: the manager's `docs/configuration.md` § "Parallelism & throughput".
 - `production_start_job` accepts optional `configPath` (a `.wikirc.*` filename

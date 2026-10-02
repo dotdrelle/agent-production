@@ -62,8 +62,8 @@ _AGENT_INSTANCE_ID = os.environ.get("PRODUCTION_INSTANCE_ID", "production-main")
 # Defaults are intermediate (effective ≈ 4 parallel): enough to actually use a
 # capable machine instead of idling, while staying safe on a single LLM backend.
 # Tune per docs/configuration.md — low profile 2/4, high profile 8/16. The LLM
-# endpoint must accept this many concurrent requests, and ingest_apply stays
-# serialized regardless (global workspace-write lock).
+# endpoint must accept this many concurrent requests; TAXO ingest runs as one
+# serialized workspace mutation.
 _RECOMMENDED_CONCURRENCY = _int_env("PRODUCTION_RECOMMENDED_CONCURRENCY", 4)
 _MAX_CONCURRENCY = _int_env("PRODUCTION_MAX_CONCURRENCY", 8)
 _MAX_TASKS_PER_PLAN = _int_env("PRODUCTION_MAX_TASKS_PER_PLAN", 0)
@@ -73,7 +73,7 @@ _IMPORTS = os.environ.get("WIKI_IMPORTS", "")
 _IMPORT_PATH_MAPPINGS = os.environ.get("PRODUCTION_IMPORT_PATH_MAPPINGS", "")
 _ALLOWED_STEPS = {
     item.strip()
-    for item in os.environ.get("PRODUCTION_ALLOWED_STEPS", "doctor,doctor_apply,copy,ingest,ingest_plan,ingest_apply,ingest_rebuild,build,export,polish,restore,pipeline,lint").split(",")
+    for item in os.environ.get("PRODUCTION_ALLOWED_STEPS", "doctor,doctor_apply,copy,ingest,ingest_rebuild,build,export,polish,restore,pipeline,lint").split(",")
     if item.strip()
 }
 _REQUIRE_CONFIRMATION = os.environ.get("PRODUCTION_REQUIRE_CONFIRMATION", "true").lower() not in {"0", "false", "no"}
@@ -86,9 +86,8 @@ _ACTIVE_PROCESSES: dict[str, asyncio.subprocess.Process] = {}
 _STEP_COMMANDS: dict[str, list[str]] = {
     "doctor": ["node", _WIKI_BIN, "doctor"],
     "doctor_apply": ["node", _WIKI_BIN, "doctor", "--apply"],
+    # Normal `wiki ingest` is the complete TAXO operation.
     "ingest": ["node", _WIKI_BIN, "ingest"],
-    "ingest_plan": ["node", _WIKI_BIN, "ingest", "--plan-only"],
-    "ingest_apply": ["node", _WIKI_BIN, "ingest", "--apply"],
     "ingest_rebuild": ["node", _WIKI_BIN, "ingest", "--from-ingested"],
     "lint": ["node", _WIKI_BIN, "lint"],
     "build": ["node", _WIKI_BIN, "build"],
@@ -96,9 +95,9 @@ _STEP_COMMANDS: dict[str, list[str]] = {
     "polish": ["node", _WIKI_BIN, "export", "--polish"],
     "restore": ["node", _WIKI_BIN, "restore"],
 }
-_MUTATING_STEPS = {"copy", "ingest", "ingest_plan", "ingest_apply", "ingest_rebuild", "build", "export", "polish", "restore", "pipeline", "doctor_apply"}
+_MUTATING_STEPS = {"copy", "ingest", "ingest_rebuild", "build", "export", "polish", "restore", "pipeline", "doctor_apply"}
 _CAPABILITY_STEP_MAP: dict[str, list[str]] = {
-    "knowledge.update": ["ingest", "ingest_plan", "ingest_apply"],
+    "knowledge.update": ["ingest"],
     "knowledge.rebuild": ["ingest_rebuild"],
     "knowledge.check": ["lint"],
     "document.build": ["build"],
@@ -112,8 +111,6 @@ _AGENT_OPERATION_TRANSLATION: dict[str, dict[str, Any]] = {
     "doctor": {"type": "doctor"},
     "doctor_apply": {"type": "doctor_apply"},
     "ingest": {"type": "ingest"},
-    "ingest_plan": {"type": "ingest_plan"},
-    "ingest_apply": {"type": "ingest_apply"},
     "ingest_rebuild": {"type": "ingest_rebuild"},
     "lint": {"type": "lint"},
     "build": {"type": "build"},
@@ -398,13 +395,39 @@ def _agent_task_result(job: dict[str, Any], progress: dict[str, Any] | None = No
         metrics["outputTokens"] = output_tokens
     if input_tokens is not None or output_tokens is not None:
         metrics["totalTokens"] = (input_tokens or 0) + (output_tokens or 0)
+    output_refs = _agent_output_refs_for_job(job)
+    seen_refs = {ref["ref"] for ref in output_refs}
+    stats: dict[str, int] = {}
+    warnings: list[str] = []
+    warnings_total = 0
+    for step in job.get("steps") or []:
+        if not isinstance(step, dict) or not isinstance(step.get("result"), dict):
+            continue
+        step_result = step["result"]
+        for ref in step_result.get("outputRefs") or []:
+            value = str(ref.get("ref") or "") if isinstance(ref, dict) else ""
+            if value and value not in seen_refs:
+                seen_refs.add(value)
+                output_refs.append({"type": "file", "ref": value})
+        for key, value in (step_result.get("stats") or {}).items():
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                stats[str(key)] = stats.get(str(key), 0) + int(value)
+        step_warnings = step_result.get("warnings") or []
+        if isinstance(step_warnings, list):
+            warnings.extend(str(value) for value in step_warnings)
+        warnings_total += _int_field(step_result.get("warningsTotal")) or len(step_warnings)
     result: dict[str, Any] = {
         "status": _agent_result_status(status),
-        "outputRefs": _agent_output_refs_for_job(job),
+        "outputRefs": output_refs,
         "metrics": metrics,
     }
     if status in {"failed", "cancelled", "canceled", "error"}:
         result["error"] = _agent_error_from_job(job)
+    if stats:
+        result["stats"] = stats
+    if warnings:
+        result["warnings"] = warnings[:20]
+        result["warningsTotal"] = max(warnings_total, len(warnings))
     return result
 
 
@@ -550,20 +573,21 @@ _CAPABILITY_ALIAS_OPERATIONS: dict[str, dict[str, str]] = {}
 def _capability_description(capability_id: str) -> str:
     # Descriptions are written to be self-sufficient for ANY MCP operator
     # (our own orchestrator or a third-party host such as Claude): they state
-    # what the capability does, what it reads/writes, and how it is split, so
+    # what the capability does and what it reads/writes, so
     # no caller-side hardcoded knowledge is required.
     descriptions = {
         "knowledge.update": (
             "Ingest Markdown source files already present in the workspace (by default the pending files under raw/untracked) "
             "into the llm-wiki knowledge base. Reads local Markdown only — it never fetches from Confluence or any remote source. "
-            "Files are processed per source file; the runtime decides ordering and how many run in parallel (callers do not set a batch size). "
+            "One approved, workspace-locked TAXO operation splits meaningful sections into evidence-bearing fiches under wiki/sources/, assigns tags, and regenerates tag-family pivots under wiki/concepts/. "
+            "It is not split into separate analysis, write, regroup or taxonomy tasks. "
             "Use knowledge.update to build or refresh wiki knowledge from documents that are already on disk."
         ),
         "knowledge.rebuild": (
-            "Re-file the ARCHIVED sources (raw/ingested/) into the wiki: every archived source is put back into its concept "
-            "folder as a leaf (wiki/concepts/<concept>/<subject>.md) without touching the archive, rebuilding the concept "
-            "pages from the kept history. Mutating, workspace-scoped, requires explicit approval. Use it when the user asks "
-            "to rebuild the wiki's concept pages from what was already ingested."
+            "Re-run the complete TAXO operation over ARCHIVED sources (raw/ingested/) without touching the archives: "
+            "refresh section fiches under wiki/sources/ and regenerate tag-family pivots under wiki/concepts/. "
+            "Mutating, workspace-scoped, requires explicit approval. Use it when the user asks to rebuild the wiki from "
+            "what was already ingested."
         ),
         "knowledge.check": (
             "Check the workspace content health (read-only): dead wiki links, orphan pages, missing citations, stale "
@@ -590,8 +614,8 @@ def _capability_description(capability_id: str) -> str:
             "This is a mutating operation, always workspace-scoped, and requires explicit approval."
         ),
         "knowledge.pipeline": (
-            "Run the production pipeline over the workspace in one ordered sequence: ingest (each source is "
-            "filed as a concept leaf under wiki/concepts/<concept>/<subject>.md — the concept IS the folder), "
+            "Run the production pipeline over the workspace in one ordered sequence: complete TAXO ingestion "
+            "(section fiches, tags and tag-family pivots in one workspace-locked operation), "
             "then build, export and polish. Pass arguments.steps to run a narrower slice — for example "
             "[\"build\",\"export\"] to rebuild and republish without touching the sources, or [\"ingest\"] alone."
         ),
@@ -637,12 +661,8 @@ def _agent_operations() -> list[str]:
 
     The plan schema used to hard-code five names while `_CAPABILITY_STEP_MAP`
     (declared right above it) routes `workspace.diagnose` to `doctor` and
-    `agent_describe` advertises `doctor`, `copy`, `ingest_plan` and
-    `ingest_apply` in `allowedSteps`. Donna planned the operation the agent had
-    itself advertised and `agent_plan` rejected it with
-    "'doctor' is not one of [...]". Deriving both schemas from the translation
-    table intersected with `PRODUCTION_ALLOWED_STEPS` makes it impossible for
-    what the agent advertises and what it validates to drift apart again.
+    Derive accepted operations from the same translation table that feeds
+    `agent_describe`, intersected with the deployment allowlist.
     """
     return sorted(set(_AGENT_OPERATION_TRANSLATION) & _ALLOWED_STEPS)
 
@@ -831,7 +851,7 @@ def _lock_path(scope: str = "workspace-write", job_id: str | None = None) -> Pat
     digest = hashlib.sha256(scope.encode("utf-8")).hexdigest()[:16]
     safe_workspace = re.sub(r"[^A-Za-z0-9_.-]+", "_", _WORKSPACE_NAME)
     # "read" is a shared scope: each read-only holder gets its own lock file so
-    # multiple concurrent read jobs (e.g. per-file ingest --plan-only) coexist
+    # multiple concurrent read jobs (e.g. lint) coexist
     # instead of colliding on a single per-scope file (FileExistsError ->
     # target_busy). Exclusive scopes keep one per-scope file whose atomic
     # creation is the mutex; concurrency is decided by _conflicting_lock.
@@ -997,11 +1017,8 @@ def _active_lock() -> dict[str, Any] | None:
 def _conflicting_lock(scopes: list[str]) -> dict[str, Any] | None:
     requested = set(scopes)
     requested_workspace = "workspace-write" in requested
-    # "read" is a shared scope: read-only jobs (e.g. ingest --plan-only, which
-    # only reads sources and writes a uniquely-named plan file) may run
-    # concurrently. Only exclusive scopes (workspace-write, deliverable:*,
-    # template:*) conflict. Without this, per-file ingest_plan tasks serialize
-    # and every parallel one fails with target_busy.
+    # "read" is a shared scope. Only exclusive scopes (workspace-write,
+    # deliverable:*, template:*) conflict.
     requested_exclusive = requested - {"read"}
     for lock in _active_locks():
         active_scopes = set(lock.get("scopes") or [lock.get("scope") or "workspace-write"])
@@ -1203,9 +1220,8 @@ async def list_tools() -> list[Tool]:
             name="production_start_job",
             description=(
                 "Start an llm-wiki production job asynchronously. Use only after explicit user request. "
-                "For type=\"ingest\" or type=\"ingest_plan\", this reads Markdown files already present in the workspace, including files exported by agent-cme; it does not fetch from Confluence directly. "
-                "Use type=\"ingest_apply\" only to apply ingest plan files produced by type=\"ingest_plan\". "
-                "type=\"ingest_rebuild\" re-files every ARCHIVED source (raw/ingested/) into its concept folder as a leaf — the rebuild, not a fresh ingest; type=\"lint\" is the read-only content check (dead links, orphans, missing citations, missing OKF page types). "
+                "For type=\"ingest\", this reads Markdown files already present in the workspace and runs the complete TAXO cycle, including fiche and tag-page writes; it does not fetch from Confluence directly. "
+                "type=\"ingest_rebuild\" reruns TAXO for every ARCHIVED source (raw/ingested/) to rebuild section fiches and tag-family pivots, then performs lint verification in the same job; type=\"lint\" is the read-only content check (dead links, orphans, missing citations, missing OKF page types). "
                 "type=\"export\" (and type=\"polish\") means publishing an existing llm-wiki DELIVERABLE from deliverables/ — it is NOT a source/Confluence export. To export Confluence or other external source content into Markdown, use the source-export agent's export tool (e.g. agent-cme's cme_export_run), not this job. "
                 "Bearer authentication and the step allowlist are the primary controls. "
                 "If PRODUCTION_REQUIRE_CONFIRMATION=true, mutating jobs also require confirm=true."
@@ -1215,11 +1231,11 @@ async def list_tools() -> list[Tool]:
                 "properties": {
                     "type": {
                         "type": "string",
-                        "enum": ["doctor", "doctor_apply", "copy", "ingest", "ingest_plan", "ingest_apply", "ingest_rebuild", "lint", "build", "export", "polish", "restore", "pipeline"],
+                        "enum": ["doctor", "doctor_apply", "copy", "ingest", "ingest_rebuild", "lint", "build", "export", "polish", "restore", "pipeline"],
                     },
                     "steps": {
                         "type": "array",
-                        "items": {"type": "string", "enum": ["doctor", "copy", "ingest", "ingest_plan", "ingest_apply", "ingest_rebuild", "lint", "build", "export", "polish", "restore"]},
+                        "items": {"type": "string", "enum": ["doctor", "copy", "ingest", "ingest_rebuild", "lint", "build", "export", "polish", "restore"]},
                         "description": "Required for type=pipeline. Ordered steps to run.",
                     },
                     "templates": {
@@ -1230,7 +1246,7 @@ async def list_tools() -> list[Tool]:
                     "inputs": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "Optional source files for ingest/ingest_plan steps, or ingest plan files for ingest_apply, relative to the workspace root.",
+                        "description": "Optional source files for ingest/ingest_rebuild, relative to the workspace root.",
                     },
                     "deliverables": {
                         "type": "array",
@@ -1579,8 +1595,8 @@ async def _tool_start_job(args: dict[str, Any], workspace_name_override: str | N
         raise ValueError("export and polish jobs require at least one deliverable.")
     if "restore" in steps and not ((restore_file and restore_revision) or restore_run):
         raise ValueError("restore jobs require restoreFile+restoreRevision or restoreRun.")
-    if inputs and not any(step in {"ingest", "ingest_plan", "ingest_apply", "ingest_rebuild"} for step in steps):
-        raise ValueError("inputs can only be used with ingest, ingest_plan, ingest_apply, ingest_rebuild, or pipeline jobs.")
+    if inputs and not any(step in {"ingest", "ingest_rebuild"} for step in steps):
+        raise ValueError("inputs can only be used with ingest, ingest_rebuild, or pipeline jobs.")
     lock_scopes = _job_lock_scopes(steps, inputs, templates, deliverables)
 
     plan = {
@@ -1821,7 +1837,7 @@ def _plan_knowledge_rebuild(constraints: dict[str, Any], workspace_revision: str
         raise ValueError("ingest_rebuild is not allowed by PRODUCTION_ALLOWED_STEPS.")
     task = _planned_task(
         "rebuild-from-ingested",
-        "Rebuild the concept pages from the archived sources",
+        "Rebuild TAXO fiches and tag-family pivots from archived sources",
         "knowledge.rebuild",
         "ingest_rebuild",
         {},
@@ -1835,8 +1851,8 @@ def _plan_knowledge_rebuild(constraints: dict[str, Any], workspace_revision: str
     )
     return _fragment(
         "knowledge.rebuild",
-        "Rebuild concept pages from the archive",
-        ["One job re-files every archived source into its concept folder, then runs the workspace content verification (dead links, orphan pages, missing citations, missing OKF page types) as its second step."],
+        "Rebuild TAXO knowledge pages from the archive",
+        ["One job reruns TAXO over every archived source to rebuild section fiches and tag-family pivots, then runs workspace content verification (dead links, orphan pages, missing citations, missing OKF page types) as its second step."],
         [],
         [task],
         task["expectedOutputRefs"],
@@ -1936,7 +1952,7 @@ def _plan_capability_operation(args: dict[str, Any]) -> tuple[str, str]:
         operation = legacy_type
 
     if not capability:
-        if operation in {"ingest", "ingest_plan", "ingest_apply"} or "ingest" in objective:
+        if operation == "ingest" or "ingest" in objective:
             capability = "knowledge.update"
         elif operation == "build" or "build" in objective or "document" in objective:
             capability = "document.build"
@@ -1974,10 +1990,8 @@ def _plan_capability_operation(args: dict[str, Any]) -> tuple[str, str]:
 
     if capability not in _CAPABILITY_STEP_MAP:
         raise ValueError("agent_plan requires a supported capability.")
-    if operation and operation not in {"ingest", "ingest_plan", "ingest_apply", "ingest_rebuild", "lint", "build", "export", "polish", "restore", "pipeline", "doctor", "doctor_apply"}:
+    if operation and operation not in {"ingest", "ingest_rebuild", "lint", "build", "export", "polish", "restore", "pipeline", "doctor", "doctor_apply"}:
         raise ValueError(f"Unsupported planning operation: {operation}")
-    if operation == "ingest_plan":
-        operation = "ingest"
     return capability, operation
 
 
@@ -2009,7 +2023,7 @@ def _plan_knowledge_update(
     constraints: dict[str, Any],
     workspace_revision: str,
 ) -> dict[str, Any]:
-    if operation not in {"ingest", "ingest_apply"}:
+    if operation != "ingest":
         raise ValueError(f"knowledge.update cannot plan operation: {operation}")
     if "ingest" not in _ALLOWED_STEPS:
         raise ValueError("ingest is not allowed by PRODUCTION_ALLOWED_STEPS.")
@@ -2018,179 +2032,31 @@ def _plan_knowledge_update(
         return _empty_plan(
             "knowledge.update",
             "Update knowledge",
-            ["No Markdown files were found in raw/untracked; no ingest operation was planned."],
+            ["No Markdown files were found in raw/untracked; no TAXO ingest operation was planned."],
         )
-
-    max_depth = constraints["maxDepth"]
-    max_tasks = constraints["maxTasks"]
-    # The parallel ingest graph uses the internal plan/apply operations. A
-    # deployment may deliberately allow only the aggregate `ingest` step; in
-    # that case advertise and execute a valid sequential plan instead of
-    # returning tasks that the same agent has forbidden itself to execute.
-    parallel_ingest_available = {"ingest_plan", "ingest_apply"}.issubset(_ALLOWED_STEPS)
-    if not parallel_ingest_available or (max_depth is not None and max_depth < 2) or (max_tasks is not None and max_tasks < 2):
-        task = _planned_task(
-            "ingest-all",
-            # Single aggregated task: this one really does analyze *and* write.
-            f"Analyze and write {len(files)} source file(s)",
-            "knowledge.update",
-            "ingest",
-            {"inputs": files},
-            [],
-            False,
-            _file_refs(files),
-            [{"type": "directory", "ref": "wiki"}],
-            _job_lock_scopes(["ingest"], files, [], []),
-            constraints,
-            workspace_revision,
-            progress_weight=len(files),
-        )
-        tasks = [task]
-        expected = task["expectedOutputRefs"]
-        synthesis = [f"{len(files)} source file(s) will be ingested as one aggregated task."]
-        return _fragment("knowledge.update", "Update knowledge", synthesis, [], tasks, expected)
-
-    aggregate_ingest = max_tasks is not None and len(files) + 1 > max_tasks
-    ingest_group = {
-        "id": "ingest",
-        # "Plan"/"Apply" described the CLI flags, not what the user sees
-        # happening: two tasks per file with no hint that one reads and the
-        # other writes. Analyze/Write names the phase by its effect, which is
-        # also what makes the barrier and the serialized writes legible.
-        "label": "Analyze sources",
-        "recommendedConcurrency": constraints["maxConcurrency"],
-        "progressWeight": len(files),
-    }
-    groups: list[dict[str, Any]] = [ingest_group]
-    plan_refs: list[dict[str, Any]] = []
-    tasks: list[dict[str, Any]] = []
-    if aggregate_ingest:
-        plan_ref = _ingest_plan_ref(files)
-        plan_refs.append(plan_ref)
-        tasks.append(
-            _planned_task(
-                "ingest-batch",
-                f"Analyze {len(files)} source file(s)",
-                "knowledge.update",
-                "ingest_plan",
-                {"inputs": files},
-                [],
-                True,
-                _file_refs(files),
-                [plan_ref],
-                ["read"],
-                constraints,
-                workspace_revision,
-                group_id="ingest",
-                recommended_concurrency=constraints["maxConcurrency"],
-                progress_weight=len(files),
-            )
-        )
-    else:
-        for index, file_ref in enumerate(files, 1):
-            plan_ref = _ingest_plan_ref([file_ref])
-            plan_refs.append(plan_ref)
-            tasks.append(
-                _planned_task(
-                    _task_id("ingest", file_ref),
-                    f"Analyze {Path(file_ref).name}",
-                    "knowledge.update",
-                    "ingest_plan",
-                    {"inputs": [file_ref]},
-                    [],
-                    True,
-                    _file_refs([file_ref]),
-                    [plan_ref],
-                    [f"ingest-plan:{file_ref}"],
-                    constraints,
-                    workspace_revision,
-                    group_id="ingest",
-                    recommended_concurrency=constraints["maxConcurrency"],
-                    progress_weight=1,
-                    priority=index,
-                )
-            )
-
-    apply_allowed = "ingest_apply" in _ALLOWED_STEPS
-    # Declared before the branch: the expected-output list below reads it even
-    # when the apply phase is not allowlisted at all.
-    if apply_allowed:
-        # The apply phase is its own group so downstream steps can wait on
-        # the WRITES as a whole instead of on each write. A hard dependsOn on
-        # every apply would couple them to individual write outcomes; a group
-        # barrier waits for the group to be terminal — done OR failed OR
-        # skipped — so a partial corpus still lets the plan settle.
-        apply_group = {
-            "id": "apply",
-            "label": "Write to wiki",
-            "recommendedConcurrency": 1,
-            "progressWeight": len(files),
-        }
-        groups.append(apply_group)
-        plan_tasks = list(tasks)
-        if aggregate_ingest:
-            apply_specs = [("ingest-apply", plan_tasks[0], plan_refs[0], f"{len(files)} source files", len(files), None)]
-        else:
-            apply_specs = [
-                (
-                    "ingest-apply" if len(files) == 1 else _task_id("ingest-apply", file_ref),
-                    plan_task,
-                    plan_ref,
-                    Path(file_ref).name,
-                    1,
-                    plan_task.get("priority"),
-                )
-                for file_ref, plan_task, plan_ref in zip(files, plan_tasks, plan_refs, strict=True)
-            ]
-        # ingest_apply takes the global workspace-write lock, which conflicts
-        # with BOTH another apply and every still-running ingest_plan read lock.
-        # The group barrier waits for the complete parallel planning group, and
-        # the lock itself serializes the writes.
-        #
-        # The applies used to be chained to each other on top of that. It was
-        # belt AND braces, and the belt cost a run: an apply whose plan failed
-        # is skipped, and every apply behind it in the chain inherited a
-        # dependency that would never succeed. One unreadable source file left
-        # nine perfectly good ones unwritten. Nothing was gained — two applies
-        # already cannot start together, since the second cannot acquire
-        # workspace-write while the first holds it.
-        for apply_id, plan_task, plan_ref, source_label, progress_weight, priority in apply_specs:
-            depends_on = [plan_task["id"]]
-            tasks.append(
-                _planned_task(
-                    apply_id,
-                    f"Write {source_label} to the wiki",
-                    "knowledge.update",
-                    "ingest_apply",
-                    {"inputs": [plan_ref["ref"]]},
-                    depends_on,
-                    False,
-                    [plan_ref],
-                    [{"type": "directory", "ref": "wiki"}],
-                    _job_lock_scopes(["ingest_apply"], [plan_ref["ref"]], [], []),
-                    constraints,
-                    workspace_revision,
-                    group_id="apply",
-                    depends_on_group=ingest_group["id"],
-                    barrier=True,
-                    progress_weight=progress_weight,
-                    priority=priority,
-                )
-            )
-
-        # A single apply barrier group serializes every write: the workspace
-        # lock scopes already enforce that only one writer holds the wiki at a
-        # time, and the group barrier is what makes the "all writes terminal"
-        # condition observable by the rest of the plan.
-
-    synthesis = [f"{len(files)} source file(s) resolved from raw/untracked."]
-    if aggregate_ingest:
-        synthesis.append("Source analysis was aggregated into one task to satisfy maxTasks.")
-    if not apply_allowed:
-        synthesis.append("ingest_apply is not allowlisted; the apply barrier was omitted.")
-    # The promise must match the plan.
-    expected = [{"type": "directory", "ref": "wiki"}] if apply_allowed else plan_refs
-    return _fragment("knowledge.update", "Update knowledge", synthesis, groups, tasks, expected)
+    task = _planned_task(
+        "ingest-taxonomy",
+        f"Ingest and organize {len(files)} source file(s)",
+        "knowledge.update",
+        "ingest",
+        {"inputs": files},
+        [],
+        False,
+        _file_refs(files),
+        [{"type": "directory", "ref": "wiki"}],
+        _job_lock_scopes(["ingest"], files, [], []),
+        constraints,
+        workspace_revision,
+        progress_weight=len(files),
+    )
+    return _fragment(
+        "knowledge.update",
+        "Update knowledge",
+        [f"{len(files)} source file(s) will be organized through one TAXO ingestion cycle."],
+        [],
+        [task],
+        task["expectedOutputRefs"],
+    )
 
 
 def _plan_document_build(
@@ -2709,18 +2575,6 @@ def _file_refs(paths: list[str]) -> list[dict[str, Any]]:
     return [{"type": "file", "ref": path, "label": Path(path).name} for path in paths]
 
 
-def _ingest_plan_ref(paths: list[str]) -> dict[str, Any]:
-    # Deterministic plan ref that the engine (writeIngestPlan in
-    # llm-wiki/src/commands/ingest.ts) reproduces exactly:
-    # ingest-{sha256(sorted paths \n-joined)[:16]}.json. The paths are sorted
-    # on BOTH sides so a given input set always maps to the same plan file
-    # (D1/D2), and the ingest- prefix is part of the shared name. A retried
-    # ingest_plan for the same inputs reuses the stable artifact instead of
-    # paying for a fresh timestamped extraction (B1).
-    digest = hashlib.sha256("\n".join(sorted(paths)).encode("utf-8")).hexdigest()[:16]
-    return {"type": "file", "ref": f".wiki/ingest-plans/ingest-{digest}.json", "label": "ingest plan"}
-
-
 def _idempotency_key(
     workspace_revision: str,
     capability: str,
@@ -2834,8 +2688,7 @@ def _pipeline_requested_steps(request_args: dict[str, Any]) -> list[str]:
     if raw_steps is None:
         # Default full production chain (0.15.66 simplification: the concept
         # grid, the reclassify pass and the LLM taxonomy synthesis were
-        # retired from the engine — the concept IS the folder, and the graph
-        # communities are derived from it). /wiki-sync and /pipeline both
+        # retired from the engine. /wiki-sync and /pipeline both
         # leave the workspace ingested and rebuilt; a caller that wants a
         # narrower slice requests it explicitly via `steps`.
         return ["ingest", "build", "export", "polish"]
@@ -2884,7 +2737,7 @@ def _unique_strings(values: list[str]) -> list[str]:
 
 
 _KNOWN_JOB_TYPES = {
-    "doctor", "doctor_apply", "copy", "ingest", "ingest_plan", "ingest_apply",
+    "doctor", "doctor_apply", "copy", "ingest",
     "ingest_rebuild", "lint", "build", "export", "polish", "restore",
 }
 
@@ -2977,7 +2830,7 @@ def _job_lock_scopes(
     deliverables: list[str],
 ) -> list[str]:
     scopes: set[str] = set()
-    if any(step in {"copy", "ingest", "ingest_apply", "ingest_rebuild", "restore", "doctor_apply"} for step in steps):
+    if any(step in {"copy", "ingest", "ingest_rebuild", "restore", "doctor_apply"} for step in steps):
         scopes.add("workspace-write")
     if "build" in steps:
         if templates:
@@ -3237,24 +3090,72 @@ def _exported_files_from_logs(lines: list[str]) -> list[str]:
     return files
 
 
-def _ingest_plan_files_from_logs(lines: list[str]) -> list[str]:
-    files: list[str] = []
-    seen: set[str] = set()
-    for line in lines:
-        match = re.search(r"Ingest plan written:\s*(.+)$", str(line))
-        if not match:
-            continue
-        value = match.group(1).strip()
-        if value and value not in seen:
-            seen.add(value)
-            files.append(value)
-    return files
-
-
 def _step_result_from_logs(job_id: str, step: str) -> dict[str, Any]:
-    if step == "ingest_plan":
-        plan_files = _ingest_plan_files_from_logs(_read_log_tail(job_id, 500))
-        return {"producedFiles": plan_files} if plan_files else {}
+    if step in {"ingest", "ingest_rebuild"}:
+        lines = _read_log_tail(job_id, 500)
+        trace_file = _trace_file_from_logs(lines)
+        if not trace_file:
+            return {}
+        trace_path = (_WORKSPACE_PATH / trace_file).resolve()
+        if not trace_path.exists():
+            return {}
+        stats: dict[str, int] = {}
+        warnings: list[str] = []
+        output_refs: list[dict[str, str]] = []
+        seen_output_refs: set[str] = set()
+        total_warnings = 0
+        for raw in trace_path.read_text(encoding="utf-8", errors="replace").splitlines():
+            event = _trace_event(raw)
+            if not event:
+                continue
+            name = event["name"]
+            fields = event["fields"]
+            if name == "ingest:output":
+                output_path = str(fields.get("path") or "")
+                if output_path.startswith(("wiki/sources/", "wiki/concepts/")) and output_path not in seen_output_refs:
+                    seen_output_refs.add(output_path)
+                    output_refs.append({"type": "file", "ref": output_path})
+            elif name == "ingest:sheet":
+                key = "sheetsKept" if str(fields.get("cached", "false")).lower() == "true" else "sheetsWritten"
+                stats[key] = stats.get(key, 0) + 1
+            elif name == "ingest:sheet-skipped":
+                stats["sheetsSkipped"] = stats.get("sheetsSkipped", 0) + 1
+                total_warnings += 1
+                warnings.append(f"sheet skipped: {fields.get('source', '')} ({fields.get('reason', 'unspecified')})")
+            elif name == "ingest:sheet-duplicate":
+                stats["sheetsDuplicate"] = stats.get("sheetsDuplicate", 0) + 1
+                total_warnings += 1
+                warnings.append(f"duplicate fiche: {fields.get('source', '')}")
+            elif name == "ingest:sheet-close":
+                stats["sheetsClose"] = stats.get("sheetsClose", 0) + 1
+                total_warnings += 1
+                warnings.append(f"close fiche: {fields.get('source', '')}")
+            elif name == "ingest:regroup-done":
+                for key in ("families", "tags", "newTags", "unfiled", "pagesWritten", "pagesRemoved", "llmCalls"):
+                    value = _int_field(fields.get(key))
+                    if value is not None:
+                        stat_key = {
+                            "families": "families",
+                            "tags": "tags",
+                            "newTags": "newTags",
+                            "unfiled": "unfiledTags",
+                            "pagesWritten": "tagPagesWritten",
+                            "pagesRemoved": "tagPagesRemoved",
+                            "llmCalls": "familyLlmCalls",
+                        }[key]
+                        stats[stat_key] = value
+            elif name in {"ingest:sheet-fallback", "ingest:sheet-unanchored", "ingest:tag-unfiled", "ingest:tag-family-degraded", "ingest:sheet-prune-skipped"}:
+                total_warnings += 1
+                warnings.append(f"{name}: {fields.get('path') or fields.get('source') or ''}")
+        result: dict[str, Any] = {}
+        if stats:
+            result["stats"] = stats
+        if warnings:
+            result["warnings"] = warnings[:20]
+            result["warningsTotal"] = total_warnings
+        if output_refs:
+            result["outputRefs"] = output_refs
+        return result
     if step not in {"export", "polish"}:
         return {}
     produced_files = _exported_files_from_logs(_read_log_tail(job_id, 500))
@@ -3424,6 +3325,9 @@ def _parse_trace_progress(trace_file: str) -> dict[str, Any]:
     state: dict[str, Any] = {"traceFile": trace_file}
     ingest_input_count: int | None = None
     ingest_done_count = 0
+    family_calls_active = 0
+    family_batches_complete: set[int] = set()
+    family_batch_count: int | None = None
     stabilize_kept = 0
     stabilize_merged = 0
     stabilize_inserted = 0
@@ -3481,6 +3385,29 @@ def _parse_trace_progress(trace_file: str) -> dict[str, Any]:
             state["detail"] = "Preparing LLM"
             if ingest_input_count is not None and ingest_input_count > 0:
                 state["percent"] = _ingest_source_percent(ingest_done_count, ingest_input_count, 0.35)
+        elif name == "ingest:sheet":
+            state["phase"] = "ingest"
+            source_name = Path(str(fields.get("source") or state.get("source") or "")).name
+            state["label"] = "Organize section sheets"
+            section_index = _int_field(fields.get("sectionIndex"))
+            section_total = _int_field(fields.get("sectionTotal"))
+            if section_index is not None and section_total:
+                state["detail"] = f"{source_name} · Section {section_index + 1}/{section_total}"
+                state["percent"] = _ingest_source_percent(ingest_done_count, ingest_input_count or 1, 0.35 + 0.45 * ((section_index + 1) / section_total))
+        elif name == "ingest:sheet-skipped":
+            state["phase"] = "ingest"
+            state["label"] = "Organize section sheets"
+            state["detail"] = f"Section skipped: {fields.get('reason', 'not usable')}"
+        elif name == "ingest:regroup-start":
+            state["phase"] = "ingest"
+            state["label"] = "Organize tags and families"
+            state["detail"] = "Regenerating tag pages"
+            state["percent"] = 90
+        elif name == "ingest:regroup-done":
+            state["phase"] = "ingest"
+            state["label"] = "Organize tags and families"
+            state["detail"] = "Tag pages ready"
+            state["percent"] = 97
         elif name == "ingest:plan":
             state["phase"] = "ingest"
             state["source"] = fields.get("source") or state.get("source")
@@ -3577,15 +3504,39 @@ def _parse_trace_progress(trace_file: str) -> dict[str, Any]:
             if output_tokens is not None:
                 state["outputTokens"] = output_tokens
         elif name == "llm:start":
-            is_stabilize_llm = fields.get("label") == "build:stabilize"
-            state["phase"] = "stabilize" if is_stabilize_llm else "llm"
+            llm_label = fields.get("label") or ""
+            is_stabilize_llm = llm_label == "build:stabilize"
+            is_taxo_families_llm = llm_label.startswith("ingest_taxo_family") or llm_label == "ingest_taxo_families"
+            state["phase"] = "stabilize" if is_stabilize_llm else "regroup" if is_taxo_families_llm else "llm"
             state["source"] = fields.get("source") or state.get("source")
             state["template"] = fields.get("template") or state.get("template")
             state["batchIndex"] = _int_field(fields.get("batchIndex"))
             state["batchCount"] = _int_field(fields.get("batchCount"))
             state["instructionCount"] = _int_field(fields.get("instructionCount")) or state.get("instructionCount")
             state["currentBatchStartedAt"] = event["at"]
-            if is_stabilize_llm:
+            if is_taxo_families_llm:
+                # This call runs after the per-source extraction loop. Do not
+                # inherit the last source filename or its section percentage:
+                # that made Serve look frozen on (for example) “file 12/16 ·
+                # LLM running · 74%” while taxonomy regrouping was underway.
+                state.pop("source", None)
+                state.pop("sourceIndex", None)
+                state["phase"] = "regroup"
+                state["label"] = "Organize tags and families"
+                tag_count = _int_field(fields.get("tags"))
+                batch_index = _int_field(fields.get("batchIndex"))
+                family_batch_count = _int_field(fields.get("batchCount")) or family_batch_count
+                family_calls_active += 1
+                if llm_label == "ingest_taxo_family_catalogue":
+                    state["detail"] = f"Finding family labels for {tag_count} tags · LLM running" if tag_count is not None else "Finding family labels · LLM running"
+                    state["percent"] = max(90, int(state.get("percent") or 0))
+                elif batch_index is not None and family_batch_count:
+                    state["detail"] = f"Assigning family batch {batch_index}/{family_batch_count} · LLM running ({family_calls_active} active)"
+                    state["percent"] = max(91, 90 + round(5 * len(family_batches_complete) / family_batch_count))
+                else:
+                    state["detail"] = f"Grouping {tag_count} tags · LLM running" if tag_count is not None else "Grouping tags · LLM running"
+                    state["percent"] = 92
+            elif is_stabilize_llm:
                 section = str(state.get("stabilizeSection") or "")
                 state["label"] = f"Stabilize {state.get('template') or ''}".strip()
                 state["detail"] = f"Stabilisation LLM: {section}" if section else "Stabilisation LLM"
@@ -3596,16 +3547,39 @@ def _parse_trace_progress(trace_file: str) -> dict[str, Any]:
                 state["detail"] = "LLM running"
             else:
                 state["label"] = f"Build {state.get('template') or ''}".strip()
-            if not is_stabilize_llm and state.get("batchIndex") is not None and state.get("batchCount"):
+            if not is_stabilize_llm and not is_taxo_families_llm and state.get("batchIndex") is not None and state.get("batchCount"):
                 state["detail"] = f"Batch {state['batchIndex'] + 1}/{state['batchCount']} · LLM running"
                 state["percent"] = _batch_percent(state["batchIndex"], state["batchCount"], False)
         elif name == "llm:end":
-            is_stabilize_llm = fields.get("label") == "build:stabilize"
-            state["phase"] = "stabilize" if is_stabilize_llm else "llm"
+            llm_label = fields.get("label") or ""
+            is_stabilize_llm = llm_label == "build:stabilize"
+            is_taxo_families_llm = llm_label.startswith("ingest_taxo_family") or llm_label == "ingest_taxo_families"
+            state["phase"] = "stabilize" if is_stabilize_llm else "regroup" if is_taxo_families_llm else "llm"
             state["source"] = fields.get("source") or state.get("source")
             state["batchIndex"] = _int_field(fields.get("batchIndex"))
             state["batchCount"] = _int_field(fields.get("batchCount"))
-            if is_stabilize_llm:
+            if is_taxo_families_llm:
+                state.pop("source", None)
+                state.pop("sourceIndex", None)
+                state["phase"] = "regroup"
+                state["label"] = "Organize tags and families"
+                tag_count = _int_field(fields.get("tags"))
+                batch_index = _int_field(fields.get("batchIndex"))
+                family_batch_count = _int_field(fields.get("batchCount")) or family_batch_count
+                family_calls_active = max(0, family_calls_active - 1)
+                if llm_label == "ingest_taxo_family_catalogue":
+                    state["detail"] = f"Family labels ready · {tag_count} tags" if tag_count is not None else "Family labels ready"
+                    state["percent"] = max(91, int(state.get("percent") or 0))
+                elif batch_index is not None and family_batch_count:
+                    family_batches_complete.add(batch_index)
+                    state["detail"] = f"Family batches {len(family_batches_complete)}/{family_batch_count} complete"
+                    if family_calls_active:
+                        state["detail"] += f" · {family_calls_active} active"
+                    state["percent"] = max(91, 90 + round(5 * len(family_batches_complete) / family_batch_count))
+                else:
+                    state["detail"] = f"Family grouping ready · {tag_count} tags" if tag_count is not None else "Family grouping ready"
+                    state["percent"] = 94
+            elif is_stabilize_llm:
                 section = str(state.get("stabilizeSection") or "")
                 state["label"] = f"Stabilize {state.get('template') or ''}".strip()
                 state["detail"] = f"LLM stabilization complete: {section}" if section else "LLM stabilization complete"
@@ -3614,7 +3588,7 @@ def _parse_trace_progress(trace_file: str) -> dict[str, Any]:
                 source_name = Path(str(state.get("source") or "")).name
                 state["label"] = f"Ingest {source_name}".strip()
                 state["detail"] = "LLM complete"
-            if not is_stabilize_llm and state.get("batchIndex") is not None and state.get("batchCount"):
+            if not is_stabilize_llm and not is_taxo_families_llm and state.get("batchIndex") is not None and state.get("batchCount"):
                 state["detail"] = f"Batch {state['batchIndex'] + 1}/{state['batchCount']} complete"
                 state["percent"] = _batch_percent(state["batchIndex"], state["batchCount"], True)
         elif name == "build:template-done":
@@ -3745,7 +3719,7 @@ def _step_commands(
     if step == "copy":
         return []
     command = [*_STEP_COMMANDS[step]]
-    if step in {"ingest", "ingest_plan", "ingest_apply", "ingest_rebuild"}:
+    if step in {"ingest", "ingest_rebuild"}:
         command.extend(inputs)
         return [command]
     if step == "build":
