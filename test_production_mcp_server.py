@@ -351,6 +351,27 @@ class ProductionMcpServerTest(unittest.TestCase):
         self.assertEqual(task["locks"], ["workspace-write"])
         self.assertTrue(task["requiresApproval"])
 
+    def test_agent_plan_rebuild_lists_archived_sources_as_input_refs_only(self):
+        archive = self.workspace / "raw" / "ingested" / "acpi"
+        archive.mkdir(parents=True)
+        (archive / "board.md").write_text("# Board\n")
+        (archive / "prophix.md").write_text("# Prophix\n")
+
+        fragment = self.payload(self.server._tool_agent_plan({
+            "capability": "knowledge.rebuild",
+            "workspace": {"revision": "rev-rebuild-refs"},
+            "arguments": {},
+            "constraints": {"requireApprovalForMutations": True},
+        }))
+
+        task = fragment["tasks"][0]
+        files = [ref["ref"] for ref in task["inputRefs"] if ref["type"] == "file"]
+        self.assertEqual(sorted(files), ["raw/ingested/acpi/board.md", "raw/ingested/acpi/prophix.md"])
+        self.assertIn("2 archived source(s)", task["label"])
+        # The files are shown, never passed on: a file list would turn the
+        # full rebuild into a partial one that prunes nothing.
+        self.assertEqual(task["arguments"], {})
+
     def test_agent_plan_check_creates_one_read_only_task(self):
         fragment = self.payload(self.server._tool_agent_plan({
             "capability": "knowledge.check",

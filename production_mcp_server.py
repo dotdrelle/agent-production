@@ -551,7 +551,7 @@ def _agent_capabilities() -> list[dict[str, Any]]:
 
 _CAPABILITY_ALIASES: dict[str, list[str]] = {
     "knowledge.update": ["ingest", "ingestion", "ingest files", "ingest documents"],
-    "knowledge.rebuild": ["file the archived sources", "archived sources into the wiki", "concept pages from the archive", "rebuild", "rebuild the concepts", "rebuild concepts", "re-file the archive", "rebuild from the archive"],
+    "knowledge.rebuild": ["file the archived sources", "archived sources into the wiki", "concept pages from the archive", "rebuild", "rebuild the concepts", "rebuild concepts", "re-file the archive", "rebuild from the archive", "every archived source", "over archived sources", "re-run the single taxo operation", "rebuild taxo fiches", "tag-family pivots from archived sources"],
     "knowledge.check": ["dead links", "orphan pages", "missing citations", "content checks", "page type metadata"],
     "document.build": ["build", "generate deliverable"],
     "document.publish": ["publish", "publish deliverable", "export deliverable"],
@@ -1835,19 +1835,27 @@ def _plan_okf_apply(constraints: dict[str, Any], workspace_revision: str) -> dic
 def _plan_knowledge_rebuild(constraints: dict[str, Any], workspace_revision: str) -> dict[str, Any]:
     if "ingest_rebuild" not in _ALLOWED_STEPS:
         raise ValueError("ingest_rebuild is not allowed by PRODUCTION_ALLOWED_STEPS.")
+    # The archived files are listed as INPUT REFS only, so the run graph and
+    # the plan panels can show which sources the rebuild works through. They
+    # must never become `arguments.inputs`: `wiki ingest --from-ingested <files>`
+    # is a PARTIAL rebuild, which keeps the rest of the tree and skips the
+    # full-rebuild pruning of pages no source produces any more.
+    archived = _scan_markdown_files("raw/ingested")
     task = _planned_task(
         "rebuild-from-ingested",
-        "Rebuild TAXO fiches and tag-family pivots from archived sources",
+        f"Rebuild TAXO fiches and tag-family pivots from {len(archived)} archived source(s)" if archived
+        else "Rebuild TAXO fiches and tag-family pivots from archived sources",
         "knowledge.rebuild",
         "ingest_rebuild",
         {},
         [],
         False,
-        [{"type": "directory", "ref": "raw/ingested"}],
+        [{"type": "directory", "ref": "raw/ingested"}, *_file_refs(archived)],
         [{"type": "directory", "ref": "wiki"}],
         _job_lock_scopes(["ingest_rebuild"], [], [], []),
         constraints,
         workspace_revision,
+        progress_weight=max(1, len(archived)),
     )
     return _fragment(
         "knowledge.rebuild",
