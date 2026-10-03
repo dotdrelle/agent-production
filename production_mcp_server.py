@@ -628,6 +628,10 @@ def _capability_input_schema(capability_id: str, supported: list[str]) -> dict[s
         "operation": {"type": "string", "enum": supported, "description": f"Which supported operation to run for this capability. One of: {', '.join(supported)}."},
         "configPath": {"type": "string", "description": "Optional .wikirc file path relative to the workspace root (e.g. .wikirc.yaml.openai). Omit to use the workspace default."},
         "callerLabel": {"type": "string", "description": "Optional identifier of the caller, logged with the job for traceability."},
+        # Consumed by the confirmation guard (PRODUCTION_REQUIRE_CONFIRMATION):
+        # the schema is closed, so the field must be declared or a contract-
+        # respecting dispatcher will not send it.
+        "confirm": {"type": "boolean", "description": "Set by the orchestrator once the task was approved; required by the confirmation guard for mutating jobs."},
     }
     if capability_id == "knowledge.update":
         properties["inputs"] = {"type": "array", "items": {"type": "string"}, "description": "Optional explicit list of Markdown source files (relative to the workspace root) to ingest. If omitted, all pending files under raw/untracked are ingested."}
