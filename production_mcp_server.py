@@ -543,7 +543,7 @@ def _agent_capabilities() -> list[dict[str, Any]]:
                 "inputSchema": _capability_input_schema(capability_id, supported),
                 "outputSchema": {"type": "object", "additionalProperties": True},
                 "supportedOperations": supported,
-                **({"mutationClass": "workspace", "defaultRequiresApproval": True} if mutating else {}),
+                **({"mutationClass": "workspace", "defaultRequiresApproval": True} if mutating else {"readOnly": True}),
             }
         )
     return capabilities
@@ -1285,6 +1285,7 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="production_job_status",
+            annotations={"readOnlyHint": True},
             description="Read status for one production job.",
             inputSchema={
                 "type": "object",
@@ -1295,6 +1296,7 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="production_job_logs",
+            annotations={"readOnlyHint": True},
             description="Read a production job log tail.",
             inputSchema={
                 "type": "object",
