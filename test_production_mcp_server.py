@@ -125,6 +125,28 @@ class ProductionMcpServerTest(unittest.TestCase):
             stream.write("\n2026-07-21T10:00:04Z +4ms INFO ingest:plan source=raw/a.md")
         self.assertEqual(progress("trace.log")["percent"], 85)
 
+    def test_taxo_ingest_reports_each_file_state(self):
+        # One task covers the whole batch: the per-file states are what lets
+        # the UIs turn finished inputs green and show several in flight.
+        trace = self.workspace / "trace.log"
+        trace.write_text(
+            "\n".join(
+                [
+                    "2026-07-21T10:00:00Z +0ms INFO ingest:run-start inputCount=4",
+                    "2026-07-21T10:00:01Z +1ms INFO ingest:sheet source=\"raw/untracked/A doc.md\" sectionIndex=0 sectionTotal=2",
+                    "2026-07-21T10:00:01Z +1ms INFO ingest:sheet source=raw/untracked/b.md sectionIndex=0 sectionTotal=1",
+                    "2026-07-21T10:00:02Z +2ms INFO ingest:source-start sourcePath=\"raw/untracked/A doc.md\"",
+                    "2026-07-21T10:00:03Z +3ms INFO ingest:source-done source=\"raw/untracked/A doc.md\" status=success",
+                    "2026-07-21T10:00:03Z +3ms INFO ingest:sheet source=\"raw/untracked/A doc.md\" sectionIndex=1 sectionTotal=2",
+                    "2026-07-21T10:00:04Z +4ms ERROR ingest:taxo-prepass-failed sourcePath=raw/untracked/c.md message=boom",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        progress = self.server._parse_trace_progress("trace.log")
+        self.assertEqual(progress["sourceStates"], {"A doc.md": "done", "b.md": "running", "c.md": "failed"})
+        self.assertEqual(progress["sourceActiveCount"], 1)
+
     def test_taxo_family_grouping_does_not_reuse_last_source_progress(self):
         trace = self.workspace / "trace.log"
         trace.write_text(

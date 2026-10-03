@@ -3234,6 +3234,8 @@ def _job_progress(job: dict[str, Any], log_tail: list[str]) -> dict[str, Any]:
         "currentBatchStartedAt": trace.get("currentBatchStartedAt"),
         "inputTokens": trace.get("inputTokens"),
         "outputTokens": trace.get("outputTokens"),
+        "sourceStates": trace.get("sourceStates"),
+        "sourceActiveCount": trace.get("sourceActiveCount"),
     }
     if status == "done":
         progress["percent"] = 100
@@ -3333,6 +3335,19 @@ def _parse_trace_progress(trace_file: str) -> dict[str, Any]:
     state: dict[str, Any] = {"traceFile": trace_file}
     ingest_input_count: int | None = None
     ingest_done_count = 0
+    # Per-file state of a TAXO ingest (basename -> running/done/failed). The
+    # whole batch is ONE task, so this is the only place the UIs can learn
+    # which files are finished and which several are in flight at once (the
+    # engine extracts up to limits.maxInFlightRequests sources ahead).
+    ingest_file_states: dict[str, str] = {}
+
+    def _mark_source(raw: Any, file_state: str) -> None:
+        file_name = Path(str(raw or "")).name
+        if not file_name:
+            return
+        if file_state == "running" and ingest_file_states.get(file_name) in {"done", "failed"}:
+            return
+        ingest_file_states[file_name] = file_state
     family_calls_active = 0
     family_batches_complete: set[int] = set()
     family_batch_count: int | None = None
@@ -3372,6 +3387,7 @@ def _parse_trace_progress(trace_file: str) -> dict[str, Any]:
         elif name == "ingest:source-start":
             state["phase"] = "ingest"
             state["source"] = fields.get("sourcePath") or state.get("source")
+            _mark_source(fields.get("sourcePath"), "running")
             source_name = Path(str(state.get("source") or "")).name
             state["label"] = f"Ingest {source_name}".strip()
             if ingest_input_count is not None and ingest_input_count > 0:
@@ -3396,6 +3412,7 @@ def _parse_trace_progress(trace_file: str) -> dict[str, Any]:
         elif name == "ingest:sheet":
             state["phase"] = "ingest"
             source_name = Path(str(fields.get("source") or state.get("source") or "")).name
+            _mark_source(fields.get("source"), "running")
             state["label"] = "Organize section sheets"
             section_index = _int_field(fields.get("sectionIndex"))
             section_total = _int_field(fields.get("sectionTotal"))
@@ -3427,6 +3444,7 @@ def _parse_trace_progress(trace_file: str) -> dict[str, Any]:
         elif name == "ingest:source-done":
             state["phase"] = "ingest"
             ingest_done_count += 1
+            _mark_source(fields.get("source"), "done")
             state["source"] = fields.get("source") or state.get("source")
             source_name = Path(str(state.get("source") or "")).name
             state["label"] = f"Ingest {source_name}".strip()
@@ -3626,9 +3644,15 @@ def _parse_trace_progress(trace_file: str) -> dict[str, Any]:
             state["waitMs"] = wait_ms
             state["retryAt"] = retry_at
             state["detail"] = _quota_wait_detail(name, fields)
+        elif name in {"ingest:source-failed", "ingest:taxo-prepass-failed"}:
+            _mark_source(fields.get("sourcePath") or fields.get("source"), "failed")
         elif name.startswith("export:"):
             state["phase"] = "export"
             state["detail"] = name
+    if ingest_file_states:
+        # Bounded: a huge batch must not bloat every status poll.
+        state["sourceStates"] = dict(list(ingest_file_states.items())[:500])
+        state["sourceActiveCount"] = sum(1 for value in ingest_file_states.values() if value == "running")
     return state
 
 
