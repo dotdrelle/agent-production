@@ -1455,14 +1455,14 @@ def _agent_capability_status(args: dict[str, Any]) -> dict[str, Any]:
     if capability != "knowledge.update" or operation != "ingest":
         raise ValueError(f"Input discovery is not supported for {capability or 'missing capability'}/{operation or 'missing operation'}.")
     files = _resolve_plan_files(None, "raw/untracked", default_scan=True)
-    # D3 : un lot VIDE est un état explicite, jamais un succès sans plan.
-    # Les deux autorités de scan (`_resolve_plan_files` ici, le scan du moteur
-    # dans raw/untracked) sont équivalentes, et l'agent passe explicitement
-    # ses inputs au moteur — mais une divergence passerait sinon pour « rien à
-    # planifier » sans que personne ne le dise. `noPending` rend cet état
-    # lisible par l'orchestrateur, qui ne peut plus le confondre avec un plan
-    # réussi. Le schéma manager du capability-status accepte ce champ
-    # supplémentaire (additionalProperties: true).
+    # D3: an EMPTY batch is an explicit state, never a success without a plan.
+    # The two scan authorities (`_resolve_plan_files` here, the engine scan
+    # in raw/untracked) are equivalent, and the agent passes its inputs
+    # explicitly to the engine — but a divergence would otherwise look like
+    # "nothing to plan" without anyone saying so. `noPending` makes that state
+    # readable by the orchestrator, which can no longer mistake it for a
+    # successful plan. The manager capability-status schema accepts this extra
+    # field (additionalProperties: true).
     return {
         "contractVersion": "1",
         "agentInstanceId": _AGENT_INSTANCE_ID,
