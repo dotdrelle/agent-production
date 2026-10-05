@@ -73,7 +73,7 @@ _IMPORTS = os.environ.get("WIKI_IMPORTS", "")
 _IMPORT_PATH_MAPPINGS = os.environ.get("PRODUCTION_IMPORT_PATH_MAPPINGS", "")
 _ALLOWED_STEPS = {
     item.strip()
-    for item in os.environ.get("PRODUCTION_ALLOWED_STEPS", "doctor,doctor_apply,copy,ingest,ingest_rebuild,build,export,polish,restore,pipeline,lint").split(",")
+    for item in os.environ.get("PRODUCTION_ALLOWED_STEPS", "doctor,doctor_apply,copy,ingest,ingest_rebuild,build,export,polish,restore,pipeline,lint,index").split(",")
     if item.strip()
 }
 _REQUIRE_CONFIRMATION = os.environ.get("PRODUCTION_REQUIRE_CONFIRMATION", "true").lower() not in {"0", "false", "no"}
@@ -90,16 +90,18 @@ _STEP_COMMANDS: dict[str, list[str]] = {
     "ingest": ["node", _WIKI_BIN, "ingest"],
     "ingest_rebuild": ["node", _WIKI_BIN, "ingest", "--from-ingested"],
     "lint": ["node", _WIKI_BIN, "lint"],
+    "index": ["node", _WIKI_BIN, "index"],
     "build": ["node", _WIKI_BIN, "build"],
     "export": ["node", _WIKI_BIN, "export"],
     "polish": ["node", _WIKI_BIN, "export", "--polish"],
     "restore": ["node", _WIKI_BIN, "restore"],
 }
-_MUTATING_STEPS = {"copy", "ingest", "ingest_rebuild", "build", "export", "polish", "restore", "pipeline", "doctor_apply"}
+_MUTATING_STEPS = {"copy", "ingest", "ingest_rebuild", "build", "export", "polish", "restore", "pipeline", "doctor_apply", "index"}
 _CAPABILITY_STEP_MAP: dict[str, list[str]] = {
     "knowledge.update": ["ingest"],
     "knowledge.rebuild": ["ingest_rebuild"],
     "knowledge.check": ["lint"],
+    "knowledge.index": ["index"],
     "document.build": ["build"],
     "document.publish": ["export", "polish"],
     "workspace.diagnose": ["doctor"],
@@ -113,6 +115,7 @@ _AGENT_OPERATION_TRANSLATION: dict[str, dict[str, Any]] = {
     "ingest": {"type": "ingest"},
     "ingest_rebuild": {"type": "ingest_rebuild"},
     "lint": {"type": "lint"},
+    "index": {"type": "index"},
     "build": {"type": "build"},
     "export": {"type": "export"},
     "polish": {"type": "polish"},
@@ -259,6 +262,8 @@ def _agent_start_job_args(args: dict[str, Any], workspace: dict[str, Any]) -> di
         ("deliverables", "deliverables"),
         ("steps", "steps"),
         ("stabilize", "stabilize"),
+        ("maintenanceSelection", "maintenanceSelection"),
+        ("maintenanceQuietMinutes", "maintenanceQuietMinutes"),
         ("configPath", "configPath"),
         ("callerLabel", "callerLabel"),
         ("file", "restoreFile"),
@@ -634,6 +639,9 @@ def _capability_input_schema(capability_id: str, supported: list[str]) -> dict[s
         "confirm": {"type": "boolean", "description": "Set by the orchestrator once the task was approved; required by the confirmation guard for mutating jobs."},
     }
     if capability_id == "knowledge.update":
+        properties["maintenanceSelection"] = {"type": "array", "items": {"type": "object", "properties": {"path": {"type": "string"}, "hash": {"type": "string"}}, "required": ["path", "hash"], "additionalProperties": False}}
+        properties["maintenanceQuietMinutes"] = {"type": "number", "minimum": 0}
+
         properties["inputs"] = {"type": "array", "items": {"type": "string"}, "description": "Optional explicit list of Markdown source files (relative to the workspace root) to ingest. If omitted, all pending files under raw/untracked are ingested."}
     if capability_id == "document.build":
         properties["templates"] = {"type": "array", "items": {"type": "string"}, "description": "Optional template files (relative to the workspace root or templates/) to build. If omitted, all applicable templates are built."}
@@ -691,6 +699,8 @@ def _agent_plan_input_schema() -> dict[str, Any]:
             "arguments": {
                 "type": "object",
                 "properties": {
+                    "maintenanceSelection": {"type": "array", "items": {"type": "object"}},
+                    "maintenanceQuietMinutes": {"type": "number"},
                     "inputs": {"type": "array", "items": {"type": "string"}},
                     "templates": {"type": "array", "items": {"type": "string"}},
                     "deliverables": {"type": "array", "items": {"type": "string"}},
@@ -741,6 +751,8 @@ def _agent_execute_input_schema() -> dict[str, Any]:
             "arguments": {
                 "type": "object",
                 "properties": {
+                    "maintenanceSelection": {"type": "array", "items": {"type": "object"}},
+                    "maintenanceQuietMinutes": {"type": "number"},
                     "inputs": {"type": "array", "items": {"type": "string"}},
                     "templates": {"type": "array", "items": {"type": "string"}},
                     "deliverables": {"type": "array", "items": {"type": "string"}},
@@ -1613,6 +1625,7 @@ async def _tool_start_job(args: dict[str, Any], workspace_name_override: str | N
         "templates": templates,
         "deliverables": deliverables,
         "stabilize": stabilize,
+        **({"maintenanceSelection": args["maintenanceSelection"], "maintenanceQuietMinutes": args.get("maintenanceQuietMinutes", 10)} if args.get("maintenanceSelection") else {}),
         "configPath": config_path,
         **({"restoreFile": restore_file, "restoreRevision": restore_revision, "restoreRun": restore_run, "dryRun": execute_dry_run} if "restore" in steps else {}),
         "lockScopes": lock_scopes,
@@ -1758,6 +1771,11 @@ def _agent_plan(args: dict[str, Any]) -> dict[str, Any]:
     workspace_revision = _workspace_revision_from_request(args)
     objective = str(args.get("objective") or "")
 
+    if capability == "knowledge.index":
+        if "index" not in _ALLOWED_STEPS:
+            raise ValueError("index is not allowed by PRODUCTION_ALLOWED_STEPS.")
+        task = _planned_task("index-repair", "Repair vector index", capability, "index", {}, [], False, [], [], ["workspace-write"], constraints, workspace_revision)
+        return _fragment(capability, "Repair vector index", [], [], [task], [])
     if capability == "knowledge.update":
         return _plan_knowledge_update(operation, request_args, constraints, workspace_revision)
     if capability == "knowledge.rebuild":
@@ -1993,6 +2011,7 @@ def _plan_capability_operation(args: dict[str, Any]) -> tuple[str, str]:
             "knowledge.update": "ingest",
             "knowledge.rebuild": "ingest_rebuild",
             "knowledge.check": "lint",
+            "knowledge.index": "index",
             "document.build": "build",
             "document.publish": "export",
             "knowledge.pipeline": "pipeline",
@@ -2004,7 +2023,7 @@ def _plan_capability_operation(args: dict[str, Any]) -> tuple[str, str]:
 
     if capability not in _CAPABILITY_STEP_MAP:
         raise ValueError("agent_plan requires a supported capability.")
-    if operation and operation not in {"ingest", "ingest_rebuild", "lint", "build", "export", "polish", "restore", "pipeline", "doctor", "doctor_apply"}:
+    if operation and operation not in {"ingest", "ingest_rebuild", "lint", "build", "export", "polish", "restore", "pipeline", "doctor", "doctor_apply", "index"}:
         raise ValueError(f"Unsupported planning operation: {operation}")
     return capability, operation
 
@@ -2752,7 +2771,7 @@ def _unique_strings(values: list[str]) -> list[str]:
 
 _KNOWN_JOB_TYPES = {
     "doctor", "doctor_apply", "copy", "ingest",
-    "ingest_rebuild", "lint", "build", "export", "polish", "restore",
+    "ingest_rebuild", "lint", "index", "build", "export", "polish", "restore",
 }
 
 # A job type resolving to more than one step, in order. The archive rebuild
@@ -2844,7 +2863,7 @@ def _job_lock_scopes(
     deliverables: list[str],
 ) -> list[str]:
     scopes: set[str] = set()
-    if any(step in {"copy", "ingest", "ingest_rebuild", "restore", "doctor_apply"} for step in steps):
+    if any(step in {"copy", "ingest", "ingest_rebuild", "restore", "doctor_apply", "index"} for step in steps):
         scopes.add("workspace-write")
     if "build" in steps:
         if templates:
@@ -3032,6 +3051,12 @@ async def _run_cli_step(
 ) -> int:
     env = dict(os.environ)
     env["WIKI_RUN_CALLER"] = job_id
+    if (job_metadata or {}).get("maintenanceSelection"):
+        env["WIKI_MAINTENANCE_SELECTION"] = json.dumps(job_metadata["maintenanceSelection"])
+        env["WIKI_MAINTENANCE_QUIET_MINUTES"] = str(job_metadata.get("maintenanceQuietMinutes", 10))
+    else:
+        env.pop("WIKI_MAINTENANCE_SELECTION", None)
+        env.pop("WIKI_MAINTENANCE_QUIET_MINUTES", None)
     metadata = job_metadata or {}
     env["WIKI_RUN_ID"] = str(metadata.get("runId") or job_id)
     env["WIKI_TASK_ID"] = str(metadata.get("callerLabel") or step)

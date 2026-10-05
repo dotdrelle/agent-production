@@ -11,7 +11,7 @@ services:
       - WIKI_IMPORTS=${WIKI_IMPORTS:-}
       - PRODUCTION_IMPORT_PATH_MAPPINGS=${PRODUCTION_IMPORT_PATH_MAPPINGS:-}
       # Keep in step with the in-code default of production_mcp_server.py: a
-      - PRODUCTION_ALLOWED_STEPS=${PRODUCTION_ALLOWED_STEPS:-doctor,doctor_apply,copy,ingest,ingest_rebuild,build,export,polish,restore,pipeline,lint}
+      - PRODUCTION_ALLOWED_STEPS=${PRODUCTION_ALLOWED_STEPS:-doctor,doctor_apply,copy,ingest,ingest_rebuild,build,export,polish,restore,pipeline,lint,index}
       - PRODUCTION_REQUIRE_CONFIRMATION=${PRODUCTION_REQUIRE_CONFIRMATION:-true}
       # Parallelism: effective concurrency ≈ recommendedConcurrency. Intermediate
       # defaults (4/8); low profile 2/4, high profile 8/16. The LLM backend must
