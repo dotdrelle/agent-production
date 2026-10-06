@@ -66,6 +66,10 @@ _AGENT_INSTANCE_ID = os.environ.get("PRODUCTION_INSTANCE_ID", "production-main")
 # serialized workspace mutation.
 _RECOMMENDED_CONCURRENCY = _int_env("PRODUCTION_RECOMMENDED_CONCURRENCY", 4)
 _MAX_CONCURRENCY = _int_env("PRODUCTION_MAX_CONCURRENCY", 8)
+# One capacity knob: the engine's in-job model calls (TAXO section extraction,
+# build batches) follow the same advertised concurrency unless the workspace
+# .wikirc sets limits.maxInFlightRequests explicitly. The engine caps at 16.
+_IN_FLIGHT_REQUESTS = max(1, min(16, _RECOMMENDED_CONCURRENCY, _MAX_CONCURRENCY or _RECOMMENDED_CONCURRENCY))
 _MAX_TASKS_PER_PLAN = _int_env("PRODUCTION_MAX_TASKS_PER_PLAN", 0)
 _MAX_TASK_DURATION_MS = _int_env("PRODUCTION_MAX_TASK_DURATION_MS", 0)
 _LOG_PREFIX = f"[production-mcp/{_WORKSPACE_NAME}]"
@@ -3051,6 +3055,10 @@ async def _run_cli_step(
 ) -> int:
     env = dict(os.environ)
     env["WIKI_RUN_CALLER"] = job_id
+    # The run's same capacity inside the job: extraction lookahead and build
+    # batches otherwise keep the engine default (3) and the configured
+    # concurrency never reaches them. Explicit .wikirc value still wins.
+    env["WIKI_MAX_IN_FLIGHT_REQUESTS"] = str(_IN_FLIGHT_REQUESTS)
     if (job_metadata or {}).get("maintenanceSelection"):
         env["WIKI_MAINTENANCE_SELECTION"] = json.dumps(job_metadata["maintenanceSelection"])
         env["WIKI_MAINTENANCE_QUIET_MINUTES"] = str(job_metadata.get("maintenanceQuietMinutes", 10))

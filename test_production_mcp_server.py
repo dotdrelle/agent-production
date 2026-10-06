@@ -755,6 +755,38 @@ class ProductionMcpServerTest(unittest.TestCase):
         self.assertEqual(captured["env"]["WIKI_TASK_ID"], "restore-task")
         self.assertEqual(captured["env"]["WIKI_CAPABILITY"], "workspace.restore")
         self.assertEqual(captured["env"]["WIKI_IDEMPOTENCY_KEY"], "restore-idem-42")
+        # One capacity knob: in-job model calls follow the advertised
+        # concurrency (default 4), capped by PRODUCTION_MAX_CONCURRENCY.
+        self.assertEqual(captured["env"]["WIKI_MAX_IN_FLIGHT_REQUESTS"], "4")
+
+    def test_cli_steps_carry_the_advertised_capacity_into_the_engine(self):
+        def run_step(env_overrides):
+            server = load_module(self.workspace, env_overrides)
+            captured = {}
+
+            class EmptyStdout:
+                async def readline(self):
+                    return b""
+
+            class SuccessfulProcess:
+                stdout = EmptyStdout()
+
+                async def wait(self):
+                    return 0
+
+            async def create_subprocess_exec(*command, **kwargs):
+                captured["env"] = kwargs["env"]
+                return SuccessfulProcess()
+
+            server.asyncio.create_subprocess_exec = create_subprocess_exec
+            server._append_log = lambda *_args, **_kwargs: None
+            exit_code = asyncio.run(server._run_cli_step("prod-job-cap", "ingest", [], [], []))
+            self.assertEqual(exit_code, 0)
+            return captured["env"]["WIKI_MAX_IN_FLIGHT_REQUESTS"]
+
+        self.assertEqual(run_step({"PRODUCTION_RECOMMENDED_CONCURRENCY": "6", "PRODUCTION_MAX_CONCURRENCY": "8"}), "6")
+        self.assertEqual(run_step({"PRODUCTION_RECOMMENDED_CONCURRENCY": "6", "PRODUCTION_MAX_CONCURRENCY": "2"}), "2")
+        self.assertEqual(run_step({"PRODUCTION_RECOMMENDED_CONCURRENCY": "40", "PRODUCTION_MAX_CONCURRENCY": "64"}), "16")
 
     def test_ingest_plan_falls_back_to_one_executable_task_when_parallel_helpers_are_disabled(self):
         server = load_module(
