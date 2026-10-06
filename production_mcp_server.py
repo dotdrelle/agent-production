@@ -3139,8 +3139,7 @@ def _exported_files_from_logs(lines: list[str]) -> list[str]:
 
 def _step_result_from_logs(job_id: str, step: str) -> dict[str, Any]:
     if step in {"ingest", "ingest_rebuild"}:
-        lines = _read_log_tail(job_id, 500)
-        trace_file = _trace_file_from_logs(lines)
+        trace_file = _job_trace_file(job_id, _read_log_tail(job_id, 500))
         if not trace_file:
             return {}
         trace_path = (_WORKSPACE_PATH / trace_file).resolve()
@@ -3245,7 +3244,7 @@ def _output_refs_for_job(job: dict[str, Any]) -> list[dict[str, Any]]:
 
 def _job_progress(job: dict[str, Any], log_tail: list[str]) -> dict[str, Any]:
     current_step = _current_step(job)
-    trace_file = _trace_file_from_logs(log_tail)
+    trace_file = _job_trace_file(str(job.get("jobId") or ""), log_tail) if job.get("jobId") else _trace_file_from_logs(log_tail)
     trace = _parse_trace_progress(trace_file) if trace_file else {}
     status = str(job.get("status") or "")
     progress = {
@@ -3327,6 +3326,35 @@ def _trace_file_from_logs(lines: list[str]) -> str | None:
         if match:
             return match.group(1).strip()
     return None
+
+
+_TRACE_FILE_BY_JOB: dict[str, str] = {}
+
+
+def _job_trace_file(job_id: str, log_tail: list[str] | None = None) -> str | None:
+    """The job's trace file, wherever its "Trace file:" line sits in the log.
+
+    The line is printed near the START of the job log, after the command line.
+    An ingest of 41 sources printed 583 lines, so a 500-line tail no longer
+    contained it: the step result came back empty (no outputRefs, no stats), the
+    runtime found nothing to verify and its evaluator rejected a successful
+    ingest. The tail is tried first; the whole log only when it misses.
+    """
+    found = _trace_file_from_logs(log_tail or []) or _TRACE_FILE_BY_JOB.get(job_id)
+    if found:
+        return found
+    path = _log_path(job_id)
+    if not path.exists():
+        return None
+    with path.open(encoding="utf-8", errors="replace") as handle:
+        for line in handle:
+            match = re.search(r"Trace file:\s*(.+)$", line.rstrip("\n"))
+            if match:
+                found = match.group(1).strip()
+    if found:
+        # Polled every few seconds while the job runs: read the long log once.
+        _TRACE_FILE_BY_JOB[job_id] = found
+    return found
 
 
 _WAIT_EVENTS = frozenset({

@@ -223,6 +223,25 @@ class ProductionMcpServerTest(unittest.TestCase):
         self.assertEqual(result["metrics"]["outputTokens"], 456)
         self.assertEqual(result["metrics"]["totalTokens"], 1659)
 
+    def test_taxo_output_refs_survive_a_job_log_longer_than_the_tail(self):
+        # juno: 41 sources made a 583-line job log; the "Trace file:" line sits
+        # near the top, out of a 500-line tail, and the result came back empty.
+        trace = self.workspace / "trace-long.log"
+        trace.write_text(
+            "2026-07-21T10:00:04Z +4ms INFO ingest:output path=wiki/sources/doc/topic.md source=raw/doc.md\n",
+            encoding="utf-8",
+        )
+        logs = self.workspace / ".wiki" / "production-jobs" / "logs"
+        logs.mkdir(parents=True, exist_ok=True)
+        (logs / "job-long.log").write_text(
+            "[start] workspace=demo type=ingest\n"
+            f"Trace file: {trace.relative_to(self.workspace)}\n"
+            + "".join(f"ingest progress line {index}\n" for index in range(600)),
+            encoding="utf-8",
+        )
+        step_result = self.server._step_result_from_logs("job-long", "ingest")
+        self.assertEqual(step_result["outputRefs"], [{"type": "file", "ref": "wiki/sources/doc/topic.md"}])
+
     def test_taxo_output_refs_from_trace_are_returned_by_agent_task_result(self):
         trace = self.workspace / "trace.log"
         trace.write_text(
