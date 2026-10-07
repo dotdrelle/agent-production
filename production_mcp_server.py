@@ -3720,6 +3720,16 @@ def _parse_trace_progress(trace_file: str) -> dict[str, Any]:
         # Bounded: a huge batch must not bloat every status poll.
         state["sourceStates"] = dict(list(ingest_file_states.items())[:500])
         state["sourceActiveCount"] = sum(1 for value in ingest_file_states.values() if value == "running")
+        # The engine extracts several sources at once, so the last trace event
+        # names whichever file spoke last — often one already done — while the
+        # run graph marks the files really in flight. Name those instead, and
+        # drop the sequential "Source N/M", which the per-file counter replaces.
+        running = [name for name, value in ingest_file_states.items() if value == "running"]
+        if running and str(state.get("label") or "").startswith("Ingest "):
+            shown = ", ".join(running[:2])
+            state["label"] = f"Ingest {shown}" + (f" +{len(running) - 2}" if len(running) > 2 else "")
+        if re.fullmatch(r"Source \d+/\d+", str(state.get("detail") or "")):
+            state["detail"] = None
     return state
 
 

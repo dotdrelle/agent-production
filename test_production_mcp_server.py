@@ -147,6 +147,26 @@ class ProductionMcpServerTest(unittest.TestCase):
         self.assertEqual(progress["sourceStates"], {"A doc.md": "done", "b.md": "running", "c.md": "failed"})
         self.assertEqual(progress["sourceActiveCount"], 1)
 
+    def test_concurrent_ingest_label_names_the_files_in_flight(self):
+        # The last event is a.md finishing while b.md and c.md still run: the
+        # label must not name the finished file the run graph shows green.
+        trace = self.workspace / "trace.log"
+        trace.write_text(
+            "\n".join(
+                [
+                    "2026-07-21T10:00:00Z +0ms INFO ingest:source-selection resolvedCount=3",
+                    "2026-07-21T10:00:01Z +1ms INFO ingest:source-start sourcePath=raw/untracked/a.md",
+                    "2026-07-21T10:00:01Z +1ms INFO ingest:source-start sourcePath=raw/untracked/b.md",
+                    "2026-07-21T10:00:01Z +1ms INFO ingest:source-start sourcePath=raw/untracked/c.md",
+                    "2026-07-21T10:00:02Z +2ms INFO ingest:source-done source=raw/untracked/a.md status=success",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        progress = self.server._parse_trace_progress("trace.log")
+        self.assertEqual(progress["label"], "Ingest b.md, c.md")
+        self.assertIsNone(progress.get("detail"))
+
     def test_taxo_family_grouping_does_not_reuse_last_source_progress(self):
         trace = self.workspace / "trace.log"
         trace.write_text(
