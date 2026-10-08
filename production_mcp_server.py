@@ -3644,6 +3644,17 @@ def _parse_trace_progress(trace_file: str) -> dict[str, Any]:
                 state["detail"] = f"Batch {state['batchIndex'] + 1}/{state['batchCount']} · LLM running"
                 state["percent"] = _batch_percent(state["batchIndex"], state["batchCount"], False)
         elif name == "llm:end":
+            # Live token figures: each finished call carries its own usage.
+            # The whole trace is re-read on every poll from a fresh state, so a
+            # running sum counts each call once; trace:summary, written at the
+            # end of the job, still has the last word. Without this the panels
+            # read "0 in · 0 out" for a whole ingest.
+            call_in = _int_field(fields.get("inputTokens"))
+            call_out = _int_field(fields.get("outputTokens"))
+            if call_in is not None:
+                state["inputTokens"] = int(state.get("inputTokens") or 0) + call_in
+            if call_out is not None:
+                state["outputTokens"] = int(state.get("outputTokens") or 0) + call_out
             llm_label = fields.get("label") or ""
             is_stabilize_llm = llm_label == "build:stabilize"
             is_taxo_families_llm = llm_label.startswith("ingest_taxo_family") or llm_label == "ingest_taxo_families"

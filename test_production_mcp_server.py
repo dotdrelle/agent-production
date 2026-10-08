@@ -243,6 +243,30 @@ class ProductionMcpServerTest(unittest.TestCase):
         self.assertEqual(result["metrics"]["outputTokens"], 456)
         self.assertEqual(result["metrics"]["totalTokens"], 1659)
 
+    def test_running_ingest_reports_live_tokens_then_the_summary_wins(self):
+        # juno: a 5-minute ingest read "0 in · 0 out" until it ended, because
+        # only trace:summary carried tokens. Each llm:end carries its own usage.
+        trace = self.workspace / "trace-live.log"
+        trace.write_text(
+            "\n".join(
+                [
+                    "2026-07-21T10:00:01Z +1ms INFO llm:start label=ingest_taxo_sheet source=raw/untracked/a.md",
+                    "2026-07-21T10:00:02Z +2ms INFO llm:end label=ingest_taxo_sheet durationMs=5 inputTokens=1391 outputTokens=1576 source=raw/untracked/a.md",
+                    "2026-07-21T10:00:03Z +3ms INFO llm:end label=ingest_taxo_sheet durationMs=5 inputTokens=295 outputTokens=1385 source=raw/untracked/a.md",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        progress = self.server._parse_trace_progress("trace-live.log")
+        self.assertEqual(progress["inputTokens"], 1686)
+        self.assertEqual(progress["outputTokens"], 2961)
+        # Re-reading the same trace never counts a call twice.
+        self.assertEqual(self.server._parse_trace_progress("trace-live.log")["inputTokens"], 1686)
+        with trace.open("a", encoding="utf-8") as stream:
+            stream.write("\n2026-07-21T10:00:04Z +4ms INFO trace:summary llmInputTokens=2000 llmOutputTokens=3000")
+        final = self.server._parse_trace_progress("trace-live.log")
+        self.assertEqual((final["inputTokens"], final["outputTokens"]), (2000, 3000))
+
     def test_taxo_output_refs_survive_a_job_log_longer_than_the_tail(self):
         # juno: 41 sources made a 583-line job log; the "Trace file:" line sits
         # near the top, out of a 500-line tail, and the result came back empty.
