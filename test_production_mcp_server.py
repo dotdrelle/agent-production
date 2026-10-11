@@ -244,7 +244,7 @@ class ProductionMcpServerTest(unittest.TestCase):
         self.assertEqual(result["metrics"]["totalTokens"], 1659)
 
     def test_running_ingest_reports_live_tokens_then_the_summary_wins(self):
-        # juno: a 5-minute ingest read "0 in · 0 out" until it ended, because
+        # lyra: a 5-minute ingest read "0 in · 0 out" until it ended, because
         # only trace:summary carried tokens. Each llm:end carries its own usage.
         trace = self.workspace / "trace-live.log"
         trace.write_text(
@@ -268,7 +268,7 @@ class ProductionMcpServerTest(unittest.TestCase):
         self.assertEqual((final["inputTokens"], final["outputTokens"]), (2000, 3000))
 
     def test_taxo_output_refs_survive_a_job_log_longer_than_the_tail(self):
-        # juno: 41 sources made a 583-line job log; the "Trace file:" line sits
+        # lyra: 41 sources made a 583-line job log; the "Trace file:" line sits
         # near the top, out of a 500-line tail, and the result came back empty.
         trace = self.workspace / "trace-long.log"
         trace.write_text(
@@ -437,7 +437,7 @@ class ProductionMcpServerTest(unittest.TestCase):
         self.assertTrue(task["requiresApproval"])
 
     def test_agent_plan_rebuild_lists_archived_sources_as_input_refs_only(self):
-        archive = self.workspace / "raw" / "ingested" / "acpi"
+        archive = self.workspace / "raw" / "ingested" / "atlas"
         archive.mkdir(parents=True)
         (archive / "board.md").write_text("# Board\n")
         (archive / "prophix.md").write_text("# Prophix\n")
@@ -451,7 +451,7 @@ class ProductionMcpServerTest(unittest.TestCase):
 
         task = fragment["tasks"][0]
         files = [ref["ref"] for ref in task["inputRefs"] if ref["type"] == "file"]
-        self.assertEqual(sorted(files), ["raw/ingested/acpi/board.md", "raw/ingested/acpi/prophix.md"])
+        self.assertEqual(sorted(files), ["raw/ingested/atlas/board.md", "raw/ingested/atlas/prophix.md"])
         self.assertIn("2 archived source(s)", task["label"])
         # The files are shown, never passed on: a file list would turn the
         # full rebuild into a partial one that prunes nothing.
