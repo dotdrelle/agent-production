@@ -1,6 +1,6 @@
 # Repository Guide
 
-Current coordinated release: **0.16.55** (trust `_AGENT_VERSION` and the git tag, not this line). Keep `_AGENT_VERSION` aligned with
+Current coordinated release: **0.16.58** (trust `_AGENT_VERSION` and the git tag, not this line). Keep `_AGENT_VERSION` aligned with
 the manager, engine, and external agents.
 
 ## Goal
@@ -127,7 +127,7 @@ deterministic resolver reads them from `agent_describe`.
   trace files can link back to the production job that launched them.
 - Keep `_AGENT_VERSION` aligned with the coordinated `llm-wiki-manager`
   release version so status responses identify the deployed agent bundle.
-  Current release line: `0.16.55`. Alignment is checked by
+  Current release line: `0.16.58`. Alignment is checked by
   `llm-wiki-manager/scripts/check-versions.js` and synced by the root
   `build-and-push.sh`.
 - **Auth, scopes, rate limiting** (0.10.3): `MCP_AUTH_TOKEN` remains a legacy

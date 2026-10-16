@@ -892,11 +892,27 @@ def _write_json(path: Path, payload: dict[str, Any]) -> None:
     tmp_path.replace(path)
 
 
+# Job lifecycle markers mirrored to the container's stdout. The full CLI
+# output stays in the per-job log file (read by production_job_logs); without
+# this mirror `docker logs` / `wiki-workspace wiki <ws> logs` showed only
+# tools/call lines and never whether a job started, which step failed or why.
+_STDOUT_JOB_MARKERS = ("[start]", "[step:", "[error]", "[finish]")
+_STDOUT_FAILURE_TAIL = 20
+
+
 def _append_log(job_id: str, line: str) -> None:
     path = _log_path(job_id)
     path.parent.mkdir(parents=True, exist_ok=True)
+    text = line.rstrip("\n")
     with path.open("a", encoding="utf-8") as handle:
-        handle.write(line.rstrip("\n") + "\n")
+        handle.write(text + "\n")
+    if text.startswith(_STDOUT_JOB_MARKERS):
+        print(f"{_LOG_PREFIX} job={job_id} {_mask_secret_text(text)}", flush=True)
+        if text.startswith("[error]"):
+            # The cause of a failed step is in the CLI output just above.
+            for tail_line in _read_log_tail(job_id, _STDOUT_FAILURE_TAIL + 1)[:-1]:
+                if tail_line.strip():
+                    print(f"{_LOG_PREFIX} job={job_id}   | {_mask_secret_text(tail_line)}", flush=True)
 
 
 def _load_job(job_id: str) -> dict[str, Any]:
