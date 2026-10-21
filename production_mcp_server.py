@@ -2160,21 +2160,51 @@ def _plan_document_publish(
         deliverables = _resolve_targets_from_objective(objective, "deliverables")
     if not deliverables:
         deliverables = _resolve_plan_files(None, "deliverables", default_scan=True)
+    excluded_artifacts: list[str] = []
+    if operation == "export":
+        excluded_artifacts = [path for path in deliverables if _is_export_artifact(path)]
+        deliverables = [path for path in deliverables if not _is_export_artifact(path)]
+    elif operation == "polish":
+        excluded_artifacts = [path for path in deliverables if _is_polished_export_artifact(path)]
+        deliverables = [path for path in deliverables if not _is_polished_export_artifact(path)]
     if not deliverables:
+        synthesis = ["No Markdown deliverables were found in deliverables; no publication operation was planned."]
+        if excluded_artifacts:
+            synthesis = ["No eligible deliverables remain for this operation."]
+            synthesis.append(_excluded_artifacts_note(operation, excluded_artifacts))
         return _empty_plan(
             "document.publish",
             "Publish documents",
-            ["No Markdown deliverables were found in deliverables; no publication operation was planned."],
+            synthesis,
         )
     tasks = _publish_tasks(operation, deliverables, request_args, constraints, workspace_revision, depends_on)
+    synthesis = [f"{len(deliverables)} deliverable file(s) resolved for {operation}."]
+    if excluded_artifacts:
+        synthesis.append(_excluded_artifacts_note(operation, excluded_artifacts))
     return _fragment(
         "document.publish",
         "Publish documents",
-        [f"{len(deliverables)} deliverable file(s) resolved for {operation}."],
+        synthesis,
         _groups_for_tasks(tasks, operation, f"{operation.title()} deliverables", constraints["maxConcurrency"], len(deliverables)),
         tasks,
         _file_refs(deliverables),
     )
+
+
+def _is_export_artifact(path: str) -> bool:
+    return bool(re.search(r"\.export(?:\.polished)?\.md$", str(path).replace("\\", "/"), re.IGNORECASE))
+
+
+def _is_polished_export_artifact(path: str) -> bool:
+    return bool(re.search(r"\.export\.polished\.md$", str(path).replace("\\", "/"), re.IGNORECASE))
+
+
+def _excluded_artifacts_note(operation: str, paths: list[str]) -> str:
+    kind = "generated export artifacts" if operation == "export" else "already-polished export artifacts"
+    examples = ", ".join(paths[:3])
+    remainder = f" and {len(paths) - 3} more" if len(paths) > 3 else ""
+    action = "export the source deliverable" if operation == "export" else "polish the source deliverable or its unpolished export"
+    return f"Skipped {len(paths)} {kind}: {examples}{remainder}. {action} instead."
 
 
 def _plan_pipeline(request_args: dict[str, Any], constraints: dict[str, Any], workspace_revision: str) -> dict[str, Any]:
